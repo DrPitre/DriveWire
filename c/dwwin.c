@@ -7,8 +7,6 @@ void WinInit(void)
         return;
     }
     
-	int y = 1;
-
 	initscr();
 	clear();
 	window0 = newwin(24, 80, 0, 0);

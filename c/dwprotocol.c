@@ -8,9 +8,6 @@ void *DriveWireProcessor(void *data)
 
 	while (comRead(dp, &(dp->lastOpcode), 1) > 0)
 	{
-		fd_set	rfds;
-		struct timeval	tv;
-		char *timeString = NULL;
 
 		{
 
