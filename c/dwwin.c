@@ -253,7 +253,7 @@ void WinUpdate(WINDOW *window, struct dwTransferData *dp)
 	wclrtoeol(window);
 
 	wmove(window, y++, x); wclrtoeol(window);
-	wprintw(window, dp->prtcmd);
+	wprintw(window, "%s", dp->prtcmd);
 
 	wmove(window, y++, x); wclrtoeol(window);
 

@@ -433,7 +433,7 @@ void DoOP_PRINT(struct dwTransferData *dp)
 
 void DoOP_PRINTFLUSH(struct dwTransferData *dp)
 {
-	char buff[128];
+	char buff[256];
 
 	fclose(dp->prtfp);
 	sprintf(buff, "cat drivewire.prt %s\n", dp->prtcmd);

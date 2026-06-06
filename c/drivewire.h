@@ -76,7 +76,7 @@ struct dwTransferData
 	unsigned char	lastError;
 	FILE	*prtfp;
 	unsigned char	lastChar;
-	char	prtcmd[80];
+	char	prtcmd[128];
 };
 
 

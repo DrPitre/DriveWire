@@ -81,7 +81,7 @@ void closeDSK(struct dwTransferData *dp, int which)
 int loadPreferences(struct dwTransferData *datapack)
 {
 	FILE	*pf;
-	char	buffer[81];
+	char	buffer[128];
 	int	i;
 	char	*p;
 
