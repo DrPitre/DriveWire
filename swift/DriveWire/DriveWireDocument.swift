@@ -11,17 +11,20 @@ import ORSSerial
 import AppIntents
 
 extension UTType {
-    static var exampleText: UTType {
-        UTType(importedAs: "com.boisypitre.drivewire-document")
+    static var drivewireDocument: UTType {
+        UTType(importedAs: "org.pitre.drivewire-document")
     }
 }
 
-final class DriveWireDocument: FileDocument {
+@MainActor
+final class DriveWireDocument: ReferenceFileDocument, ObservableObject {
     struct DriveWireDocumentModel: Codable {
         var serialDriver: DriveWireSerialDriver
         var tcpDriver: DriveWireTCPDriver
         var connectionType: ConnectionType
     }
+
+    typealias Snapshot = DriveWireDocumentModel
     
     @Published var serialDriver = DriveWireSerialDriver()
     @Published var tcpDriver = DriveWireTCPDriver()
@@ -33,9 +36,10 @@ final class DriveWireDocument: FileDocument {
     
     @Published var connectionType: ConnectionType = .serial
     
-    static var readableContentTypes: [UTType] { [.exampleText] }
+    static var readableContentTypes: [UTType] { [.drivewireDocument] }
     
     init() {
+        configureChangeTracking()
     }
     
     struct ReloadVirtualDriveIntent: AppIntent {
@@ -76,16 +80,28 @@ final class DriveWireDocument: FileDocument {
         self.serialDriver = model.serialDriver
         self.tcpDriver = model.tcpDriver
         self.connectionType = model.connectionType
+        configureChangeTracking()
     }
-    
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        let model = DriveWireDocumentModel(
+
+    func snapshot(contentType: UTType) throws -> DriveWireDocumentModel {
+        DriveWireDocumentModel(
             serialDriver: self.serialDriver,
             tcpDriver: self.tcpDriver,
             connectionType: self.connectionType
         )
-        
-        let data = try JSONEncoder().encode(model)
+    }
+
+    func fileWrapper(snapshot: DriveWireDocumentModel, configuration: WriteConfiguration) throws -> FileWrapper {
+        let data = try JSONEncoder().encode(snapshot)
         return .init(regularFileWithContents: data)
+    }
+
+    private func configureChangeTracking() {
+        serialDriver.onChange = { [weak self] in
+            self?.objectWillChange.send()
+        }
+        tcpDriver.onChange = { [weak self] in
+            self?.objectWillChange.send()
+        }
     }
 }

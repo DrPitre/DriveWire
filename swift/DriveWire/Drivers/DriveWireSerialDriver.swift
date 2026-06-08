@@ -12,6 +12,7 @@ import ORSSerial
 /// This class provides the ability to connect to a guest on a serial port. Provide the
 /// device name of the serial port in ``init(serialPort:)``
 /// When you're ready for the driver to stop, set ``quit`` to `true`.
+@MainActor
 class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate, ObservableObject, Codable {
     
     enum CodingKeys: String, CodingKey {
@@ -30,6 +31,8 @@ class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate
     
     /// A flag that when set to `true`,  causes serial traffic to log.
     public var logging = true
+
+    var onChange: (() -> Void)?
          
     private var serialPort : ORSSerialPort?
     
@@ -47,6 +50,8 @@ class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate
                 serialPort.delegate = self
                 serialPort.open()
             }
+
+            onChange?()
         }
     }
     
@@ -54,6 +59,7 @@ class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate
     public var baudRate = 57600 {
         didSet {
             serialPort?.baudRate = NSNumber(value: baudRate)
+            onChange?()
         }
     }
     
@@ -97,6 +103,7 @@ class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate
     override init() {
         super.init()
         host = DriveWireHost(delegate: self)
+        configureHost()
     }
     
     required init(from decoder: Decoder) throws {
@@ -108,7 +115,7 @@ class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate
             self.baudRate = try values.decode(Int.self, forKey: .baudRate)
             self.log = try values.decode(String.self, forKey: .log)
             self.host = try values.decode(DriveWireHost.self, forKey: .host)
-            self.host.delegate = self
+            configureHost()
         } catch {
             print("\(error)")
         }
@@ -127,5 +134,11 @@ class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate
         self.serialPort?.close()
         self.serialPort = nil
     }
-}
 
+    private func configureHost() {
+        host.delegate = self
+        host.onChange = { [weak self] in
+            self?.onChange?()
+        }
+    }
+}

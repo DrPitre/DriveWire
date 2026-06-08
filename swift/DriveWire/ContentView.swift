@@ -39,7 +39,7 @@ struct VirtualChannelsView : View {
 }
 
 struct DriveSelector: View {
-    let buttonSize = 50.0
+    let buttonSize = 40.0
     @Binding var selectedDisk : String
     var body: some View {
         HStack {
@@ -72,7 +72,7 @@ struct SerialPortSelector: View {
      var body: some View {
          VStack {
              Picker("Serial port:", selection: $selectedPortName) {
-                 Text("No device").tag("NONE")
+                 Text("No device").tag("---")
                  ForEach(ObservableSerialPortManager().availablePorts, id: \.self) { port in
                      Text(port.name).tag(port.name)
                  }
@@ -106,7 +106,7 @@ struct IPAddressSelector: View {
 }
 
 struct StatisticsView: View {
-    @Binding var document: DriveWireDocument
+    @ObservedObject var document: DriveWireDocument
 
      var body: some View {
          VStack {
@@ -166,7 +166,7 @@ struct StatisticsView: View {
 }
 
 struct SerialCommsView : View {
-    @Binding var document: DriveWireDocument
+    @ObservedObject var document: DriveWireDocument
     @Binding var portName: String
     @Binding var baudRate: String
 
@@ -185,7 +185,7 @@ struct SerialCommsView : View {
 }
 
 struct TCPCommsView : View {
-    @Binding var document: DriveWireDocument
+    @ObservedObject var document: DriveWireDocument
     @Binding var ipAddress: String
     @Binding var ipPort: String
 
@@ -195,8 +195,8 @@ struct TCPCommsView : View {
 }
 
 struct ContentView: View {
-    @Binding var document: DriveWireDocument
-    @State var selectedName = "NONE"
+    @ObservedObject var document: DriveWireDocument
+    @State var selectedName = "---"
     @State var selectedBaud = "57600"
     @State var selectedIPAddress = "192.168.0.10"
     @State var selectedIPPort = "6809"
@@ -246,7 +246,7 @@ struct ContentView: View {
             GroupBox(label:
                 Label("Statistics", systemImage: "building.columns")
             ) {
-                StatisticsView(document: $document)
+                StatisticsView(document: document)
             }.padding(10)
         }
 
@@ -263,10 +263,10 @@ struct ContentView: View {
 
                 if document.connectionType == .serial {
                     // Show serial UI
-                    SerialCommsView(document: $document, portName: $selectedName, baudRate: $selectedBaud)
+                    SerialCommsView(document: document, portName: $selectedName, baudRate: $selectedBaud)
                 } else {
                     // Show TCP/IP UI
-                    TCPCommsView(document: $document, ipAddress: $selectedIPAddress, ipPort: $selectedIPPort)
+                    TCPCommsView(document: document, ipAddress: $selectedIPAddress, ipPort: $selectedIPPort)
                 }
             }
 
@@ -315,6 +315,5 @@ class ObservableSerialPortManager: ObservableObject {
 
 
  #Preview {
-    ContentView(document: .constant(DriveWireDocument()))
+    ContentView(document: DriveWireDocument())
 }
-

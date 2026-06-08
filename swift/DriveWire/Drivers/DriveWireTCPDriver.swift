@@ -12,6 +12,7 @@ import Foundation
 /// This class provides the ability to connect to a guest on a TCP/IP port. Provide the
 /// device name of the serial port in ``init(ipAddress:ipPort:)``
 /// When you're ready for the driver to stop, set ``quit`` to `true`.
+@MainActor
 class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codable {
     private var inputStream: InputStream?
     private var outputStream: OutputStream?
@@ -35,12 +36,15 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
     
     /// A flag that when set to `true`,  causes serial traffic to log.
     public var logging = true
+
+    var onChange: (() -> Void)?
     
     /// The TCP/IP address associated with this driver.
     public var ipAddress: String = "" {
         didSet {
             if oldValue != ipAddress {
                 reconnect()
+                onChange?()
             }
         }
     }
@@ -50,12 +54,13 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
         didSet {
             if oldValue != ipPort {
                 reconnect()
+                onChange?()
             }
         }
     }
     
     /// The host object.
-    internal var host : DriveWireHost = DriveWireHost()
+    @MainActor internal var host: DriveWireHost = DriveWireHost()
     
     @_documentation(visibility: private)
     internal func transactionCompleted(opCode: UInt8) {
@@ -72,6 +77,7 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
     override init() {
         super.init()
         host = DriveWireHost(delegate: self)
+        configureHost()
     }
     
     /// Create a driver that connects to a TCP/IP port.
@@ -82,6 +88,7 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
     init(ipAddress: String, ipPort: UInt32) {
         super.init()
         host = DriveWireHost(delegate: self)
+        configureHost()
         self.ipAddress = ipAddress
         self.ipPort = ipPort
         connect()
@@ -121,8 +128,8 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
             let bytesRead = stream.read(&readBuffer, maxLength: readBuffer.count)
             if bytesRead > 0 {
                 let data = Data(readBuffer[0..<bytesRead])
-                DispatchQueue.main.async {
-                    self.dataAvailable(host: self.host, data: data)
+                Task { @MainActor in
+                    await self.dataAvailable(host: self.host, data: data)
                 }
             } else {
                 if bytesRead < 0 {
@@ -149,7 +156,7 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
             self.ipPort = try values.decode(UInt32.self, forKey: .ipPort)
             self.log = try values.decode(String.self, forKey: .log)
             self.host = try values.decode(DriveWireHost.self, forKey: .host)
-            self.host.delegate = self
+            configureHost()
         } catch {
             print("\(error)")
         }
@@ -177,6 +184,13 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
     private func reconnect() {
         stop()
         connect()
+    }
+
+    private func configureHost() {
+        host.delegate = self
+        host.onChange = { [weak self] in
+            self?.onChange?()
+        }
     }
 }
 

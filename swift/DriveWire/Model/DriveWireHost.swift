@@ -10,7 +10,7 @@ import AppKit
 import AppIntents
 
 /// An interface for receiving information from the DriveWire host.
-public protocol DriveWireDelegate {
+public protocol DriveWireDelegate: AnyObject {
     /// Informs the delegate that there is available data.
     ///
     /// - Parameters:
@@ -40,20 +40,40 @@ public struct DriveWireStatistics {
 }
 
 /// Errors that the DriveWire host throws.
-public enum DriveWireHostError : Error {
+public enum DriveWireHostError : LocalizedError {
     /// There's a virtual drive currently mounted in this slot.
     case driveAlreadyExists
     /// A virtual disk with that name doesn't exist.
     case nameNotFound
+    
+    public var errorDescription: String? {
+        switch self {
+        case .driveAlreadyExists:
+            return "There's a virtual drive currently mounted in this slot."
+        case .nameNotFound:
+            return "A virtual disk with that name doesn't exist."
+        }
+    }
 }
 
 /// Error codes that the DriveWire protocol returns.
 ///
 /// These error codes are identical to the errors that OS-9 uses.
-public enum DriveWireProtocolError : Int {
+public enum DriveWireProtocolError : Int, LocalizedError {
     case E_NONE = 0x00
     case E_UNIT = 0xF0
     case E_CRC = 0xF4
+    
+    public var errorDescription: String? {
+        switch self {
+        case .E_NONE:
+            return "No error."
+        case .E_UNIT:
+            return "Unit error."
+        case .E_CRC:
+            return "CRC error."
+        }
+    }
 }
 
 /// Manages communication with a DriveWire guest.
@@ -63,16 +83,19 @@ public enum DriveWireProtocolError : Int {
 /// The basis of communication between the guest and host is a documented set of uni- and bi-directional messages called *transactions*. A transaction is a series of one or more packets that the guest and host pass to each other.
 ///
 @Observable
-public class DriveWireHost : Codable {
+public class DriveWireHost : @MainActor Codable {
     var log : String = ""
+    var onChange: (() -> Void)?
 
     init() {
+        setupTransactions()
     }
     
     func reloadVirtualDrives() {
         for vd in virtualDrives {
             vd.reload()
         }
+        notifyChange()
     }
     
     enum CodingKeys: String, CodingKey {
@@ -82,14 +105,14 @@ public class DriveWireHost : Codable {
     /// Statistical information about the host.
     public var statistics = DriveWireStatistics()
     private var serialBuffer = Data()
-    public var delegate : DriveWireDelegate?
+    public weak var delegate : DriveWireDelegate?
     /// The DriveWire transaction code of the transaction that the host is currently executing.
     ///
     /// Inspect this property to determine which transaction the host is currently executing.
-    public var currentTransaction : UInt8 = 0
-    public var currentSubTransaction : UInt8 = 0
+    public private(set) var currentTransaction : UInt8 = 0
+    public private(set) var currentSubTransaction : UInt8 = 0
     /// An array of virtual drives.
-    public var virtualDrives : [VirtualDrive] = []
+    public private(set) var virtualDrives : [VirtualDrive] = []
     
     /// The guest's capability byte sent from ``OPDWINIT``.
     private var guestCapabilityByte : UInt8 = 0x00
@@ -153,20 +176,16 @@ public class DriveWireHost : Codable {
             
             var byte : UInt8 = 0
             repeat {
-                do {
-                    if filePosition >= fileContents.count {
-                        errorCode = 211
-                        break
-                    }
-                    byte = fileContents[filePosition]
-                    filePosition = filePosition + 1
-                    if byte == 0x0A {
-                        byte = 0x0D
-                    }
-                    data = data + Data([byte])
-                } catch {
+                if filePosition >= fileContents.count {
                     errorCode = 211
+                    break
                 }
+                byte = fileContents[filePosition]
+                filePosition = filePosition + 1
+                if byte == 0x0A {
+                    byte = 0x0D
+                }
+                data = data + Data([byte])
             } while filePosition < fileContents.count && data.count <= maximumCount && byte != 0x0D && errorCode == 0
 
             return (errorCode, data)
@@ -178,17 +197,13 @@ public class DriveWireHost : Codable {
             
             var byte : UInt8 = 0
             repeat {
-                do {
-                    if filePosition >= fileContents.count {
-                        errorCode = 211
-                        break
-                    }
-                    byte = fileContents[filePosition]
-                    filePosition = filePosition + 1
-                    data = data + Data([byte])
-                } catch {
+                if filePosition >= fileContents.count {
                     errorCode = 211
+                    break
                 }
+                byte = fileContents[filePosition]
+                filePosition = filePosition + 1
+                data = data + Data([byte])
             } while filePosition < fileContents.count && data.count < maximumCount && errorCode == 0
 
             return (errorCode, data)
@@ -439,8 +454,10 @@ public class DriveWireHost : Codable {
             let values = try decoder.container(keyedBy: CodingKeys.self)
             self.virtualDrives = try values.decode([VirtualDrive].self, forKey: .virtualDrives)
             setupTransactions()
+            configureVirtualDrives()
         } catch {
             print("\(error)")
+            setupTransactions()
         }
     }
     
@@ -448,7 +465,7 @@ public class DriveWireHost : Codable {
     ///
     /// - Parameters:
     ///     - delegate: The delegate that receives messages.
-    init(delegate : DriveWireDelegate) {
+    public init(delegate : DriveWireDelegate) {
         self.delegate = delegate
         
         setupTransactions()
@@ -463,28 +480,34 @@ public class DriveWireHost : Codable {
         if let _ = virtualDrives.first(where: { $0.driveNumber == driveNumber }) {
             ejectVirtualDisk(driveNumber: driveNumber)
             // A drive with this number already exists... disallow it.
-//            throw DriveWireHostError.driveAlreadyExists
+            // throw DriveWireHostError.driveAlreadyExists
         }
 
-        virtualDrives.append(try VirtualDrive(driveNumber: driveNumber, imagePath: imagePath))
+        let virtualDrive = try VirtualDrive(driveNumber: driveNumber, imagePath: imagePath)
+        virtualDrive.onChange = { [weak self] in
+            self?.notifyChange()
+        }
+        virtualDrives.append(virtualDrive)
+        notifyChange()
     }
     
     /// Ejects a virtual disk from the virtual drive.
     /// - Parameters:
-    ///     - driveNumber: The drive number to remove the virtual disk image from.ds
+    ///     - driveNumber: The drive number to remove the virtual disk image from.
     public func ejectVirtualDisk(driveNumber : Int) {
         virtualDrives.removeAll { $0.driveNumber == driveNumber }
+        notifyChange()
     }
     
     /// Find a virtual disk with a specific name.
     /// - Parameters:
-    ///     - name: The name of the virtual disk. This is the last component of a pathlsit.
-    /// - Returns:The `VirtualDrive` object, if found; otherwise it throws an error.
+    ///     - name: The name of the virtual disk. This is the last component of a path.
+    /// - Returns:The `VirtualDrive` object, if found; otherwise nil.
     public func findVirtualDisk(name : String) -> VirtualDrive? {
-        if let foundDrive = virtualDrives.first(where: {($0.imagePath as NSString).lastPathComponent == name}) {
-            return foundDrive
+        guard let foundDrive = virtualDrives.first(where: {($0.imagePath as NSString).lastPathComponent == name}) else {
+            return nil
         }
-        return nil
+        return foundDrive
     }
     
     /// Find a free virtual drive.
@@ -497,12 +520,12 @@ public class DriveWireHost : Codable {
             tryAgain = false
             for v in virtualDrives {
                 if v.driveNumber == candidate {
-                    candidate = candidate + 1
+                    candidate += 1
                     tryAgain = true
                     break
                 }
             }
-        } while tryAgain == true
+        } while tryAgain
         
         return candidate
     }
@@ -518,11 +541,10 @@ public class DriveWireHost : Codable {
         
         serialBuffer.append(data)
         
-        repeat
-        {
-            bytesConsumed = self.processor!(serialBuffer)
-            
-            if bytesConsumed > 0  && serialBuffer.count >= bytesConsumed {
+        repeat {
+            guard let processor = self.processor else { return }
+            bytesConsumed = processor(serialBuffer)
+            if bytesConsumed > 0 && serialBuffer.count >= bytesConsumed {
                 // chop off consumed bytes
                 serialBuffer.replaceSubrange(0..<bytesConsumed, with: Data([]))
             }
@@ -533,13 +555,25 @@ public class DriveWireHost : Codable {
     
     private func setupWatchdog() {
         invalidateWatchdog()
-        watchdog = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false, block: { time in
-            self.resetState()
+        watchdog = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false, block: { [weak self] time in
+            self?.resetState()
         })
     }
     
     private func invalidateWatchdog() {
         watchdog?.invalidate()
+    }
+
+    private func configureVirtualDrives() {
+        for virtualDrive in virtualDrives {
+            virtualDrive.onChange = { [weak self] in
+                self?.notifyChange()
+            }
+        }
+    }
+
+    private func notifyChange() {
+        onChange?()
     }
     
     /// Computes a simple checksum of the passed data.
@@ -554,7 +588,7 @@ public class DriveWireHost : Codable {
         for d in data {
             lastChecksum += UInt16(d)
         }
-        return lastChecksum;
+        return lastChecksum
     }
     
     private func resetState() {
@@ -593,7 +627,7 @@ public class DriveWireHost : Codable {
             nameLength = Int(data[1])
             
             // We read 2 bytes into this buffer (OP_NAMEOBJ_MOUNT, 1 byte name length)
-            result = expectedCount;
+            result = expectedCount
             
             processor = OP_NAMEOBJ_MOUNT2
         }
@@ -601,28 +635,29 @@ public class DriveWireHost : Codable {
         return result
         
         func OP_NAMEOBJ_MOUNT2(data : Data) -> Int {
+            var innerResult = 0
             if data.count >= nameLength {
                 resetState()
-                result = nameLength;
-                let name = String(bytes: data, encoding: .ascii)!
-                
-                // determine if a named object with this name already exists
-                if let vd = findVirtualDisk(name: name) {
-                    response = UInt8(vd.driveNumber)
-                } else {
-                    do {
-                        let nextFreeDrive = findAvailableVirtualDrive()
-                        try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
-                        response = UInt8(nextFreeDrive);
-                    } catch {
-                        response = 0
+                innerResult = nameLength
+                if let name = String(bytes: data, encoding: .ascii) {
+                    // determine if a named object with this name already exists
+                    if let vd = findVirtualDisk(name: name) {
+                        response = UInt8(vd.driveNumber)
+                    } else {
+                        do {
+                            let nextFreeDrive = findAvailableVirtualDrive()
+                            try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
+                            response = UInt8(nextFreeDrive)
+                        } catch {
+                            response = 0
+                        }
                     }
+                    delegate?.dataAvailable(host: self, data: Data([response]))
+                    delegate?.transactionCompleted(opCode: currentTransaction)
                 }
-                delegate?.dataAvailable(host: self, data: Data([response]))
-                delegate?.transactionCompleted(opCode: currentTransaction)
             }
             
-            return result
+            return innerResult
         }
     }
     
@@ -636,7 +671,7 @@ public class DriveWireHost : Codable {
             nameLength = Int(data[1])
             
             // We read 2 bytes into this buffer (OP_NAMEOBJ_MOUNT, 1 byte name length)
-            result = expectedCount;
+            result = expectedCount
             
             processor = OP_NAMEOBJ_MOUNT2
         }
@@ -644,28 +679,29 @@ public class DriveWireHost : Codable {
         return result
         
         func OP_NAMEOBJ_MOUNT2(data : Data) -> Int {
+            var innerResult = 0
             if data.count >= nameLength {
                 resetState()
-                result = nameLength;
-                let name = String(bytes: data, encoding: .ascii)!
-                
-                // determine if a named object with this name already exists
-                if let _ = findVirtualDisk(name: name) {
-                    response = 0
-                } else {
-                    let nextFreeDrive = findAvailableVirtualDrive()
-                    do {
-                        try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
-                        response = UInt8(nextFreeDrive);
-                    } catch {
-                        
+                innerResult = nameLength
+                if let name = String(bytes: data, encoding: .ascii) {
+                    // determine if a named object with this name already exists
+                    if let _ = findVirtualDisk(name: name) {
+                        response = 0
+                    } else {
+                        let nextFreeDrive = findAvailableVirtualDrive()
+                        do {
+                            try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
+                            response = UInt8(nextFreeDrive)
+                        } catch {
+                            response = 0
+                        }
                     }
+                    delegate?.dataAvailable(host: self, data: Data([response]))
+                    delegate?.transactionCompleted(opCode: currentTransaction)
                 }
-                delegate?.dataAvailable(host: self, data: Data([response]))
-                delegate?.transactionCompleted(opCode: currentTransaction)
             }
             
-            return result
+            return innerResult
         }
     }
     
@@ -697,7 +733,7 @@ public class DriveWireHost : Codable {
         resetState()
         statistics = DriveWireStatistics()  // reset statistics
         delegate?.transactionCompleted(opCode: currentTransaction)
-        log = log + "OP_INIT" + "\n"
+        log = log + "OP_INIT\n"
         return 1
     }
     
@@ -705,7 +741,7 @@ public class DriveWireHost : Codable {
         currentTransaction = OPTERM
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        log = log + "OP_TERM" + "\n"
+        log = log + "OP_TERM\n"
         return 1
     }
     
@@ -717,7 +753,7 @@ public class DriveWireHost : Codable {
         
         if data.count >= expectedCount {
             resetState()
-            result = expectedCount;
+            result = expectedCount
             
             let driveNumber = data[1]
             statistics.lastDriveNumber = driveNumber
@@ -726,8 +762,6 @@ public class DriveWireHost : Codable {
             let sectorBuffer = data[5..<261]
             let checksum = Int(data[261])*256+Int(data[262])
 
-            result = expectedCount;
-            
             // Check if the drive number exists in our virtual drive list.
             if let virtualDrive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) {
                 // It exists! Verify checksum.
@@ -735,8 +769,10 @@ public class DriveWireHost : Codable {
                 if computedChecksum == checksum {
                     // All good. Write sector to disk image.
                     statistics.lastDriveNumber = driveNumber
-                    statistics.writeCount = statistics.writeCount + 1
-                    statistics.percentWritesOK = (1 - statistics.reWriteCount / statistics.writeCount) * 100
+                    statistics.writeCount += 1
+                    if statistics.writeCount != 0 {
+                        statistics.percentWritesOK = (1 - statistics.reWriteCount / statistics.writeCount) * 100
+                    }
                     error = virtualDrive.writeSector(lsn: vLSN, sector: sectorBuffer)
                 } else {
                     error = DriveWireProtocolError.E_CRC.rawValue
@@ -759,7 +795,7 @@ public class DriveWireHost : Codable {
     }
     
     private func OP_REWRITE(data : Data) -> Int {
-        statistics.reWriteCount = statistics.reWriteCount + 1
+        statistics.reWriteCount += 1
         return OP_WRITE_CORE(data: data, operation: OPREWRITE)
     }
     
@@ -770,14 +806,14 @@ public class DriveWireHost : Codable {
         
         if data.count >= expectedCount {
             resetState()
-            result = expectedCount;
+            result = expectedCount
             
             statistics.lastDriveNumber = data[1]
             statistics.lastGetStat = data[2]
             delegate?.transactionCompleted(opCode: currentTransaction)
+            log = log + "OP_GETSTAT(\(statistics.lastDriveNumber), \(statistics.lastGetStat))\n"
         }
         
-        log = log + "OP_GETSTAT(" + String(statistics.lastDriveNumber) + "," + String(statistics.lastGetStat) + ")" + "\n"
         return result
     }
     
@@ -788,14 +824,14 @@ public class DriveWireHost : Codable {
         
         if data.count >= expectedCount {
             resetState()
-            result = expectedCount;
+            result = expectedCount
             
             statistics.lastDriveNumber = data[1]
             statistics.lastSetStat = data[2]
             delegate?.transactionCompleted(opCode: currentTransaction)
+            log = log + "OP_SETSTAT(\(statistics.lastDriveNumber), \(statistics.lastGetStat))\n"
         }
         
-        log = log + "OP_SETSTAT(" + String(statistics.lastDriveNumber) + "," + String(statistics.lastGetStat) + ")" + "\n"
         return result
     }
     
@@ -803,7 +839,7 @@ public class DriveWireHost : Codable {
         currentTransaction = OPRESET
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        log = log + "OP_RESET" + "\n"
+        log = log + "OP_RESET\n"
         return 1
     }
     
@@ -814,8 +850,9 @@ public class DriveWireHost : Codable {
         
         if data.count >= expectedCount {
             resetState()
-            result = expectedCount;
+            result = expectedCount
             delegate?.transactionCompleted(opCode: currentTransaction)
+            log = log + "OP_WIREBUG\n"
         }
         
         return result
@@ -835,6 +872,7 @@ public class DriveWireHost : Codable {
             let printerByte = data[1]
             printBuffer.append(printerByte)
             delegate?.transactionCompleted(opCode: currentTransaction)
+            log = log + "OP_PRINT(\(printerByte))\n"
         }
         
         return result
@@ -847,22 +885,41 @@ public class DriveWireHost : Codable {
         // For now, just clear the print buffer
         printBuffer.removeAll()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        
+        log = log + "OP_PRINTFLUSH\n"
+
         return 1
     }
     
     private func OP_SERINIT(data : Data) -> Int {
+        var result = 0
+        let expectedCount = 2
         currentTransaction = OPSERINIT
-        resetState()
-        delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+
+        if data.count >= expectedCount {
+            resetState()
+            let channelNo = data[1]
+            result = expectedCount
+            delegate?.transactionCompleted(opCode: currentTransaction)
+            log = log + "OP_SERINIT(\(channelNo))\n"
+        }
+        
+        return result
     }
     
     private func OP_SERTERM(data : Data) -> Int {
+        var result = 0
+        let expectedCount = 2
         currentTransaction = OPSERTERM
-        resetState()
-        delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+
+        if data.count >= expectedCount {
+            resetState()
+            let channelNo = data[1]
+            result = expectedCount
+            delegate?.transactionCompleted(opCode: currentTransaction)
+            log = log + "OP_SERTERM(\(channelNo))\n"
+        }
+        
+        return result
     }
     
     private func OP_SERREAD(data : Data) -> Int {
@@ -873,17 +930,37 @@ public class DriveWireHost : Codable {
     }
     
     private func OP_SERREADM(data : Data) -> Int {
+        var result = 0
+        let expectedCount = 3
         currentTransaction = OPSERREADM
-        resetState()
-        delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+
+        if data.count >= expectedCount {
+            resetState()
+            let channelNo = data[1]
+            let numBytes = data[2]
+            result = expectedCount
+            delegate?.transactionCompleted(opCode: currentTransaction)
+            log = log + "OP_SEREADM(\(channelNo), \(numBytes))\n"
+        }
+        
+        return result
     }
     
     private func OP_SERWRITE(data : Data) -> Int {
+        var result = 0
+        let expectedCount = 3
         currentTransaction = OPSERWRITE
-        resetState()
-        delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+
+        if data.count >= expectedCount {
+            resetState()
+            let channelNo = data[1]
+            let dataByte = data[2]
+            result = expectedCount
+            delegate?.transactionCompleted(opCode: currentTransaction)
+            log = log + "OP_SEREADM(\(channelNo), \(dataByte))n"
+        }
+        
+        return result
     }
     
     private func OP_SERWRITEM(data : Data) -> Int {
@@ -894,17 +971,54 @@ public class DriveWireHost : Codable {
     }
     
     private func OP_SERGETSTAT(data : Data) -> Int {
+        var result = 0
+        let expectedCount = 3
         currentTransaction = OPSERGETSTAT
-        resetState()
-        delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+
+        if data.count >= expectedCount {
+            let channelNo = data[1]
+            let statByte = data[2]
+            result = expectedCount
+            resetState()
+            delegate?.transactionCompleted(opCode: currentTransaction)
+            log = log + "OP_SERGETSTAT(\(channelNo), \(statByte))\n"
+        }
+        
+        return result
     }
     
     private func OP_SERSETSTAT(data : Data) -> Int {
+        var result = 0
+        let expectedCount = 3
         currentTransaction = OPSERSETSTAT
-        resetState()
-        delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        
+        if data.count >= expectedCount {
+            let channelNo = data[1]
+            let statByte = data[2]
+            if statByte == 0x28 {
+                processor = OP_SERSETSTAT_0x28
+            } else {
+                result = expectedCount
+                resetState()
+                delegate?.transactionCompleted(opCode: currentTransaction)
+            }
+            log = log + "OP_SERSETSTAT(\(channelNo), \(statByte))\n"
+        }
+        
+        return result
+    }
+    
+    private func OP_SERSETSTAT_0x28(data : Data) -> Int {
+        var result = 0
+        let expectedCount = 26
+        
+        if data.count >= expectedCount {
+            result = expectedCount
+            resetState()
+            delegate?.transactionCompleted(opCode: currentTransaction)
+        }
+        
+        return result
     }
     
     private func OP_FASTWRITE_Serial(data : Data) -> Int {
@@ -965,7 +1079,7 @@ public class DriveWireHost : Codable {
     }
     
     private func OPRFMCREATE(data : Data) -> Int {
-        var result = 0
+        let result = 0
         let expectedCount = 2
         
         if data.count >= expectedCount {
@@ -1013,7 +1127,7 @@ public class DriveWireHost : Codable {
             if currentSubTransaction == DWRFMTransaction.OP_RFM_CHGDIR.rawValue {
                 
             } else {
-                rfmPathDescriptor.pathname = String(bytes: data, encoding: .ascii)!
+                rfmPathDescriptor.pathname = String(bytes: data, encoding: .ascii) ?? ""
             }
 
             result = expectedCount
@@ -1038,7 +1152,7 @@ public class DriveWireHost : Codable {
     }
     
     private func OPRFMMAKDIR(data : Data) -> Int {
-        var result = 1
+        let result = 1
         return result
     }
 
@@ -1088,11 +1202,11 @@ public class DriveWireHost : Codable {
 
                 if mode & 0x4 != 0 {
                     // execution directory
-                    rfmWorkingExecutionDirectoryPathDescriptor.pathname = String(bytes: data, encoding: .ascii)!
+                    rfmWorkingExecutionDirectoryPathDescriptor.pathname = String(bytes: data, encoding: .ascii) ?? ""
                     errorCode = rfmWorkingExecutionDirectoryPathDescriptor.openLocalFile()
                 } else {
                     // data directory
-                    rfmWorkingDataDirectoryPathDescriptor.pathname = String(bytes: data, encoding: .ascii)!
+                    rfmWorkingDataDirectoryPathDescriptor.pathname = String(bytes: data, encoding: .ascii) ?? ""
                     errorCode = rfmWorkingDataDirectoryPathDescriptor.openLocalFile()
                 }
 
@@ -1124,10 +1238,10 @@ public class DriveWireHost : Codable {
         }
     }
 
-private func OPRFMDELETE(data : Data) -> Int {
-    var result = 1
-    return result
-}
+    private func OPRFMDELETE(data : Data) -> Int {
+        let result = 1
+        return result
+    }
 
     // Format of command from the client at this point
     // - 2 byte: Path descriptor address (we use this as part of a unique identifier for this path)
@@ -1379,9 +1493,9 @@ private func OPRFMDELETE(data : Data) -> Int {
         var errorCode : UInt8 = 0
         
         if data.count >= expectedCount {
-            let processID = Int(data[0])
-            let pathNumber = Int(data[1])
-            let pathDescriptorAddress = Int(data[2]) * 256 + Int(data[3])
+            let _ = Int(data[0])
+            let _ = Int(data[1])
+            let _ = Int(data[2]) * 256 + Int(data[3])
             
             result = expectedCount
 
@@ -1405,30 +1519,33 @@ private func OPRFMDELETE(data : Data) -> Int {
         
         if byte >= 0x80 && byte <= 0x8E {
             // FASTWRITE serial
-            fastwriteChannel = byte & 0x0F;
+            fastwriteChannel = byte & 0x0F
             result = OP_FASTWRITE_Serial(data: data)
         }
         else if byte >= 0x91 && byte <= 0x9E {
             // FASTWRITE virtual screen
-            self.fastwriteChannel = (byte & 0x0F) - 1;
+            self.fastwriteChannel = (byte & 0x0F) - 1
             result = OP_FASTWRITE_Screen(data: data)
         } else {
             for e in dwTransaction {
                 if e.opcode == byte {
                     processor = e.processor
-                    result = processor!(data)
+                    if let processor = processor {
+                        result = processor(data)
+                    }
                     break
                 }
             }
         }
         
-        return result;
+        return result
     }
 }
 
+@MainActor
 extension DriveWireHost {
     private func OP_REREADEX(data : Data) -> Int {
-        statistics.reReadCount = statistics.reReadCount + 1
+        statistics.reReadCount += 1
         return OP_READEX(data: data)
     }
     
@@ -1446,14 +1563,16 @@ extension DriveWireHost {
             statistics.lastLSN = vLSN
 
             // We read 5 bytes into this buffer (OP_READEX, 1 byte drive number, 3 byte LSN)
-            result = 5;
+            result = 5
             
             // Check if the drive number exists in our virtual drive list.
             if let virtualDrive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) {
                 // It exists! Read sector from disk image.
                 statistics.lastDriveNumber = driveNumber
-                statistics.readCount = statistics.readCount + 1
-                statistics.percentReadsOK = (1 - statistics.reReadCount / statistics.readCount) * 100
+                statistics.readCount += 1
+                if statistics.readCount != 0 {
+                    statistics.percentReadsOK = (1 - statistics.reReadCount / statistics.readCount) * 100
+                }
                 (error, sectorBuffer) = virtualDrive.readSector(lsn: vLSN)
             } else {
                 // It doesn't exist. Set the error code.
@@ -1477,7 +1596,7 @@ extension DriveWireHost {
             if data.count >= 2 {
                 // We read 2 bytes into this buffer (guest's checksum).
                 // Here we're expecting the checksum from the guest.
-                result = 2;
+                result = 2
                 
                 let guestChecksum = UInt16(data[0]) * 256 + UInt16(data[1])
                 if readexChecksum != guestChecksum {
@@ -1496,7 +1615,7 @@ extension DriveWireHost {
     }
     
     private func OP_REREAD(data : Data) -> Int {
-        statistics.reReadCount = statistics.reReadCount + 1
+        statistics.reReadCount += 1
         return OP_READ(data: data)
     }
     
@@ -1514,14 +1633,16 @@ extension DriveWireHost {
             statistics.lastLSN = vLSN
 
             // We read 5 bytes into this buffer (OP_READEX, 1 byte drive number, 3 byte LSN)
-            result = 5;
+            result = 5
             
             // Check if the drive number exists in our virtual drive list.
             if let virtualDrive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) {
                 // It exists! Read sector from disk image.
                 statistics.lastDriveNumber = driveNumber
-                statistics.readCount = statistics.readCount + 1
-                statistics.percentReadsOK = (1 - statistics.reReadCount / statistics.readCount) * 100
+                statistics.readCount += 1
+                if statistics.readCount != 0 {
+                    statistics.percentReadsOK = (1 - statistics.reReadCount / statistics.readCount) * 100
+                }
                 (error, sectorBuffer) = virtualDrive.readSector(lsn: vLSN)
             } else {
                 // It doesn't exist. Set the error code.
@@ -1581,7 +1702,7 @@ extension Data {
             if count % 2 == 1 {
                 line.append(" ")
             }
-            count = count + 1
+            count += 1
             if count % 16 == 0 {
                 c()
             }
@@ -1593,18 +1714,18 @@ extension Data {
     }
 }
 
+@MainActor
 extension DriveWireHost {
     /// A representation of a storage device.
-    public class VirtualDrive : Codable {
-        
-        func didReceive(changes: String) {
-            do {
-                let u = URL(fileURLWithPath: self.imagePath)
-                self.storageContainer = try Data(contentsOf:u)
-            } catch {
-                print(error)
-            }
+    public class VirtualDrive : Codable, FileMonitorDelegate {
+        enum CodingKeys: String, CodingKey {
+            case driveNumber
+            case imagePath
+            case bookmarkData
+            case storageContainer
         }
+
+        var onChange: (() -> Void)?
         
         /// The drive number for this drive.
         var driveNumber = 0
@@ -1614,16 +1735,30 @@ extension DriveWireHost {
         
         private var bookmarkData = Data()
         private var storageContainer = Data()
+        private var fileMonitor: FileMonitor?
         
         /// Creates a new virtual drive.
         ///
         /// - Parameters:
         ///     - driveNumber: The number to assign to this virtual drive.
         ///     - imagePath: A path to a file that contains the drive's data.
-        init(driveNumber : Int, imagePath : String) throws {
+        public init(driveNumber : Int, imagePath : String) throws {
             self.driveNumber = driveNumber
             self.imagePath = imagePath
+            configureFileMonitor()
+            reload()
+        }
 
+        public required init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            self.driveNumber = try values.decode(Int.self, forKey: .driveNumber)
+            self.imagePath = try values.decode(String.self, forKey: .imagePath)
+            self.bookmarkData = try values.decode(Data.self, forKey: .bookmarkData)
+            self.storageContainer = try values.decode(Data.self, forKey: .storageContainer)
+            configureFileMonitor()
+        }
+
+        func fileMonitorDidChange(_ fileMonitor: FileMonitor) {
             reload()
         }
         
@@ -1631,6 +1766,7 @@ extension DriveWireHost {
             do {
                 let u = URL(fileURLWithPath: self.imagePath)
                 self.storageContainer = try Data(contentsOf:u)
+                onChange?()
             } catch {
                 print(error)
             }
@@ -1680,88 +1816,98 @@ extension DriveWireHost {
                 storageContainer[range] = sector
             }
 
+            do {
+                let url = URL(fileURLWithPath: imagePath)
+                try storageContainer.write(to: url, options: .atomic)
+            } catch {
+                print(error)
+                return DriveWireProtocolError.E_UNIT.rawValue
+            }
+
+            onChange?()
+
             return DriveWireProtocolError.E_NONE.rawValue
+        }
+
+        private func configureFileMonitor() {
+            do {
+                let monitor = try FileMonitor(url: URL(fileURLWithPath: imagePath))
+                monitor.delegate = self
+                fileMonitor = monitor
+            } catch {
+                fileMonitor = nil
+                print(error)
+            }
         }
     }
 }
 
 protocol FileMonitorDelegate: AnyObject {
-    func didReceive(changes: String)
+    func fileMonitorDidChange(_ fileMonitor: FileMonitor)
 }
 
-class FileMonitor : Codable {
-    enum CodingKeys: String, CodingKey {
-        case url
-    }
-
+class FileMonitor {
     let url: URL
-    let fileHandle: FileHandle
     weak var delegate: FileMonitorDelegate?
-    let source: DispatchSourceFileSystemObject
-
-    public required init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        self.url = try values.decode(URL.self, forKey: .url)
-        self.fileHandle = try FileHandle(forReadingFrom: self.url)
-        self.delegate = nil
-        self.source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fileHandle.fileDescriptor,
-            eventMask: .extend,
-            queue: DispatchQueue.main
-        )
-        
-        source.setEventHandler {
-            let event = self.source.data
-            self.process(event: event)
-        }
-        
-        source.setCancelHandler {
-            try? self.fileHandle.close()
-        }
-        
-        fileHandle.seekToEndOfFile()
-        source.resume()
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(url, forKey:.url)
-    }
+    private var fileHandle: FileHandle?
+    private var source: DispatchSourceFileSystemObject?
     
 
-    init(url: URL) throws {
+    public init(url: URL) throws {
         self.url = url
-        self.fileHandle = try FileHandle(forReadingFrom: url)
-
-        source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fileHandle.fileDescriptor,
-            eventMask: .delete,
-            queue: DispatchQueue.main
-        )
-
-        source.setEventHandler {
-            let event = self.source.data
-            self.process(event: event)
-        }
-
-        source.setCancelHandler {
-            try? self.fileHandle.close()
-        }
-
-        fileHandle.seekToEndOfFile()
-        source.resume()
+        try startMonitoring()
     }
 
     deinit {
-        source.cancel()
+        stopMonitoring()
+    }
+
+    private func startMonitoring() throws {
+        let fileHandle = try FileHandle(forReadingFrom: url)
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fileHandle.fileDescriptor,
+            eventMask: [.write, .extend, .delete, .rename, .attrib, .revoke],
+            queue: DispatchQueue.main
+        )
+
+        source.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            let event = source.data
+            self.process(event: event)
+        }
+
+        source.setCancelHandler {
+            try? fileHandle.close()
+        }
+
+        self.fileHandle = fileHandle
+        self.source = source
+        source.resume()
+    }
+
+    private func stopMonitoring() {
+        source?.cancel()
+        source = nil
+        fileHandle = nil
+    }
+
+    private func restartMonitoringSoon() {
+        stopMonitoring()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self else { return }
+            do {
+                try self.startMonitoring()
+            } catch {
+                print(error)
+            }
+        }
     }
 
     func process(event: DispatchSource.FileSystemEvent) {
-        guard event.contains(.delete) else {
-            return
+        delegate?.fileMonitorDidChange(self)
+
+        if event.contains(.delete) || event.contains(.rename) || event.contains(.revoke) {
+            restartMonitoringSoon()
         }
-        let newData = self.fileHandle.readDataToEndOfFile()
-        let string = String(data: newData, encoding: .utf8)!
-        self.delegate?.didReceive(changes: string)
     }
 }

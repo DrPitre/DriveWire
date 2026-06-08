@@ -9,7 +9,7 @@
 			<string>Editor</string>
 			<key>LSItemContentTypes</key>
 			<array>
-				<string>com.boisypitre.drivewire</string>
+				<string>org.pitre.drivewire</string>
 			</array>
 			<key>NSUbiquitousDocumentUserActivityType</key>
 			<string>$(PRODUCT_BUNDLE_IDENTIFIER).drivewire-document</string>
@@ -25,7 +25,7 @@
 			<key>UTTypeDescription</key>
 			<string>DriveWire Document</string>
 			<key>UTTypeIdentifier</key>
-			<string>com.boisypitre.drivewire-document</string>
+			<string>org.pitre.drivewire-document</string>
 			<key>UTTypeTagSpecification</key>
 			<dict>
 				<key>public.filename-extension</key>
