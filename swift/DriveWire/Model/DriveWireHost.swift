@@ -164,51 +164,25 @@ public class DriveWireHost : Codable {
             return 0
         }
 
-        mutating func readLineFromFile(offset : Int, maximumCount : Int) -> (UInt8, Data) {
-            var errorCode : UInt8 = 0
+        mutating func readLineFromFile(maximumCount: Int) -> (UInt8, Data) {
+            guard filePosition < fileContents.count else { return (211, Data()) }
             var data = Data()
-            
-            var byte : UInt8 = 0
-            repeat {
-                do {
-                    if filePosition >= fileContents.count {
-                        errorCode = 211
-                        break
-                    }
-                    byte = fileContents[filePosition]
-                    filePosition = filePosition + 1
-                    if byte == 0x0A {
-                        byte = 0x0D
-                    }
-                    data = data + Data([byte])
-                } catch {
-                    errorCode = 211
-                }
-            } while filePosition < fileContents.count && data.count <= maximumCount && byte != 0x0D && errorCode == 0
-
-            return (errorCode, data)
+            while filePosition < fileContents.count && data.count < maximumCount {
+                var byte = fileContents[filePosition]
+                filePosition += 1
+                if byte == 0x0A { byte = 0x0D }
+                data.append(byte)
+                if byte == 0x0D { break }
+            }
+            return (0, data)
         }
 
-        mutating func readFromFile(offset : Int, maximumCount : Int) -> (UInt8, Data) {
-            var errorCode : UInt8 = 0
-            var data = Data()
-            
-            var byte : UInt8 = 0
-            repeat {
-                do {
-                    if filePosition >= fileContents.count {
-                        errorCode = 211
-                        break
-                    }
-                    byte = fileContents[filePosition]
-                    filePosition = filePosition + 1
-                    data = data + Data([byte])
-                } catch {
-                    errorCode = 211
-                }
-            } while filePosition < fileContents.count && data.count < maximumCount && errorCode == 0
-
-            return (errorCode, data)
+        mutating func readFromFile(maximumCount: Int) -> (UInt8, Data) {
+            guard filePosition < fileContents.count else { return (211, Data()) }
+            let end = min(filePosition + maximumCount, fileContents.count)
+            let data = Data(fileContents[filePosition..<end])
+            filePosition = end
+            return (0, data)
         }
     }
 
@@ -1068,7 +1042,7 @@ public class DriveWireHost : Codable {
             result = expectedCount
 
             if var descriptor = rfmPaths[pathNumber] {
-                let (errorCode, lineData) = descriptor.readFromFile(offset: descriptor.filePosition, maximumCount: maxBytes)
+                let (errorCode, lineData) = descriptor.readFromFile(maximumCount: maxBytes)
                 rfmPaths[pathNumber] = descriptor
                 if errorCode != 0 {
                     delegate?.dataAvailable(host: self, data: Data([0x00]))
@@ -1117,7 +1091,7 @@ public class DriveWireHost : Codable {
             result = expectedCount
 
             if var descriptor = rfmPaths[pathNumber] {
-                let (errorCode, lineData) = descriptor.readLineFromFile(offset: descriptor.filePosition, maximumCount: maxBytes)
+                let (errorCode, lineData) = descriptor.readLineFromFile(maximumCount: maxBytes)
                 rfmPaths[pathNumber] = descriptor
                 if errorCode != 0 {
                     delegate?.dataAvailable(host: self, data: Data([0x00]))
