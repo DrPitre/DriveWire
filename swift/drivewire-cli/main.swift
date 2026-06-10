@@ -30,12 +30,16 @@ struct DriveWireCmd: ParsableCommand {
     @Flag(name: .shortAndLong, help: "Show client activity")
     var verbose: Bool = false
 
+    @Option(name: .long, help: "Root path for RFM file access (default: home directory)")
+    var rfmRoot: String = NSHomeDirectory()
+
     func run() throws {
         let d = DriveWireSerialDriver()
-        
+
         d.baudRate = baudRate
         d.portName = port
         d.logging = verbose
+        d.host.rfmRootPath = rfmRoot
 
         if let disk0Path = disk0 {
             try d.host.insertVirtualDisk(driveNumber: 0, imagePath: disk0Path)

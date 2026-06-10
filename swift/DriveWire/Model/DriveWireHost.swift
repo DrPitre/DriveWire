@@ -105,38 +105,63 @@ public class DriveWireHost : Codable {
     private var processor : ((Data) -> Int)?
     
     struct RFMPathDescriptor {
+        var processID = 0
         var pathNumber = 0
+        var pathDescriptorAddress = 0
         var mode = 0
         var filePosition = 0
         var pathname = ""
+        var shouldCreate = false
         var localFile : FileHandle? = nil
         var fileContents : Data = Data()
         var attributes = [FileAttributeKey : Any]()
 
         mutating func openLocalFile(rootPath: String) -> UInt8 {
-            var errorCode : UInt8 = 0
             let localPathname: String
             if (pathname as NSString).isAbsolutePath {
                 localPathname = rootPath + pathname
             } else {
                 localPathname = rootPath + "/" + pathname
             }
+
+            // Guard against path traversal escaping rfmRootPath.
+            guard !pathname.isEmpty else { return 216 }
+            let resolvedPath = URL(filePath: localPathname).standardized.path
+            let normalizedRoot = URL(filePath: rootPath).standardized.path
+            guard resolvedPath == normalizedRoot || resolvedPath.hasPrefix(normalizedRoot + "/") else {
+                return 214  // E$FNA
+            }
+
             do {
-                attributes = try FileManager.default.attributesOfItem(atPath: localPathname)
+                let fileExists = FileManager.default.fileExists(atPath: localPathname)
                 if mode & 0x80 != 0 {
+                    guard fileExists else { return 216 }
+                    attributes = try FileManager.default.attributesOfItem(atPath: localPathname)
                     if let fileType = attributes[.type] as? FileAttributeType, fileType != .typeDirectory {
-                        errorCode = 214
+                        return 214
                     }
                 } else {
-                    localFile = try FileHandle(forReadingFrom: URL(filePath: localPathname))
-                    if let localFile = localFile {
-                        fileContents = localFile.availableData
+                    if !fileExists {
+                        guard shouldCreate else { return 216 }
+                        guard FileManager.default.createFile(atPath: localPathname, contents: nil) else {
+                            return 216
+                        }
+                    } else {
+                        attributes = try FileManager.default.attributesOfItem(atPath: localPathname)
+                    }
+                    let url = URL(filePath: localPathname)
+                    let needsWrite = (mode & 0x0A) != 0 || shouldCreate
+                    localFile = needsWrite
+                        ? try FileHandle(forUpdating: url)
+                        : try FileHandle(forReadingFrom: url)
+                    if let f = localFile {
+                        fileContents = f.availableData
                     }
                 }
             } catch {
-                errorCode = 216
+                return 216
             }
-            return errorCode
+            return 0
         }
 
         mutating func readLineFromFile(offset : Int, maximumCount : Int) -> (UInt8, Data) {
@@ -956,22 +981,27 @@ public class DriveWireHost : Codable {
     }
     
     private func OPRFMCREATE(data : Data) -> Int {
-        // Create is handled identically to Open on the host side.
-        return OPRFMOPEN(data: data)
+        return rfmOpen(data: data, shouldCreate: true)
     }
 
-    // Receives: path#(1) + mode(1), then pathname terminated by CR ($0D).
+    // Receives: path#(1) + processID(1) + mode(1), then pathname terminated by CR ($0D).
     // Sends back: 1-byte error code.
     private func OPRFMOPEN(data : Data) -> Int {
+        return rfmOpen(data: data, shouldCreate: false)
+    }
+
+    private func rfmOpen(data: Data, shouldCreate: Bool) -> Int {
         var result = 0
-        let expectedCount = 2
+        let expectedCount = 3
         var capturedPathNumber = 0
 
         if data.count >= expectedCount {
             capturedPathNumber = Int(data[0])
             var descriptor = RFMPathDescriptor()
             descriptor.pathNumber = capturedPathNumber
-            descriptor.mode = Int(data[1])
+            descriptor.processID = Int(data[1])
+            descriptor.mode = Int(data[2])
+            descriptor.shouldCreate = shouldCreate
             rfmPaths[capturedPathNumber] = descriptor
             result = expectedCount
             processor = OPRFMGETPATH
@@ -981,11 +1011,12 @@ public class DriveWireHost : Codable {
 
         func OPRFMGETPATH(data: Data) -> Int {
             guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
-            let pathname = String(bytes: data[data.startIndex..<crOffset], encoding: .ascii) ?? ""
+            let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let pathname = String(bytes: pathBytes, encoding: .ascii) ?? ""
             rfmPaths[capturedPathNumber]?.pathname = pathname
             let errorCode = rfmPaths[capturedPathNumber]?.openLocalFile(rootPath: rfmRootPath) ?? 0xFF
             delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            log += "OP_RFM_OPEN(\(capturedPathNumber), \(pathname)) -> \(errorCode)\n"
+            log += "OP_RFM_\(shouldCreate ? "CREATE" : "OPEN")(\(capturedPathNumber), \(pathname)) -> \(errorCode)\n"
             resetState()
             return crOffset - data.startIndex + 1
         }
