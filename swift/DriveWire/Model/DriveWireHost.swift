@@ -511,9 +511,10 @@ public class DriveWireHost : Codable {
         repeat
         {
             bytesConsumed = self.processor!(serialBuffer)
-            
+
             if bytesConsumed > 0  && serialBuffer.count >= bytesConsumed {
-                // chop off consumed bytes
+                // Bytes were consumed — cancel the idle watchdog while mid-transaction.
+                invalidateWatchdog()
                 serialBuffer.replaceSubrange(0..<bytesConsumed, with: Data([]))
             }
         } while bytesConsumed > 0 && serialBuffer.count > 0
