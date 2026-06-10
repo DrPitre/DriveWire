@@ -126,7 +126,7 @@ public class DriveWireHost : Codable {
             }
 
             // Guard against path traversal escaping rfmRootPath.
-            guard !pathname.isEmpty else { return 216 }
+            guard !pathname.isEmpty && !pathname.contains("\0") else { return 216 }
             let resolvedPath = URL(filePath: localPathname).standardized.path
             let normalizedRoot = URL(filePath: rootPath).standardized.path
             guard resolvedPath == normalizedRoot || resolvedPath.hasPrefix(normalizedRoot + "/") else {
