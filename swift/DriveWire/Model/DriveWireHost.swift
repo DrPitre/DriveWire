@@ -596,8 +596,8 @@ public class DriveWireHost : Codable {
             if data.count >= nameLength {
                 resetState()
                 result = nameLength;
-                let name = String(bytes: data, encoding: .ascii)!
-                
+                let name = String(bytes: data, encoding: .ascii) ?? ""
+
                 // determine if a named object with this name already exists
                 if let vd = findVirtualDisk(name: name) {
                     response = UInt8(vd.driveNumber)
@@ -613,11 +613,11 @@ public class DriveWireHost : Codable {
                 delegate?.dataAvailable(host: self, data: Data([response]))
                 delegate?.transactionCompleted(opCode: currentTransaction)
             }
-            
+
             return result
         }
     }
-    
+
     private func OP_NAMEOBJ_CREATE(data : Data) -> Int {
         var nameLength = 0
         var result = 0
@@ -639,8 +639,8 @@ public class DriveWireHost : Codable {
             if data.count >= nameLength {
                 resetState()
                 result = nameLength;
-                let name = String(bytes: data, encoding: .ascii)!
-                
+                let name = String(bytes: data, encoding: .ascii) ?? ""
+
                 // determine if a named object with this name already exists
                 if let _ = findVirtualDisk(name: name) {
                     response = 0
@@ -650,13 +650,13 @@ public class DriveWireHost : Codable {
                         try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
                         response = UInt8(nextFreeDrive);
                     } catch {
-                        
+
                     }
                 }
                 delegate?.dataAvailable(host: self, data: Data([response]))
                 delegate?.transactionCompleted(opCode: currentTransaction)
             }
-            
+
             return result
         }
     }
