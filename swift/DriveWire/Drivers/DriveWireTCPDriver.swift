@@ -214,7 +214,7 @@ class DriveWireTCPServerDriver: NSObject, DriveWireDelegate, ObservableObject {
     }
 
     func start(port: UInt16) throws {
-        host = DriveWireHost(delegate: self)
+        host.delegate = self
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             throw DriveWireHostError.nameNotFound
         }
