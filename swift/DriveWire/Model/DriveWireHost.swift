@@ -67,6 +67,7 @@ public class DriveWireHost : Codable {
     var log : String = ""
 
     init() {
+        setupTransactions()
     }
     
     func reloadVirtualDrives() {
