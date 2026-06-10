@@ -10,7 +10,10 @@ import ArgumentParser
 
 struct DriveWireCmd: ParsableCommand {
     @Option(name: .shortAndLong, help: "Serial port path (e.g. /dev/cu.usbserial-FTVA079L)")
-    var port: String
+    var port: String?
+
+    @Option(name: .long, help: "TCP port to listen on for incoming guest connections (e.g. MAME -bitb socket.127.0.0.1:<port>)")
+    var tcpPort: UInt16?
 
     @Option(name: .shortAndLong, help: "Baud rate for the serial port")
     var baudRate: Int = 57600
@@ -34,29 +37,32 @@ struct DriveWireCmd: ParsableCommand {
     var rfmRoot: String = NSHomeDirectory()
 
     func run() throws {
-        let d = DriveWireSerialDriver()
+        guard port != nil || tcpPort != nil else {
+            throw ValidationError("Provide either --port (serial) or --tcp-port (TCP server).")
+        }
 
-        d.baudRate = baudRate
-        d.portName = port
-        d.logging = verbose
-        d.host.rfmRootPath = rfmRoot
+        func insertDisks(into host: DriveWireHost) throws {
+            if let p = disk0 { try host.insertVirtualDisk(driveNumber: 0, imagePath: p) }
+            if let p = disk1 { try host.insertVirtualDisk(driveNumber: 1, imagePath: p) }
+            if let p = disk2 { try host.insertVirtualDisk(driveNumber: 2, imagePath: p) }
+            if let p = disk3 { try host.insertVirtualDisk(driveNumber: 3, imagePath: p) }
+        }
 
-        if let disk0Path = disk0 {
-            try d.host.insertVirtualDisk(driveNumber: 0, imagePath: disk0Path)
+        if let listenPort = tcpPort {
+            let d = DriveWireTCPServerDriver()
+            d.logging = verbose
+            d.host.rfmRootPath = rfmRoot
+            try insertDisks(into: d.host)
+            try d.start(port: listenPort)
+        } else if let serialPort = port {
+            let d = DriveWireSerialDriver()
+            d.baudRate = baudRate
+            d.portName = serialPort
+            d.logging = verbose
+            d.host.rfmRootPath = rfmRoot
+            try insertDisks(into: d.host)
         }
-        
-        if let disk1Path = disk1 {
-            try d.host.insertVirtualDisk(driveNumber: 1, imagePath: disk1Path)
-        }
-        
-        if let disk2Path = disk2 {
-            try d.host.insertVirtualDisk(driveNumber: 2, imagePath: disk2Path)
-        }
-        
-        if let disk3Path = disk3 {
-            try d.host.insertVirtualDisk(driveNumber: 3, imagePath: disk3Path)
-        }
-        
+
         while true {
             RunLoop.current.run(mode: .default, before: Date.distantFuture)
         }

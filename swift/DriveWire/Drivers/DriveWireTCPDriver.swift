@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Network
 
 /// Provides a TCP/IP interface to a DriveWire host.
 ///
@@ -191,5 +192,80 @@ extension DriveWireTCPDriver: StreamDelegate {
         default:
             break
         }
+    }
+}
+
+/// Provides a TCP server interface to a DriveWire host.
+///
+/// Listens for an incoming TCP connection (e.g. from MAME's `-bitb socket.127.0.0.1:<port>`)
+/// and serves a DriveWire guest over that connection.
+class DriveWireTCPServerDriver: NSObject, DriveWireDelegate, ObservableObject {
+    private var listener: NWListener?
+    private var connection: NWConnection?
+
+    public var logging = false
+    public var host: DriveWireHost = DriveWireHost()
+
+    func transactionCompleted(opCode: UInt8) {}
+
+    func dataAvailable(host: DriveWireHost, data: Data) {
+        if logging { data.dump(prefix: "<-") }
+        connection?.send(content: data, completion: .idempotent)
+    }
+
+    func start(port: UInt16) throws {
+        host = DriveWireHost(delegate: self)
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            throw DriveWireHostError.nameNotFound
+        }
+        listener = try NWListener(using: .tcp, on: nwPort)
+        listener?.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
+        listener?.stateUpdateHandler = { state in
+            if case .ready = state {
+                print("DriveWire TCP server listening on port \(port)")
+            }
+        }
+        listener?.start(queue: .main)
+    }
+
+    private func accept(_ conn: NWConnection) {
+        connection?.cancel()
+        connection = conn
+        conn.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                print("DriveWire guest connected")
+                self?.receive(from: conn)
+            case .failed, .cancelled:
+                print("DriveWire guest disconnected")
+                self?.connection = nil
+            default:
+                break
+            }
+        }
+        conn.start(queue: .main)
+    }
+
+    private func receive(from conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, isComplete, error in
+            if let data = data, !data.isEmpty {
+                if self?.logging == true { data.dump(prefix: "->") }
+                var d = data
+                self?.host.send(data: &d)
+            }
+            if error == nil && !isComplete {
+                self?.receive(from: conn)
+            } else {
+                print("DriveWire guest disconnected")
+                self?.connection = nil
+            }
+        }
+    }
+
+    func stop() {
+        connection?.cancel()
+        listener?.cancel()
+        connection = nil
+        listener = nil
     }
 }
