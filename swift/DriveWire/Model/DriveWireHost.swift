@@ -845,60 +845,71 @@ public class DriveWireHost : Codable {
     
     private func OP_SERINIT(data : Data) -> Int {
         currentTransaction = OPSERINIT
+        guard data.count >= 2 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 2  // opcode + channel#
     }
-    
+
     private func OP_SERTERM(data : Data) -> Int {
         currentTransaction = OPSERTERM
+        guard data.count >= 2 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 2  // opcode + channel#
     }
-    
+
     private func OP_SERREAD(data : Data) -> Int {
         currentTransaction = OPSERREAD
+        guard data.count >= 2 else { return 0 }
         resetState()
         delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
-        return 1
+        return 2  // opcode + channel#
     }
-    
+
     private func OP_SERREADM(data : Data) -> Int {
         currentTransaction = OPSERREADM
+        guard data.count >= 2 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 2  // opcode + channel#
     }
-    
+
     private func OP_SERWRITE(data : Data) -> Int {
         currentTransaction = OPSERWRITE
+        guard data.count >= 3 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 3  // opcode + channel# + data_byte
     }
-    
+
     private func OP_SERWRITEM(data : Data) -> Int {
         currentTransaction = OPSERWRITEM
+        guard data.count >= 3 else { return 0 }
+        let count = Int(data[2])
+        let total = 3 + count
+        guard data.count >= total else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return total  // opcode + channel# + count + data
     }
-    
+
     private func OP_SERGETSTAT(data : Data) -> Int {
         currentTransaction = OPSERGETSTAT
+        guard data.count >= 3 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 3  // opcode + channel# + stat_code
     }
-    
+
     private func OP_SERSETSTAT(data : Data) -> Int {
         currentTransaction = OPSERSETSTAT
+        guard data.count >= 3 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 3  // opcode + channel# + setstat_code
     }
-    
+
     private func OP_FASTWRITE_Serial(data : Data) -> Int {
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
