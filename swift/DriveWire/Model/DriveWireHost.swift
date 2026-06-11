@@ -193,6 +193,7 @@ public class DriveWireHost : Codable {
                     ? Data(data.map { $0 == 0x0D ? 0x0A : $0 })
                     : data
                 file.write(bytesToWrite)
+                file.synchronizeFile()
                 // Keep fileContents in sync for subsequent reads
                 let end = filePosition + bytesToWrite.count
                 if fileContents.count < end {
