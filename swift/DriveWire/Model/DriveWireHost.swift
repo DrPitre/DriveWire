@@ -1099,9 +1099,14 @@ public class DriveWireHost : Codable {
                 let normalizedRoot = URL(filePath: rfmRootPath).standardized.path
                 if resolved == normalizedRoot || resolved.hasPrefix(normalizedRoot + "/") {
                     do {
-                        try FileManager.default.removeItem(atPath: resolved)
-                        errorCode = 0
-                        log += "OP_RFM_DELETE(\(capturedPathNumber), \(pathname)) -> 0\n"
+                        let attrs = try FileManager.default.attributesOfItem(atPath: resolved)
+                        if attrs[.type] as? FileAttributeType == .typeDirectory {
+                            errorCode = 214  // E$FNA — use deldir for directories
+                        } else {
+                            try FileManager.default.removeItem(atPath: resolved)
+                            errorCode = 0
+                            log += "OP_RFM_DELETE(\(capturedPathNumber), \(pathname)) -> 0\n"
+                        }
                     } catch { errorCode = 216 }
                 } else { errorCode = 214 }
             }
