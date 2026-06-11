@@ -118,15 +118,14 @@ public class DriveWireHost : Codable {
         var attributes = [FileAttributeKey : Any]()
 
         mutating func openLocalFile(rootPath: String) -> UInt8 {
+            guard !pathname.isEmpty && !pathname.contains("\0") else { return 216 }
+
             let localPathname: String
             if (pathname as NSString).isAbsolutePath {
                 localPathname = rootPath + pathname
             } else {
                 localPathname = rootPath + "/" + pathname
             }
-
-            // Guard against path traversal escaping rfmRootPath.
-            guard !pathname.isEmpty && !pathname.contains("\0") else { return 216 }
             let resolvedPath = URL(filePath: localPathname).standardized.path
             let normalizedRoot = URL(filePath: rootPath).standardized.path
             guard resolvedPath == normalizedRoot || resolvedPath.hasPrefix(normalizedRoot + "/") else {
