@@ -113,6 +113,7 @@ public class DriveWireHost : Codable {
         var filePosition = 0
         var pathname = ""
         var shouldCreate = false
+        var pendingClose = false
         var localFile : FileHandle? = nil
         var fileContents : Data = Data()
         var attributes = [FileAttributeKey : Any]()
@@ -1192,14 +1193,22 @@ public class DriveWireHost : Codable {
     }
 
     // Receives: path#(1). Sends back: 1-byte error code.
+    // Receives: path#(1). Sends back: 1-byte error code.
+    // If the path was opened via CREATE, the shell closes its reference after
+    // forking the child writer — keep the descriptor alive for incoming writes.
     private func OPRFMCLOSE(data: Data) -> Int {
         var result = 0
         let expectedCount = 1
 
         if data.count >= expectedCount {
             let pathNumber = Int(data[0])
-            rfmPaths[pathNumber]?.localFile?.closeFile()
-            rfmPaths.removeValue(forKey: pathNumber)
+            if let descriptor = rfmPaths[pathNumber], descriptor.shouldCreate && !descriptor.pendingClose {
+                // First close of a CREATE'd path — stay open for child writes
+                rfmPaths[pathNumber]?.pendingClose = true
+            } else {
+                rfmPaths[pathNumber]?.localFile?.closeFile()
+                rfmPaths.removeValue(forKey: pathNumber)
+            }
             result = expectedCount
             delegate?.dataAvailable(host: self, data: Data([0x00]))
             resetState()
