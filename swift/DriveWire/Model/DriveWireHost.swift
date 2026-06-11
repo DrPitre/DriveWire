@@ -1101,10 +1101,11 @@ public class DriveWireHost : Codable {
             let byteCount = Int(data[1]) * 256 + Int(data[2])
             let totalCount = headerCount + byteCount
             if data.count >= totalCount {
-                if var descriptor = rfmPaths[pathNumber] {
-                    let writeData = data[headerCount..<totalCount]
-                    _ = descriptor.writeToFile(data: Data(writeData))
-                    rfmPaths[pathNumber] = descriptor
+                let key = rfmPaths[pathNumber] != nil ? pathNumber
+                    : rfmPaths.first { $0.value.localFile != nil }?.key
+                if let k = key, var descriptor = rfmPaths[k] {
+                    _ = descriptor.writeToFile(data: Data(data[headerCount..<totalCount]))
+                    rfmPaths[k] = descriptor
                 }
                 result = totalCount
                 resetState()
@@ -1154,10 +1155,11 @@ public class DriveWireHost : Codable {
             let byteCount = Int(data[1]) * 256 + Int(data[2])
             let totalCount = headerCount + byteCount
             if data.count >= totalCount {
-                if var descriptor = rfmPaths[pathNumber] {
-                    let writeData = data[headerCount..<totalCount]
-                    _ = descriptor.writeToFile(data: Data(writeData), translateCR: true)
-                    rfmPaths[pathNumber] = descriptor
+                let key = rfmPaths[pathNumber] != nil ? pathNumber
+                    : rfmPaths.first { $0.value.localFile != nil }?.key
+                if let k = key, var descriptor = rfmPaths[k] {
+                    _ = descriptor.writeToFile(data: Data(data[headerCount..<totalCount]), translateCR: true)
+                    rfmPaths[k] = descriptor
                 }
                 result = totalCount
                 resetState()
