@@ -1145,8 +1145,6 @@ public class DriveWireHost : Codable {
     }
 
     // Receives: path#(1) then count(2) then count bytes. No response.
-    // Receives: path#(1) then count(2) then count bytes. No response.
-    // Translates CR → LF since OS-9 uses CR as line terminator.
     private func OPRFMWRITLN(data: Data) -> Int {
         var result = 0
         let headerCount = 3
