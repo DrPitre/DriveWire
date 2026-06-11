@@ -202,6 +202,7 @@ public class DriveWireHost : Codable {
             } else {
                 bytesToWrite = data
             }
+            file.seek(toFileOffset: UInt64(filePosition))
             file.write(bytesToWrite)
             file.synchronizeFile()
             filePosition += bytesToWrite.count
