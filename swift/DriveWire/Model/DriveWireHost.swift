@@ -67,6 +67,7 @@ public class DriveWireHost : Codable {
     var log : String = ""
 
     init() {
+        setupTransactions()
     }
     
     func reloadVirtualDrives() {
@@ -110,94 +111,106 @@ public class DriveWireHost : Codable {
         var pathDescriptorAddress = 0
         var mode = 0
         var filePosition = 0
-        var pathnameLength = 0
         var pathname = ""
-        var errorCode : UInt8 = 0
+        var shouldCreate = false
+        var pendingClose = false
         var localFile : FileHandle? = nil
         var fileContents : Data = Data()
         var attributes = [FileAttributeKey : Any]()
-        
-        mutating func openLocalFile() -> UInt8 {
-            var errorCode : UInt8 = 0
-            
-            var localPathname = pathname
-            if (localPathname as NSString).isAbsolutePath == false {
-                // TODO: resolve relative paths
+
+        mutating func openLocalFile(rootPath: String) -> UInt8 {
+            guard !pathname.isEmpty && !pathname.contains("\0") else { return 216 }
+
+            let localPathname: String
+            if (pathname as NSString).isAbsolutePath {
+                localPathname = rootPath + pathname
+            } else {
+                localPathname = rootPath + "/" + pathname
             }
+            let resolvedPath = URL(filePath: localPathname).standardized.path
+            let normalizedRoot = URL(filePath: rootPath).standardized.path
+            guard resolvedPath == normalizedRoot || resolvedPath.hasPrefix(normalizedRoot + "/") else {
+                return 214  // E$FNA
+            }
+
             do {
-                localPathname = "/Users/boisy" + localPathname
-                attributes = try FileManager().attributesOfItem(atPath: localPathname)
-                
-                // Determine if we're opening a directory
+                let fileExists = FileManager.default.fileExists(atPath: localPathname)
                 if mode & 0x80 != 0 {
-                    // We're expecting this to be a directory
-                    if let fileType = attributes[FileAttributeKey.type] as? String, fileType != "NSFileTypeDirectory" {
-                        errorCode = 214
+                    guard fileExists else { return 216 }
+                    attributes = try FileManager.default.attributesOfItem(atPath: localPathname)
+                    if let fileType = attributes[.type] as? FileAttributeType, fileType != .typeDirectory {
+                        return 214
                     }
                 } else {
-                    localFile = try FileHandle(forReadingFrom: URL(filePath: localPathname))
-                    if let localFile = localFile {
-                        fileContents = localFile.availableData
+                    if !fileExists {
+                        guard shouldCreate else { return 216 }
+                        guard FileManager.default.createFile(atPath: localPathname, contents: nil) else {
+                            return 216
+                        }
+                    } else {
+                        attributes = try FileManager.default.attributesOfItem(atPath: localPathname)
+                    }
+                    let url = URL(filePath: localPathname)
+                    let needsWrite = (mode & 0x0A) != 0 || shouldCreate
+                    localFile = needsWrite
+                        ? try FileHandle(forUpdating: url)
+                        : try FileHandle(forReadingFrom: url)
+                    if let f = localFile {
+                        fileContents = f.availableData
                     }
                 }
             } catch {
-                errorCode = 216
+                return 216
             }
-            
-            return errorCode
+            return 0
         }
 
-        mutating func readLineFromFile(offset : Int, maximumCount : Int) -> (UInt8, Data) {
-            var errorCode : UInt8 = 0
+        mutating func readLineFromFile(maximumCount: Int) -> (UInt8, Data) {
+            guard filePosition < fileContents.count else { return (211, Data()) }
             var data = Data()
-            
-            var byte : UInt8 = 0
-            repeat {
-                do {
-                    if filePosition >= fileContents.count {
-                        errorCode = 211
-                        break
-                    }
-                    byte = fileContents[filePosition]
-                    filePosition = filePosition + 1
-                    if byte == 0x0A {
-                        byte = 0x0D
-                    }
-                    data = data + Data([byte])
-                } catch {
-                    errorCode = 211
-                }
-            } while filePosition < fileContents.count && data.count <= maximumCount && byte != 0x0D && errorCode == 0
-
-            return (errorCode, data)
+            while filePosition < fileContents.count && data.count < maximumCount {
+                var byte = fileContents[filePosition]
+                filePosition += 1
+                if byte == 0x0A { byte = 0x0D }
+                data.append(byte)
+                if byte == 0x0D { break }
+            }
+            return (0, data)
         }
 
-        mutating func readFromFile(offset : Int, maximumCount : Int) -> (UInt8, Data) {
-            var errorCode : UInt8 = 0
-            var data = Data()
-            
-            var byte : UInt8 = 0
-            repeat {
-                do {
-                    if filePosition >= fileContents.count {
-                        errorCode = 211
-                        break
-                    }
-                    byte = fileContents[filePosition]
-                    filePosition = filePosition + 1
-                    data = data + Data([byte])
-                } catch {
-                    errorCode = 211
-                }
-            } while filePosition < fileContents.count && data.count < maximumCount && errorCode == 0
+        mutating func readFromFile(maximumCount: Int) -> (UInt8, Data) {
+            guard filePosition < fileContents.count else { return (211, Data()) }
+            let end = min(filePosition + maximumCount, fileContents.count)
+            let data = Data(fileContents[filePosition..<end])
+            filePosition = end
+            return (0, data)
+        }
 
-            return (errorCode, data)
+        mutating func writeToFile(data: Data, translateCR: Bool = false) -> UInt8 {
+            guard let file = localFile else { return 216 }
+            let bytesToWrite: Data
+            if translateCR {
+                // Strip trailing $FF and $00 padding, convert all $0D → $0A
+                var endIndex = data.endIndex
+                while endIndex > data.startIndex {
+                    let prev = data.index(before: endIndex)
+                    let byte = data[prev]
+                    if byte != 0x00 && byte != 0xFF { break }
+                    endIndex = prev
+                }
+                bytesToWrite = Data(data[data.startIndex..<endIndex].map { $0 == 0x0D ? 0x0A : $0 })
+            } else {
+                bytesToWrite = data
+            }
+            file.write(bytesToWrite)
+            file.synchronizeFile()
+            filePosition += bytesToWrite.count
+            return 0
         }
     }
 
-    var rfmWorkingDataDirectoryPathDescriptor = RFMPathDescriptor()
-    var rfmWorkingExecutionDirectoryPathDescriptor = RFMPathDescriptor()
-    var rfmPathDescriptor = RFMPathDescriptor()
+    var rfmRootPath: String = NSHomeDirectory()
+    private var rfmPaths: [Int: RFMPathDescriptor] = [:]
     
     /// The no-operation transaction code.
     ///
@@ -521,9 +534,10 @@ public class DriveWireHost : Codable {
         repeat
         {
             bytesConsumed = self.processor!(serialBuffer)
-            
+
             if bytesConsumed > 0  && serialBuffer.count >= bytesConsumed {
-                // chop off consumed bytes
+                // Bytes were consumed — cancel the idle watchdog while mid-transaction.
+                invalidateWatchdog()
                 serialBuffer.replaceSubrange(0..<bytesConsumed, with: Data([]))
             }
         } while bytesConsumed > 0 && serialBuffer.count > 0
@@ -604,8 +618,8 @@ public class DriveWireHost : Codable {
             if data.count >= nameLength {
                 resetState()
                 result = nameLength;
-                let name = String(bytes: data, encoding: .ascii)!
-                
+                let name = String(bytes: data, encoding: .ascii) ?? ""
+
                 // determine if a named object with this name already exists
                 if let vd = findVirtualDisk(name: name) {
                     response = UInt8(vd.driveNumber)
@@ -621,11 +635,11 @@ public class DriveWireHost : Codable {
                 delegate?.dataAvailable(host: self, data: Data([response]))
                 delegate?.transactionCompleted(opCode: currentTransaction)
             }
-            
+
             return result
         }
     }
-    
+
     private func OP_NAMEOBJ_CREATE(data : Data) -> Int {
         var nameLength = 0
         var result = 0
@@ -647,8 +661,8 @@ public class DriveWireHost : Codable {
             if data.count >= nameLength {
                 resetState()
                 result = nameLength;
-                let name = String(bytes: data, encoding: .ascii)!
-                
+                let name = String(bytes: data, encoding: .ascii) ?? ""
+
                 // determine if a named object with this name already exists
                 if let _ = findVirtualDisk(name: name) {
                     response = 0
@@ -658,13 +672,13 @@ public class DriveWireHost : Codable {
                         try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
                         response = UInt8(nextFreeDrive);
                     } catch {
-                        
+
                     }
                 }
                 delegate?.dataAvailable(host: self, data: Data([response]))
                 delegate?.transactionCompleted(opCode: currentTransaction)
             }
-            
+
             return result
         }
     }
@@ -853,60 +867,71 @@ public class DriveWireHost : Codable {
     
     private func OP_SERINIT(data : Data) -> Int {
         currentTransaction = OPSERINIT
+        guard data.count >= 2 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 2  // opcode + channel#
     }
-    
+
     private func OP_SERTERM(data : Data) -> Int {
         currentTransaction = OPSERTERM
+        guard data.count >= 2 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 2  // opcode + channel#
     }
-    
+
     private func OP_SERREAD(data : Data) -> Int {
         currentTransaction = OPSERREAD
+        guard data.count >= 2 else { return 0 }
         resetState()
         delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
-        return 1
+        return 2  // opcode + channel#
     }
-    
+
     private func OP_SERREADM(data : Data) -> Int {
         currentTransaction = OPSERREADM
+        guard data.count >= 2 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 2  // opcode + channel#
     }
-    
+
     private func OP_SERWRITE(data : Data) -> Int {
         currentTransaction = OPSERWRITE
+        guard data.count >= 3 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 3  // opcode + channel# + data_byte
     }
-    
+
     private func OP_SERWRITEM(data : Data) -> Int {
         currentTransaction = OPSERWRITEM
+        guard data.count >= 3 else { return 0 }
+        let count = Int(data[2])
+        let total = 3 + count
+        guard data.count >= total else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return total  // opcode + channel# + count + data
     }
-    
+
     private func OP_SERGETSTAT(data : Data) -> Int {
         currentTransaction = OPSERGETSTAT
+        guard data.count >= 3 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 3  // opcode + channel# + stat_code
     }
-    
+
     private func OP_SERSETSTAT(data : Data) -> Int {
         currentTransaction = OPSERSETSTAT
+        guard data.count >= 3 else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 3  // opcode + channel# + setstat_code
     }
-    
+
     private func OP_FASTWRITE_Serial(data : Data) -> Int {
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
@@ -965,432 +990,269 @@ public class DriveWireHost : Codable {
     }
     
     private func OPRFMCREATE(data : Data) -> Int {
-        var result = 0
-        let expectedCount = 2
-        
-        if data.count >= expectedCount {
-            
-            resetState()
-        }
-        
-        return result
+        return rfmOpen(data: data, shouldCreate: true)
     }
-    
-    // Format of command from the client at this point
-    // - 2 byte: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 1 byte: Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 1 byte: Mode Byte from caller's R$A
-    // - 2 bytes: length of pathname
+
+    // Receives: path#(1) + processID(1) + mode(1), then pathname terminated by CR ($0D).
+    // Sends back: 1-byte error code.
     private func OPRFMOPEN(data : Data) -> Int {
+        return rfmOpen(data: data, shouldCreate: false)
+    }
+
+    private func rfmOpen(data: Data, shouldCreate: Bool) -> Int {
         var result = 0
-        let expectedCount = 7
+        let expectedCount = 3
+        var capturedPathNumber = 0
 
         if data.count >= expectedCount {
-            rfmPathDescriptor = RFMPathDescriptor()
-            rfmPathDescriptor.processID = Int(data[0])
-            rfmPathDescriptor.pathNumber = Int(data[1])
-            rfmPathDescriptor.pathDescriptorAddress = Int(data[2]) * 256 + Int(data[3])
-            rfmPathDescriptor.mode = Int(data[4])
-            rfmPathDescriptor.pathnameLength = Int(data[5]) * 256 + Int(data[6])
-            
+            capturedPathNumber = Int(data[0])
+            var descriptor = RFMPathDescriptor()
+            descriptor.pathNumber = capturedPathNumber
+            descriptor.processID = Int(data[1])
+            descriptor.mode = Int(data[2])
+            descriptor.shouldCreate = shouldCreate
+            rfmPaths[capturedPathNumber] = descriptor
             result = expectedCount
             processor = OPRFMGETPATH
-            log = log + "OP_RFM_OPEN("
         }
-        
+
         return result
-    }
 
-    private func OPRFMGETPATH(data : Data) -> Int {
-        var result = 0
-        let expectedCount = rfmPathDescriptor.pathnameLength
-
-        if data.count >= expectedCount {
-            var lsn0 : UInt8 = 0
-            var lsn1 : UInt8 = 0
-            var lsn2 : UInt8 = 0
-            
-            if currentSubTransaction == DWRFMTransaction.OP_RFM_CHGDIR.rawValue {
-                
-            } else {
-                rfmPathDescriptor.pathname = String(bytes: data, encoding: .ascii)!
-            }
-
-            result = expectedCount
-            
-            // Locate the file on the host.
-            let errorCode = rfmPathDescriptor.openLocalFile()
-
-            if errorCode == 0 {
-                // obtain unique identifier
-                lsn0 = 3
-                lsn1 = 2
-                lsn2 = 1
-            }
-            
-            delegate?.dataAvailable(host: self, data: Data([errorCode, lsn0, lsn1, lsn2]))
-            log = log + "\(rfmPathDescriptor.pathDescriptorAddress), \(rfmPathDescriptor.pathNumber), \(rfmPathDescriptor.pathname)) -> [\(errorCode), \(lsn0), \(lsn1), \(lsn2)]\n"
-
-            resetState()
-        }
-        
-        return result
-    }
-    
-    private func OPRFMMAKDIR(data : Data) -> Int {
-        var result = 1
-        return result
-    }
-
-    private func OPRFMCHGDIR(data : Data) -> Int {
-        var result = 0
-        let expectedCount = 7
-        var mode = 0
-        
-        if data.count >= expectedCount {
-            let processID = Int(data[0])
-            let pathNumber = Int(data[1])
-            let pathDescriptorAddress = Int(data[2]) * 256 + Int(data[3])
-            mode = Int(data[4])
-            let pathnameLength = Int(data[5]) * 256 + Int(data[6])
-
-            if mode & 0x4 != 0 {
-                // execution directory
-                rfmWorkingExecutionDirectoryPathDescriptor.processID = processID
-                rfmWorkingExecutionDirectoryPathDescriptor.pathNumber = pathNumber
-                rfmWorkingExecutionDirectoryPathDescriptor.pathDescriptorAddress = pathDescriptorAddress
-                rfmWorkingExecutionDirectoryPathDescriptor.mode = mode
-                rfmWorkingExecutionDirectoryPathDescriptor.pathnameLength = pathnameLength
-            } else {
-                // data directory
-                rfmWorkingDataDirectoryPathDescriptor.processID = processID
-                rfmWorkingDataDirectoryPathDescriptor.pathNumber = pathNumber
-                rfmWorkingDataDirectoryPathDescriptor.pathDescriptorAddress = pathDescriptorAddress
-                rfmWorkingDataDirectoryPathDescriptor.mode = mode
-                rfmWorkingDataDirectoryPathDescriptor.pathnameLength = pathnameLength
-            }
-            
-            result = expectedCount
-            processor = OPRFMGETCHGDIRPATH
-        }
-        
-        return result
-        
-        func OPRFMGETCHGDIRPATH(data : Data) -> Int {
-            var result = 0
-            let expectedCount = rfmPathDescriptor.pathnameLength
-            var errorCode : UInt8 = 0
-            
-            if data.count >= expectedCount {
-                var lsn0 : UInt8 = 0
-                var lsn1 : UInt8 = 0
-                var lsn2 : UInt8 = 0
-
-                if mode & 0x4 != 0 {
-                    // execution directory
-                    rfmWorkingExecutionDirectoryPathDescriptor.pathname = String(bytes: data, encoding: .ascii)!
-                    errorCode = rfmWorkingExecutionDirectoryPathDescriptor.openLocalFile()
-                } else {
-                    // data directory
-                    rfmWorkingDataDirectoryPathDescriptor.pathname = String(bytes: data, encoding: .ascii)!
-                    errorCode = rfmWorkingDataDirectoryPathDescriptor.openLocalFile()
-                }
-
-                result = expectedCount
-                
-                // Locate the file on the host.
-
-                if errorCode == 0 {
-                    // obtain unique identifier
-                    lsn0 = 3
-                    lsn1 = 2
-                    lsn2 = 1
-                }
-                
-                if mode & 0x4 != 0 {
-                    // execution directory
-                    log = log + "OP_RFM_CHGDIR(Execution, \(rfmWorkingExecutionDirectoryPathDescriptor.pathDescriptorAddress), \(rfmWorkingExecutionDirectoryPathDescriptor.pathNumber), \(rfmWorkingExecutionDirectoryPathDescriptor.pathname)) -> [\(errorCode), \(lsn0), \(lsn1), \(lsn2)]\n"
-                } else {
-                    // data directory
-                    log = log + "OP_RFM_CHGDIR(Data, \(rfmWorkingDataDirectoryPathDescriptor.pathDescriptorAddress), \(rfmWorkingDataDirectoryPathDescriptor.pathNumber), \(rfmWorkingDataDirectoryPathDescriptor.pathname)) -> [\(errorCode), \(lsn0), \(lsn1), \(lsn2)]\n"
-                }
-
-                delegate?.dataAvailable(host: self, data: Data([errorCode, lsn0, lsn1, lsn2]))
-
-                resetState()
-            }
-            
-            return result
-        }
-    }
-
-private func OPRFMDELETE(data : Data) -> Int {
-    var result = 1
-    return result
-}
-
-    // Format of command from the client at this point
-    // - 2 byte: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 1 byte: Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 4 bytes: 32-bit seek position
-    private func OPRFMSEEK(data : Data) -> Int {
-        var result = 0
-        let expectedCount = 7
-        var errorCode : UInt8 = 0
-
-        if data.count >= expectedCount {
-            rfmPathDescriptor.pathDescriptorAddress = Int(data[0]) * 256 + Int(data[1])
-            rfmPathDescriptor.pathNumber = Int(data[2])
-            rfmPathDescriptor.filePosition = Int(data[3]) * 16777216 + Int(data[4]) * 65536 + Int(data[5]) * 256 + Int(data[6])
-
-            result = expectedCount
-            resetState()
+        func OPRFMGETPATH(data: Data) -> Int {
+            guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
+            let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let pathname = String(bytes: pathBytes, encoding: .ascii) ?? ""
+            rfmPaths[capturedPathNumber]?.pathname = pathname
+            let errorCode = rfmPaths[capturedPathNumber]?.openLocalFile(rootPath: rfmRootPath) ?? 0xFF
             delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            log = log + "OP_RFM_SEEK(\(rfmPathDescriptor.filePosition)) -> R$B=\(errorCode)\n"
+            log += "OP_RFM_\(shouldCreate ? "CREATE" : "OPEN")(\(capturedPathNumber), \(pathname)) -> \(errorCode)\n"
+            resetState()
+            return crOffset - data.startIndex + 1
         }
-        
-        return result
     }
 
-    // Read data from the client.
-    //
-    // Format of command from the client at this point
-    // - 1 byte:  Process ID
-    // - 1 byte:  Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 2 bytes: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 2 bytes: Number of bytes to read
-    //
-    // If there is an error, then the following bytes are sent to the client, and the transaction terminates:
-    // - 1 byte:  a non-zero error code
-    // - 2 bytes: size to read (0)
-    //
-    // If there is NOT an error, then the following bytes are sent to the client:
-    // - 1 byte: 0 (no error)
-    // - 2 bytes: the number of bytes the client can read
-    //
-    // Upon receiving the non-error 3-byte response, the client will then issue a "ready" response of 1 byte.
-    // When the host receives the "ready" response, it will send the number of bytes to the client.
-    private func OPRFMREAD(data : Data) -> Int {
-        var pathDescriptorAddress = 0
-        var pathNumber = 0
-        var bytesToRead = 0
-        var errorCode : UInt8 = 0
-        var dataToSend = Data([0x00])
+    private func OPRFMMAKDIR(data: Data) -> Int {
+        var result = 0
+        let expectedCount = 3
+        var capturedPathNumber = 0
 
-        // Format of command from the client at this point
-        // - 1 byte: 0 = acknowledged previous response
-        func OPRFMREADP2(data : Data) -> Int {
-            var result = 0
-            let expectedCount = 1
-            
-            if data.count >= expectedCount {
-                result = expectedCount
-                delegate?.dataAvailable(host: self, data: dataToSend)
-            }
-
-            resetState()
-
-            return result
+        if data.count >= expectedCount {
+            capturedPathNumber = Int(data[0])
+            result = expectedCount
+            processor = OPRFMGETMKDIRPATH
         }
 
+        return result
+
+        func OPRFMGETMKDIRPATH(data: Data) -> Int {
+            guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
+            let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let pathname = String(bytes: pathBytes, encoding: .ascii) ?? ""
+            var errorCode: UInt8 = 216
+            if !pathname.isEmpty && !pathname.contains("\0") {
+                let localPath = (pathname as NSString).isAbsolutePath
+                    ? rfmRootPath + pathname : rfmRootPath + "/" + pathname
+                let resolved = URL(filePath: localPath).standardized.path
+                let normalizedRoot = URL(filePath: rfmRootPath).standardized.path
+                if resolved == normalizedRoot || resolved.hasPrefix(normalizedRoot + "/") {
+                    do {
+                        try FileManager.default.createDirectory(
+                            atPath: resolved, withIntermediateDirectories: true)
+                        errorCode = 0
+                        log += "OP_RFM_MAKDIR(\(capturedPathNumber), \(pathname)) -> 0\n"
+                    } catch { errorCode = 216 }
+                } else { errorCode = 214 }
+            }
+            delegate?.dataAvailable(host: self, data: Data([errorCode]))
+            resetState()
+            return crOffset - data.startIndex + 1
+        }
+    }
+
+    private func OPRFMCHGDIR(data: Data) -> Int {
+        return OPRFMOPEN(data: data)
+    }
+
+    private func OPRFMDELETE(data: Data) -> Int {
+        resetState()
+        return 0
+    }
+
+    // Receives: path#(1) + X(2) + U(2) where X:U is the 32-bit seek position.
+    // Sends back: 1-byte error code.
+    private func OPRFMSEEK(data: Data) -> Int {
         var result = 0
         let expectedCount = 5
-        
+        var errorCode: UInt8 = 0
+
         if data.count >= expectedCount {
-            pathDescriptorAddress = Int(data[0]) * 256 + Int(data[1])
-            pathNumber = Int(data[2])
-            bytesToRead = Int(data[3]) * 256 + Int(data[4])
+            let pathNumber = Int(data[0])
+            let position = Int(data[1]) * 16777216 + Int(data[2]) * 65536 + Int(data[3]) * 256 + Int(data[4])
+            rfmPaths[pathNumber]?.filePosition = position
             result = expectedCount
-            
-            // Get number of bytes to read from file on this path.
-            
-            // Send the response code to the guest.
-            // Format of response:
-            // - 1 byte: error code
-            // - 2 bytes: length of valid data
-            (errorCode, dataToSend) = rfmPathDescriptor.readFromFile(offset: 0, maximumCount : bytesToRead)
+            resetState()
             delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            delegate?.dataAvailable(host: self, data: Data([UInt8((dataToSend.count >> 8) & 0xFF), UInt8(dataToSend.count & 0xFF)]))
-            if errorCode == 0 {
-                processor = OPRFMREADP2
+            log += "OP_RFM_SEEK(\(pathNumber), \(position)) -> \(errorCode)\n"
+        }
+
+        return result
+    }
+
+    // Receives: path#(1) then maxBytes(2). Sends: count(1) then count bytes.
+    // count=0 signals EOF; rfm.asm treats it as E$EOF.
+    private func OPRFMREAD(data: Data) -> Int {
+        var result = 0
+        let expectedCount = 3
+
+        if data.count >= expectedCount {
+            let pathNumber = Int(data[0])
+            let maxBytes = min(Int(data[1]) * 256 + Int(data[2]), 255)
+            result = expectedCount
+
+            if var descriptor = rfmPaths[pathNumber] {
+                let (errorCode, lineData) = descriptor.readFromFile(maximumCount: maxBytes)
+                rfmPaths[pathNumber] = descriptor
+                if errorCode != 0 {
+                    delegate?.dataAvailable(host: self, data: Data([0x00]))
+                } else {
+                    delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count)]))
+                    if !lineData.isEmpty {
+                        delegate?.dataAvailable(host: self, data: lineData)
+                    }
+                }
             } else {
+                delegate?.dataAvailable(host: self, data: Data([0x00]))
+            }
+            resetState()
+        }
+
+        return result
+    }
+
+    // Receives: path#(1) then count(2) then count bytes. No response.
+    // Receives: path#(1) then count(2) then count bytes. No response.
+    private func OPRFMWRITE(data: Data) -> Int {
+        var result = 0
+        let headerCount = 3
+
+        if data.count >= headerCount {
+            let pathNumber = Int(data[0])
+            let byteCount = Int(data[1]) * 256 + Int(data[2])
+            let totalCount = headerCount + byteCount
+            if data.count >= totalCount {
+                let key = rfmPaths[pathNumber] != nil ? pathNumber
+                    : rfmPaths.first { $0.value.localFile != nil }?.key
+                if let k = key, var descriptor = rfmPaths[k] {
+                    _ = descriptor.writeToFile(data: Data(data[headerCount..<totalCount]))
+                    rfmPaths[k] = descriptor
+                }
+                result = totalCount
                 resetState()
             }
         }
-        
+
         return result
     }
 
-    private func OPRFMWRITE(data : Data) -> Int {
-        var result = 1
-        return result
-    }
+    // Receives: path#(1) then maxBytes(2). Sends: count(1) then count bytes.
+    private func OPRFMREADLN(data: Data) -> Int {
+        var result = 0
+        let expectedCount = 3
 
-    // Read data from the client up to a new line.
-    //
-    // Format of command from the client at this point
-    // - 1 byte:  Process ID
-    // - 1 byte:  Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 2 bytes: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 2 bytes: Number of bytes to read
-    //
-    // If there is an error, then the following bytes are sent to the client, and the transaction terminates:
-    // - 1 byte:  a non-zero error code
-    // - 2 bytes: (0, 0)
-    //
-    // If there is NOT an error, then the following bytes are sent to the client:
-    // - 1 byte: 0 (no error)
-    // - 2 bytes: the number of bytes the client can read
-    //
-    // Upon receiving the non-error 3-byte response, the client will then issue a "ready" response of 1 byte.
-    // When the host receives the "ready" response, it sends the number of requested bytes to the client.
-    private func OPRFMREADLN(data : Data) -> Int {
-        var pathDescriptorAddress = 0
-        var pathNumber = 0
-        var bytesToRead = 0
-        var errorCode : UInt8 = 0
-        var dataToSend = Data([0x00])
+        if data.count >= expectedCount {
+            let pathNumber = Int(data[0])
+            let maxBytes = min(Int(data[1]) * 256 + Int(data[2]), 255)
+            result = expectedCount
 
-        // Format of command from the client at this point
-        // - 1 byte: 0 = acknowledged previous response
-        func OPRFMREADP2(data : Data) -> Int {
-            var result = 0
-            let expectedCount = 1
-            
-            if data.count >= expectedCount {
-                result = expectedCount
-                delegate?.dataAvailable(host: self, data: dataToSend)
+            if var descriptor = rfmPaths[pathNumber] {
+                let (errorCode, lineData) = descriptor.readLineFromFile(maximumCount: maxBytes)
+                rfmPaths[pathNumber] = descriptor
+                if errorCode != 0 {
+                    delegate?.dataAvailable(host: self, data: Data([0x00]))
+                } else {
+                    delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count)]))
+                    if !lineData.isEmpty {
+                        delegate?.dataAvailable(host: self, data: lineData)
+                    }
+                }
+            } else {
+                delegate?.dataAvailable(host: self, data: Data([0x00]))
             }
-
             resetState()
-
-            return result
         }
 
+        return result
+    }
+
+    // Receives: path#(1) then count(2) then count bytes. No response.
+    private func OPRFMWRITLN(data: Data) -> Int {
         var result = 0
-        let expectedCount = 5
-        
-        if data.count >= expectedCount {
-            pathDescriptorAddress = Int(data[0]) * 256 + Int(data[1])
-            pathNumber = Int(data[2])
-            bytesToRead = Int(data[3]) * 256 + Int(data[4])
-            result = expectedCount
-            
-            // Get number of bytes to read from file on this path.
-            
-            // Send the response code to the guest.
-            // Format of response:
-            // - 1 byte: error code
-            // - 2 bytes: length of valid data
-            (errorCode, dataToSend) = rfmPathDescriptor.readLineFromFile(offset: 0, maximumCount: bytesToRead)
-            delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            delegate?.dataAvailable(host: self, data: Data([UInt8((dataToSend.count >> 8) & 0xFF), UInt8(dataToSend.count & 0xFF)]))
-            if errorCode == 0 {
-                processor = OPRFMREADP2
-            } else {
+        let headerCount = 3
+
+        if data.count >= headerCount {
+            let pathNumber = Int(data[0])
+            let byteCount = Int(data[1]) * 256 + Int(data[2])
+            let totalCount = headerCount + byteCount
+            if data.count >= totalCount {
+                let key = rfmPaths[pathNumber] != nil ? pathNumber
+                    : rfmPaths.first { $0.value.localFile != nil }?.key
+                if let k = key, var descriptor = rfmPaths[k] {
+                    _ = descriptor.writeToFile(data: Data(data[headerCount..<totalCount]), translateCR: true)
+                    rfmPaths[k] = descriptor
+                }
+                result = totalCount
                 resetState()
             }
         }
-        
+
         return result
     }
 
-    private func OPRFMWRITLN(data : Data) -> Int {
-        var result = 1
-        return result
-    }
-
-    // Perform a GetStat on behalf of the client.
-    //
-    // Format of command from the client at this point
-    // - 1 byte:  Process ID
-    // - 1 byte:  Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 2 bytes: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 1 byte:  GetStat code
-    //
-    // Responses from the host depend upon the GetStat code.
-    private func OPRFMGETSTT(data : Data) -> Int {
+    // Receives: path#(1) + SS.code(1). rfm.asm's getstt handlers are stubs, so send nothing.
+    private func OPRFMGETSTT(data: Data) -> Int {
         var result = 0
-        let expectedCount = 4
-        var errorCode : UInt8 = 0
+        let expectedCount = 2
 
         if data.count >= expectedCount {
-            rfmPathDescriptor.pathDescriptorAddress = Int(data[0]) * 256 + Int(data[1])
-            rfmPathDescriptor.pathNumber = Int(data[2])
-            let statCode = Int(data[3])
-            
-            switch statCode {
-            case 2:
-                // return file size
-                let count = rfmPathDescriptor.fileContents.count
-                delegate?.dataAvailable(host: self, data: Data([errorCode, UInt8((count & 0xFF000000) >> 24), UInt8((count & 0x00FF0000) >> 16), UInt8((count & 0x0000FF00) >> 8), UInt8((count & 0x000000FF) >> 0)]))
-                log = log + "OP_RFM_GETSTAT(SS.Size) -> R$B=\(errorCode), R$X=\((count & 0xFFFF0000) >> 16), R$U=\((count & 0x0000FFFF) >> 0)\n"
-                
-            default:
-                log = log + "OP_RFM_GETSTAT(\(statCode))\n"
+            let pathNumber = Int(data[0])
+            let statCode = Int(data[1])
+            result = expectedCount
+            resetState()
+            log += "OP_RFM_GETSTT(\(pathNumber), \(statCode))\n"
+        }
+
+        return result
+    }
+
+    // Receives nothing (rfm.asm sendit only sends the sub-op). No response.
+    private func OPRFMSETSTT(data: Data) -> Int {
+        resetState()
+        return 0
+    }
+
+    // Receives: path#(1). Sends back: 1-byte error code.
+    // Receives: path#(1). Sends back: 1-byte error code.
+    // If the path was opened via CREATE, the shell closes its reference after
+    // forking the child writer — keep the descriptor alive for incoming writes.
+    private func OPRFMCLOSE(data: Data) -> Int {
+        var result = 0
+        let expectedCount = 1
+
+        if data.count >= expectedCount {
+            let pathNumber = Int(data[0])
+            if let descriptor = rfmPaths[pathNumber], descriptor.shouldCreate && !descriptor.pendingClose {
+                // First close of a CREATE'd path — stay open for child writes
+                rfmPaths[pathNumber]?.pendingClose = true
+            } else {
+                rfmPaths[pathNumber]?.localFile?.closeFile()
+                rfmPaths.removeValue(forKey: pathNumber)
             }
-            
             result = expectedCount
+            delegate?.dataAvailable(host: self, data: Data([0x00]))
             resetState()
+            log += "OP_RFM_CLOSE(\(pathNumber))\n"
         }
-        
-        return result
-    }
 
-    // Perform a SetStat on behalf of the client.
-    //
-    // Format of command from the client at this point
-    // - 1 byte:  Process ID
-    // - 1 byte:  Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 2 bytes: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 1 byte:  SetStat code
-    //
-    // Responses from the host depend upon the SetStat code.
-    private func OPRFMSETSTT(data : Data) -> Int {
-        var result = 0
-        let expectedCount = 4
-        var errorCode : UInt8 = 0
-
-        if data.count >= expectedCount {
-            rfmPathDescriptor.pathDescriptorAddress = Int(data[0]) * 256 + Int(data[1])
-            rfmPathDescriptor.pathNumber = Int(data[2])
-            let statCode = Int(data[3])
-            
-            result = expectedCount
-            resetState()
-            delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            log = log + "OP_RFM_SETSTAT(\(statCode))\n"
-        }
-        
-        return result
-    }
-
-    // Perform a close on behalf of the client.
-    //
-    // Format of command from the client at this point
-    // - 1 byte:  Process ID
-    // - 1 byte:  Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 2 bytes: Path descriptor address (we use this as part of a unique identifier for this path)
-    //
-    // The host responds with a single error code.
-    private func OPRFMCLOSE(data : Data) -> Int {
-        var result = 0
-        let expectedCount = 4
-        var errorCode : UInt8 = 0
-        
-        if data.count >= expectedCount {
-            let processID = Int(data[0])
-            let pathNumber = Int(data[1])
-            let pathDescriptorAddress = Int(data[2]) * 256 + Int(data[3])
-            
-            result = expectedCount
-
-            errorCode = 0
-            delegate?.dataAvailable(host: self, data: Data([errorCode]))
-
-            resetState()
-        }
-        
         return result
     }
 
