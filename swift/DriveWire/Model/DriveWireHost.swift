@@ -1071,7 +1071,9 @@ public class DriveWireHost : Codable {
     }
 
     private func OPRFMCHGDIR(data: Data) -> Int {
-        return OPRFMOPEN(data: data)
+        // rfm.asm chgdir uses sendit — only the sub-opcode is sent, no path data.
+        resetState()
+        return 0
     }
 
     private func OPRFMDELETE(data: Data) -> Int {
@@ -1101,10 +1103,19 @@ public class DriveWireHost : Codable {
                     do {
                         let attrs = try FileManager.default.attributesOfItem(atPath: resolved)
                         if attrs[.type] as? FileAttributeType == .typeDirectory {
-                            errorCode = 214  // E$FNA — use deldir for directories
+                            // Only delete if empty (deldir path)
+                            let contents = try FileManager.default.contentsOfDirectory(atPath: resolved)
+                            if contents.isEmpty {
+                                try FileManager.default.removeItem(atPath: resolved)
+                                errorCode = 0
+                            } else {
+                                errorCode = 215  // E$DNE — directory not empty
+                            }
                         } else {
                             try FileManager.default.removeItem(atPath: resolved)
                             errorCode = 0
+                        }
+                        if errorCode == 0 {
                             log += "OP_RFM_DELETE(\(capturedPathNumber), \(pathname)) -> 0\n"
                         }
                     } catch { errorCode = 216 }
