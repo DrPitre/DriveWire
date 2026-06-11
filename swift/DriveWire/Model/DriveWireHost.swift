@@ -1030,8 +1030,41 @@ public class DriveWireHost : Codable {
     }
 
     private func OPRFMMAKDIR(data: Data) -> Int {
-        resetState()
-        return 0
+        var result = 0
+        let expectedCount = 3
+        var capturedPathNumber = 0
+
+        if data.count >= expectedCount {
+            capturedPathNumber = Int(data[0])
+            result = expectedCount
+            processor = OPRFMGETMKDIRPATH
+        }
+
+        return result
+
+        func OPRFMGETMKDIRPATH(data: Data) -> Int {
+            guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
+            let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let pathname = String(bytes: pathBytes, encoding: .ascii) ?? ""
+            var errorCode: UInt8 = 216
+            if !pathname.isEmpty && !pathname.contains("\0") {
+                let localPath = (pathname as NSString).isAbsolutePath
+                    ? rfmRootPath + pathname : rfmRootPath + "/" + pathname
+                let resolved = URL(filePath: localPath).standardized.path
+                let normalizedRoot = URL(filePath: rfmRootPath).standardized.path
+                if resolved == normalizedRoot || resolved.hasPrefix(normalizedRoot + "/") {
+                    do {
+                        try FileManager.default.createDirectory(
+                            atPath: resolved, withIntermediateDirectories: true)
+                        errorCode = 0
+                        log += "OP_RFM_MAKDIR(\(capturedPathNumber), \(pathname)) -> 0\n"
+                    } catch { errorCode = 216 }
+                } else { errorCode = 214 }
+            }
+            delegate?.dataAvailable(host: self, data: Data([errorCode]))
+            resetState()
+            return crOffset - data.startIndex + 1
+        }
     }
 
     private func OPRFMCHGDIR(data: Data) -> Int {
