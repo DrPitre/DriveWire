@@ -190,25 +190,19 @@ public class DriveWireHost : Codable {
             guard let file = localFile else { return 216 }
             let bytesToWrite: Data
             if translateCR {
-                // Convert CR→LF and strip $FF padding (OS-9 string terminator)
+                // Strip $FF padding (OS-9 string terminator) and convert CR→LF
                 var out = Data()
                 for byte in data {
-                    if byte == 0xFF { break }  // $FF = end of OS-9 string, discard padding
+                    if byte == 0xFF { break }
                     out.append(byte == 0x0D ? 0x0A : byte)
                 }
                 bytesToWrite = out
             } else {
                 bytesToWrite = data
             }
-            file.seek(toFileOffset: UInt64(filePosition))
             file.write(bytesToWrite)
             file.synchronizeFile()
-            let end = filePosition + bytesToWrite.count
-            if fileContents.count < end {
-                fileContents.append(Data(repeating: 0, count: end - fileContents.count))
-            }
-            fileContents.replaceSubrange(filePosition..<end, with: bytesToWrite)
-            filePosition = end
+            filePosition += bytesToWrite.count
             return 0
         }
     }
