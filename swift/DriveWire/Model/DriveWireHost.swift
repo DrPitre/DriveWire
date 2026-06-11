@@ -190,13 +190,15 @@ public class DriveWireHost : Codable {
             guard let file = localFile else { return 216 }
             let bytesToWrite: Data
             if translateCR {
-                // Strip $FF padding (OS-9 string terminator) and convert CR→LF
-                var out = Data()
-                for byte in data {
-                    if byte == 0xFF { break }
-                    out.append(byte == 0x0D ? 0x0A : byte)
+                // Strip trailing $FF and $00 padding, convert all $0D → $0A
+                var endIndex = data.endIndex
+                while endIndex > data.startIndex {
+                    let prev = data.index(before: endIndex)
+                    let byte = data[prev]
+                    if byte != 0x00 && byte != 0xFF { break }
+                    endIndex = prev
                 }
-                bytesToWrite = out
+                bytesToWrite = Data(data[data.startIndex..<endIndex].map { $0 == 0x0D ? 0x0A : $0 })
             } else {
                 bytesToWrite = data
             }
