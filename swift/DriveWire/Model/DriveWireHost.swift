@@ -184,6 +184,27 @@ public class DriveWireHost : Codable {
             filePosition = end
             return (0, data)
         }
+
+        mutating func writeToFile(data: Data, translateCR: Bool = false) -> UInt8 {
+            guard let file = localFile else { return 216 }
+            do {
+                try file.seek(toOffset: UInt64(filePosition))
+                let bytesToWrite = translateCR
+                    ? Data(data.map { $0 == 0x0D ? 0x0A : $0 })
+                    : data
+                file.write(bytesToWrite)
+                // Keep fileContents in sync for subsequent reads
+                let end = filePosition + bytesToWrite.count
+                if fileContents.count < end {
+                    fileContents.append(Data(repeating: 0, count: end - fileContents.count))
+                }
+                fileContents.replaceSubrange(filePosition..<end, with: bytesToWrite)
+                filePosition = end
+            } catch {
+                return 216
+            }
+            return 0
+        }
     }
 
     var rfmRootPath: String = NSHomeDirectory()
@@ -1074,6 +1095,7 @@ public class DriveWireHost : Codable {
     }
 
     // Receives: path#(1) then count(2) then count bytes. No response.
+    // Receives: path#(1) then count(2) then count bytes. No response.
     private func OPRFMWRITE(data: Data) -> Int {
         var result = 0
         let headerCount = 3
@@ -1083,7 +1105,11 @@ public class DriveWireHost : Codable {
             let byteCount = Int(data[1]) * 256 + Int(data[2])
             let totalCount = headerCount + byteCount
             if data.count >= totalCount {
-                // TODO: write to file
+                if var descriptor = rfmPaths[pathNumber] {
+                    let writeData = data[headerCount..<totalCount]
+                    _ = descriptor.writeToFile(data: Data(writeData))
+                    rfmPaths[pathNumber] = descriptor
+                }
                 result = totalCount
                 resetState()
             }
@@ -1123,6 +1149,8 @@ public class DriveWireHost : Codable {
     }
 
     // Receives: path#(1) then count(2) then count bytes. No response.
+    // Receives: path#(1) then count(2) then count bytes. No response.
+    // Translates CR → LF since OS-9 uses CR as line terminator.
     private func OPRFMWRITLN(data: Data) -> Int {
         var result = 0
         let headerCount = 3
@@ -1132,7 +1160,11 @@ public class DriveWireHost : Codable {
             let byteCount = Int(data[1]) * 256 + Int(data[2])
             let totalCount = headerCount + byteCount
             if data.count >= totalCount {
-                // TODO: write to file
+                if var descriptor = rfmPaths[pathNumber] {
+                    let writeData = data[headerCount..<totalCount]
+                    _ = descriptor.writeToFile(data: Data(writeData), translateCR: true)
+                    rfmPaths[pathNumber] = descriptor
+                }
                 result = totalCount
                 resetState()
             }
