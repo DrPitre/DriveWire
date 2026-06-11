@@ -188,9 +188,18 @@ public class DriveWireHost : Codable {
 
         mutating func writeToFile(data: Data, translateCR: Bool = false) -> UInt8 {
             guard let file = localFile else { return 216 }
-            let bytesToWrite = translateCR
-                ? Data(data.map { $0 == 0x0D ? 0x0A : $0 })
-                : data
+            let bytesToWrite: Data
+            if translateCR {
+                // Convert CR→LF and strip $FF padding (OS-9 string terminator)
+                var out = Data()
+                for byte in data {
+                    if byte == 0xFF { break }  // $FF = end of OS-9 string, discard padding
+                    out.append(byte == 0x0D ? 0x0A : byte)
+                }
+                bytesToWrite = out
+            } else {
+                bytesToWrite = data
+            }
             file.seek(toFileOffset: UInt64(filePosition))
             file.write(bytesToWrite)
             file.synchronizeFile()
