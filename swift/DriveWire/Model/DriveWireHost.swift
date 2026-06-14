@@ -107,48 +107,74 @@ public class DriveWireHost : Codable {
     
     struct RFMPathDescriptor {
         var processID = 0
+        var parentProcessID = 0
         var pathNumber = 0
         var pathDescriptorAddress = 0
         var mode = 0
         var filePosition = 0
         var pathname = ""
-        var shouldCreate = false
-        var pendingClose = false
         var localFile : FileHandle? = nil
         var fileContents : Data = Data()
         var attributes = [FileAttributeKey : Any]()
 
-        mutating func openLocalFile(rootPath: String) -> UInt8 {
+        mutating func openLocalFile(rootPath: String, shouldCreate: Bool = false) -> UInt8 {
             guard !pathname.isEmpty && !pathname.contains("\0") else { return 216 }
 
+            let expanded = RFMPathDescriptor.expandMultiDots(pathname)
             let localPathname: String
-            if (pathname as NSString).isAbsolutePath {
-                localPathname = rootPath + pathname
+            if (expanded as NSString).isAbsolutePath {
+                localPathname = rootPath + expanded
             } else {
-                localPathname = rootPath + "/" + pathname
+                localPathname = rootPath + "/" + expanded
             }
             let resolvedPath = URL(filePath: localPathname).standardized.path
             let normalizedRoot = URL(filePath: rootPath).standardized.path
             guard resolvedPath == normalizedRoot || resolvedPath.hasPrefix(normalizedRoot + "/") else {
-                return 214  // E$FNA
+                return 214  // E$FNA — escaped above rfmRootPath (or above device root)
             }
 
             do {
                 let fileExists = FileManager.default.fileExists(atPath: localPathname)
                 if mode & 0x80 != 0 {
-                    guard fileExists else { return 216 }
-                    attributes = try FileManager.default.attributesOfItem(atPath: localPathname)
-                    if let fileType = attributes[.type] as? FileAttributeType, fileType != .typeDirectory {
-                        return 214
+                    // Directory open — clamp '..' at the device root.
+                    let effectiveLocalPath: String
+                    if resolvedPath == normalizedRoot {
+                        // Resolved to rfmRootPath itself — not a valid CoCo device directory.
+                        // This happens when "." is opened with no CWD set (e.g. before any chd).
+                        return 216
+                    } else {
+                        effectiveLocalPath = resolvedPath
                     }
+                    var isDir: ObjCBool = false
+                    guard FileManager.default.fileExists(atPath: effectiveLocalPath, isDirectory: &isDir), isDir.boolValue else {
+                        return 216
+                    }
+                    attributes = (try? FileManager.default.attributesOfItem(atPath: effectiveLocalPath)) ?? [:]
+                    // Store the effective path so DriveWireHost can synthesize directory entries with proper LSNs.
+                    self.pathname = effectiveLocalPath.hasPrefix(rootPath)
+                        ? String(effectiveLocalPath.dropFirst(rootPath.count))
+                        : effectiveLocalPath
                 } else {
                     if !fileExists {
                         guard shouldCreate else { return 216 }
+                        // Check parent directory is writable before creating
+                        let parent = (localPathname as NSString).deletingLastPathComponent
+                        guard FileManager.default.isWritableFile(atPath: parent) else { return 214 }
                         guard FileManager.default.createFile(atPath: localPathname, contents: nil) else {
                             return 216
                         }
                     } else {
                         attributes = try FileManager.default.attributesOfItem(atPath: localPathname)
+                        if attributes[.type] as? FileAttributeType == .typeDirectory {
+                            return 214  // E$FNA — path is a directory, not a file
+                        }
+                        let needsWrite = (mode & 0x0A) != 0 || shouldCreate
+                        if needsWrite && !FileManager.default.isWritableFile(atPath: localPathname) {
+                            return 214  // E$FNA — write access denied
+                        }
+                        if !FileManager.default.isReadableFile(atPath: localPathname) {
+                            return 214  // E$FNA — read access denied
+                        }
                     }
                     let url = URL(filePath: localPathname)
                     let needsWrite = (mode & 0x0A) != 0 || shouldCreate
@@ -163,6 +189,75 @@ public class DriveWireHost : Codable {
                 return 216
             }
             return 0
+        }
+
+        // Build one 32-byte OS-9 directory entry: name[0..28] with last char | 0x80, then 3-byte LSN.
+        static func makeOS9DirEntry(_ name: String, lsn: Int) -> Data {
+            var entry = Data(repeating: 0, count: 32)
+            let bytes = Array(name.utf8.prefix(29))
+            for (i, b) in bytes.enumerated() {
+                entry[i] = i == bytes.count - 1 ? (b | 0x80) : b
+            }
+            entry[29] = UInt8((lsn >> 16) & 0xFF)
+            entry[30] = UInt8((lsn >> 8) & 0xFF)
+            entry[31] = UInt8(lsn & 0xFF)
+            return entry
+        }
+
+        // Expand OS-9 multi-dot path components: N dots = N-1 parent-dir references.
+        static func expandMultiDots(_ path: String) -> String {
+            return path.components(separatedBy: "/").map { c in
+                guard !c.isEmpty, c.allSatisfy({ $0 == "." }), c.count >= 2 else { return c }
+                return Array(repeating: "..", count: c.count - 1).joined(separator: "/")
+            }.joined(separator: "/")
+        }
+
+        // Synthesize an OS-9 file descriptor sector from host file attributes.
+        // Layout: FD.ATT(1) FD.OWN(2) FD.DAT(5) FD.LNK(1) FD.SIZ(4) FD.Creat(3) FD.SEG(zeros...)
+        func synthesizeFD(count: Int) -> Data {
+            var fd = Data(repeating: 0, count: max(count, 16))
+            let isDir = attributes[.type] as? FileAttributeType == .typeDirectory
+
+            // FD.ATT: DIR=0x80, owner R/W/E = 0x07, public R = 0x08
+            var att: UInt8 = isDir ? 0x8F : 0x0F
+            if let posix = attributes[.posixPermissions] as? Int {
+                att = isDir ? 0x80 : 0x00
+                if posix & 0o400 != 0 { att |= 0x01 }  // owner read
+                if posix & 0o200 != 0 { att |= 0x02 }  // owner write
+                if posix & 0o100 != 0 { att |= 0x04 }  // owner exec
+                if posix & 0o004 != 0 { att |= 0x08 }  // public read
+                if posix & 0o002 != 0 { att |= 0x10 }  // public write
+                if posix & 0o001 != 0 { att |= 0x20 }  // public exec
+            }
+            fd[0] = att
+
+            // FD.OWN (bytes 1-2): owner — 0
+            // FD.DAT (bytes 3-7): modification date YYMMDDHHMM
+            if let mod = attributes[.modificationDate] as? Date {
+                let c = Calendar.current
+                fd[3] = UInt8(max(0, min(255, c.component(.year, from: mod) - 1900)))
+                fd[4] = UInt8(c.component(.month, from: mod))
+                fd[5] = UInt8(c.component(.day, from: mod))
+                fd[6] = UInt8(c.component(.hour, from: mod))
+                fd[7] = UInt8(c.component(.minute, from: mod))
+            }
+            // FD.LNK (byte 8): link count
+            fd[8] = 1
+            // FD.SIZ (bytes 9-12): file size, big-endian
+            let sz = attributes[.size] as? Int ?? 0
+            fd[9]  = UInt8((sz >> 24) & 0xFF)
+            fd[10] = UInt8((sz >> 16) & 0xFF)
+            fd[11] = UInt8((sz >> 8) & 0xFF)
+            fd[12] = UInt8(sz & 0xFF)
+            // FD.Creat (bytes 13-15): creation date YYMMDD
+            if let cr = attributes[.creationDate] as? Date {
+                let c = Calendar.current
+                fd[13] = UInt8(max(0, min(255, c.component(.year, from: cr) - 1900)))
+                fd[14] = UInt8(c.component(.month, from: cr))
+                fd[15] = UInt8(c.component(.day, from: cr))
+            }
+            // FD.SEG (bytes 16+): segment list — all zeros for RFM (no physical sectors)
+            return Data(fd.prefix(count))
         }
 
         mutating func readLineFromFile(maximumCount: Int) -> (UInt8, Data) {
@@ -212,6 +307,12 @@ public class DriveWireHost : Codable {
 
     var rfmRootPath: String = NSHomeDirectory()
     private var rfmPaths: [Int: RFMPathDescriptor] = [:]
+    private var rfmCurrentDir: [Int: String] = [:]
+    // Maps host path ↔ unique LSN for synthesized RFM directory entries.
+    // LSNs start above a typical NitrOS-9 DW image (~524k sectors for DW format).
+    private var rfmLSNByPath: [String: Int] = [:]
+    private var rfmLSNToPath: [Int: String] = [:]
+    private var rfmLSNCounter: Int = 0x600000
     
     /// The no-operation transaction code.
     ///
@@ -420,8 +521,8 @@ public class DriveWireHost : Codable {
         dwTransaction.append(DWOp(opcode:OPNAMEOBJCREATE, processor: self.OP_NAMEOBJ_CREATE))
         dwTransaction.append(DWOp(opcode:OPNOP, processor: self.OP_NOP))
         dwTransaction.append(DWOp(opcode:OPTIME, processor: self.OP_TIME))
-        dwTransaction.append(DWOp(opcode:OPINIT, processor: self.OP_INIT))
-        dwTransaction.append(DWOp(opcode:OPTERM, processor: self.OP_TERM))
+        dwTransaction.append(DWOp(opcode:0x49, processor: self.OP_INIT))   // OPINIT (historical)
+        dwTransaction.append(DWOp(opcode:0x54, processor: self.OP_TERM))   // OPTERM (historical)
         dwTransaction.append(DWOp(opcode:OPREAD, processor: self.OP_READ))
         dwTransaction.append(DWOp(opcode:OPREADEX, processor: self.OP_READEX))
         dwTransaction.append(DWOp(opcode:OPREREAD, processor: self.OP_REREAD))
@@ -430,8 +531,8 @@ public class DriveWireHost : Codable {
         dwTransaction.append(DWOp(opcode:OPREWRITE, processor: self.OP_REWRITE))
         dwTransaction.append(DWOp(opcode:OPGETSTAT, processor: self.OP_GETSTAT))
         dwTransaction.append(DWOp(opcode:OPSETSTAT, processor: self.OP_SETSTAT))
-        dwTransaction.append(DWOp(opcode:OPRESET3, processor: self.OP_RESET))
-        dwTransaction.append(DWOp(opcode:OPRESET2, processor: self.OP_RESET))
+        dwTransaction.append(DWOp(opcode:0xF8, processor: self.OP_RESET))  // OPRESET3 (historical)
+        dwTransaction.append(DWOp(opcode:0xFE, processor: self.OP_RESET))  // OPRESET2 (historical)
         dwTransaction.append(DWOp(opcode:OPRESET, processor: self.OP_RESET))
         dwTransaction.append(DWOp(opcode:OPWIREBUG, processor: self.OP_WIREBUG))
         dwTransaction.append(DWOp(opcode:OPPRINTFLUSH, processor: self.OP_PRINTFLUSH))
@@ -576,6 +677,18 @@ public class DriveWireHost : Codable {
         processor = OP_OPCODE
         invalidateWatchdog()
     }
+
+    func resetRFMState() {
+        for descriptor in rfmPaths.values {
+            descriptor.localFile?.closeFile()
+        }
+        rfmPaths.removeAll()
+        rfmCurrentDir.removeAll()
+        rfmLSNByPath.removeAll()
+        rfmLSNToPath.removeAll()
+        rfmLSNCounter = 0x600000
+        print("RFM state reset")
+    }
     
     private func OP_DWINIT(data : Data) -> Int {
         var result = 0
@@ -704,23 +817,26 @@ public class DriveWireHost : Codable {
         resetState()
         delegate?.dataAvailable(host: self, data: Data([year, month, day, hour, minute, second]))
         delegate?.transactionCompleted(opCode: currentTransaction)
+        let msg = "OP_TIME -> \(1900 + Int(year))/\(month)/\(day) \(hour):\(String(format:"%02d",minute)):\(String(format:"%02d",second))"
+        log += msg + "\n"; print(msg)
         return 1
     }
-    
+
     private func OP_INIT(data : Data) -> Int {
-        currentTransaction = OPINIT
+        currentTransaction = 0x49   // OPINIT (historical)
         resetState()
-        statistics = DriveWireStatistics()  // reset statistics
+        statistics = DriveWireStatistics()
+        resetRFMState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        log = log + "OP_INIT" + "\n"
+        log += "OP_INIT\n"; print("OP_INIT")
         return 1
     }
-    
+
     private func OP_TERM(data : Data) -> Int {
-        currentTransaction = OPTERM
+        currentTransaction = 0x54   // OPTERM (historical)
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        log = log + "OP_TERM" + "\n"
+        log += "OP_TERM\n"; print("OP_TERM")
         return 1
     }
     
@@ -764,6 +880,8 @@ public class DriveWireHost : Codable {
             statistics.lastDriveNumber = driveNumber
             delegate?.dataAvailable(host: self, data: Data([UInt8(error)]))
             delegate?.transactionCompleted(opCode: currentTransaction)
+            let msg = "OP_WRITE(drive=\(driveNumber), lsn=0x\(String(vLSN, radix: 16))) -> \(error)"
+            log += msg + "\n"; print(msg)
         }
         
         return result
@@ -792,7 +910,8 @@ public class DriveWireHost : Codable {
             delegate?.transactionCompleted(opCode: currentTransaction)
         }
         
-        log = log + "OP_GETSTAT(" + String(statistics.lastDriveNumber) + "," + String(statistics.lastGetStat) + ")" + "\n"
+        log += "OP_GETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastGetStat))))\n"
+        print("OP_GETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastGetStat))))")
         return result
     }
     
@@ -810,15 +929,17 @@ public class DriveWireHost : Codable {
             delegate?.transactionCompleted(opCode: currentTransaction)
         }
         
-        log = log + "OP_SETSTAT(" + String(statistics.lastDriveNumber) + "," + String(statistics.lastGetStat) + ")" + "\n"
+        log += "OP_SETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastSetStat))))\n"
+        print("OP_SETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastSetStat))))")
         return result
     }
     
     private func OP_RESET(data : Data) -> Int {
         currentTransaction = OPRESET
         resetState()
+        resetRFMState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        log = log + "OP_RESET" + "\n"
+        log += "OP_RESET\n"; print("OP_RESET")
         return 1
     }
     
@@ -869,68 +990,83 @@ public class DriveWireHost : Codable {
     private func OP_SERINIT(data : Data) -> Int {
         currentTransaction = OPSERINIT
         guard data.count >= 2 else { return 0 }
+        let ch = data[1]
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 2  // opcode + channel#
+        let msg = "OP_SERINIT(ch=\(ch))"; log += msg + "\n"; print(msg)
+        return 2
     }
 
     private func OP_SERTERM(data : Data) -> Int {
         currentTransaction = OPSERTERM
         guard data.count >= 2 else { return 0 }
+        let ch = data[1]
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 2  // opcode + channel#
+        let msg = "OP_SERTERM(ch=\(ch))"; log += msg + "\n"; print(msg)
+        return 2
     }
 
     private func OP_SERREAD(data : Data) -> Int {
         currentTransaction = OPSERREAD
         guard data.count >= 2 else { return 0 }
+        let ch = data[1]
         resetState()
         delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
-        return 2  // opcode + channel#
+        let msg = "OP_SERREAD(ch=\(ch))"; log += msg + "\n"; print(msg)
+        return 2
     }
 
     private func OP_SERREADM(data : Data) -> Int {
         currentTransaction = OPSERREADM
         guard data.count >= 2 else { return 0 }
+        let ch = data[1]
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 2  // opcode + channel#
+        let msg = "OP_SERREADM(ch=\(ch))"; log += msg + "\n"; print(msg)
+        return 2
     }
 
     private func OP_SERWRITE(data : Data) -> Int {
         currentTransaction = OPSERWRITE
         guard data.count >= 3 else { return 0 }
+        let ch = data[1]; let byte = data[2]
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 3  // opcode + channel# + data_byte
+        let msg = "OP_SERWRITE(ch=\(ch), byte=0x\(String(byte, radix: 16)))"; log += msg + "\n"; print(msg)
+        return 3
     }
 
     private func OP_SERWRITEM(data : Data) -> Int {
         currentTransaction = OPSERWRITEM
         guard data.count >= 3 else { return 0 }
-        let count = Int(data[2])
+        let ch = data[1]; let count = Int(data[2])
         let total = 3 + count
         guard data.count >= total else { return 0 }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return total  // opcode + channel# + count + data
+        let msg = "OP_SERWRITEM(ch=\(ch), bytes=\(count))"; log += msg + "\n"; print(msg)
+        return total
     }
 
     private func OP_SERGETSTAT(data : Data) -> Int {
         currentTransaction = OPSERGETSTAT
         guard data.count >= 3 else { return 0 }
+        let ch = data[1]; let code = data[2]
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 3  // opcode + channel# + stat_code
+        let msg = "OP_SERGETSTAT(ch=\(ch), \(DriveWireHost.ssCodeName(Int(code))))"; log += msg + "\n"; print(msg)
+        return 3
     }
 
     private func OP_SERSETSTAT(data : Data) -> Int {
         currentTransaction = OPSERSETSTAT
         guard data.count >= 3 else { return 0 }
+        let ch = data[1]; let code = data[2]
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 3  // opcode + channel# + setstat_code
+        let msg = "OP_SERSETSTAT(ch=\(ch), \(DriveWireHost.ssCodeName(Int(code))))"; log += msg + "\n"; print(msg)
+        return 3
     }
 
     private func OP_FASTWRITE_Serial(data : Data) -> Int {
@@ -1002,7 +1138,7 @@ public class DriveWireHost : Codable {
 
     private func rfmOpen(data: Data, shouldCreate: Bool) -> Int {
         var result = 0
-        let expectedCount = 3
+        let expectedCount = 4
         var capturedPathNumber = 0
 
         if data.count >= expectedCount {
@@ -1010,8 +1146,8 @@ public class DriveWireHost : Codable {
             var descriptor = RFMPathDescriptor()
             descriptor.pathNumber = capturedPathNumber
             descriptor.processID = Int(data[1])
-            descriptor.mode = Int(data[2])
-            descriptor.shouldCreate = shouldCreate
+            descriptor.parentProcessID = Int(data[2])
+            descriptor.mode = Int(data[3])
             rfmPaths[capturedPathNumber] = descriptor
             result = expectedCount
             processor = OPRFMGETPATH
@@ -1022,23 +1158,142 @@ public class DriveWireHost : Codable {
         func OPRFMGETPATH(data: Data) -> Int {
             guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
             let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
-            let pathname = String(bytes: pathBytes, encoding: .ascii) ?? ""
+            let pid = rfmPaths[capturedPathNumber]?.processID ?? 0
+            let ppid = rfmPaths[capturedPathNumber]?.parentProcessID ?? 0
+            let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
+                                              processID: pid, parentProcessID: ppid)
             rfmPaths[capturedPathNumber]?.pathname = pathname
-            let errorCode = rfmPaths[capturedPathNumber]?.openLocalFile(rootPath: rfmRootPath) ?? 0xFF
+            let errorCode = rfmPaths[capturedPathNumber]?.openLocalFile(rootPath: rfmRootPath, shouldCreate: shouldCreate) ?? 0xFF
+            if errorCode != 0 {
+                // Failed open — remove the descriptor so the slot is clean for reuse.
+                rfmPaths.removeValue(forKey: capturedPathNumber)
+            }
+            // For directory opens, synthesize OS-9 directory entries with stable LSNs.
+            if errorCode == 0, let descriptor = rfmPaths[capturedPathNumber], descriptor.mode & 0x80 != 0 {
+                rfmPaths[capturedPathNumber]?.fileContents = synthesizeDirectoryEntries(for: descriptor)
+            }
             delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            log += "OP_RFM_\(shouldCreate ? "CREATE" : "OPEN")(\(capturedPathNumber), \(pathname)) -> \(errorCode)\n"
+            let msg = "OP_RFM_\(shouldCreate ? "CREATE" : "OPEN")(path#\(capturedPathNumber), pid=\(pid), ppid=\(ppid), mode=0x\(String(rfmPaths[capturedPathNumber]?.mode ?? 0, radix: 16)), cwd=\(rfmCurrentDir[pid] ?? rfmCurrentDir[ppid] ?? "none"), resolved=\(pathname)) -> \(errorCode)"
+            log += msg + "\n"
+            print(msg)
             resetState()
             return crOffset - data.startIndex + 1
         }
     }
 
+    private func resolveRFMPathname(_ pathname: String, processID: Int, parentProcessID: Int) -> String {
+        guard !(pathname as NSString).isAbsolutePath else { return pathname }
+        let base: String
+        if let cwd = rfmCurrentDir[processID] {
+            base = cwd
+        } else if let cwd = rfmCurrentDir[parentProcessID] {
+            base = cwd
+        } else {
+            return pathname
+        }
+        if pathname == "." { return base }
+        return (base as NSString).appendingPathComponent(pathname)
+    }
+
+    // Expand OS-9 multi-dot path components: N dots = N-1 parent-dir references.
+    private func expandOS9MultiDots(_ path: String) -> String {
+        RFMPathDescriptor.expandMultiDots(path)
+    }
+
+    private static func ssCodeName(_ code: Int) -> String {
+        switch code {
+        case 0x00: return "SS.Opt"
+        case 0x01: return "SS.Ready"
+        case 0x02: return "SS.Size"
+        case 0x03: return "SS.Reset"
+        case 0x04: return "SS.WTrk"
+        case 0x05: return "SS.Pos"
+        case 0x06: return "SS.EOF"
+        case 0x07: return "SS.Link"
+        case 0x08: return "SS.ULink"
+        case 0x09: return "SS.Feed"
+        case 0x0A: return "SS.Frz"
+        case 0x0B: return "SS.SPT"
+        case 0x0C: return "SS.SQD"
+        case 0x0D: return "SS.DCmd"
+        case 0x0E: return "SS.DevNm"
+        case 0x0F: return "SS.FD"
+        case 0x10: return "SS.Ticks"
+        case 0x11: return "SS.Lock"
+        case 0x12: return "SS.DStat"
+        case 0x13: return "SS.Joy"
+        case 0x14: return "SS.BlkRd"
+        case 0x15: return "SS.BlkWr"
+        case 0x16: return "SS.Reten"
+        case 0x17: return "SS.WFM"
+        case 0x18: return "SS.RFM"
+        case 0x19: return "SS.ELog"
+        case 0x1A: return "SS.SSig"
+        case 0x1B: return "SS.Relea"
+        case 0x1C: return "SS.AlfaS"
+        case 0x1D: return "SS.Break"
+        case 0x1E: return "SS.RsBit"
+        case 0x1F: return "SS.DirEnt"
+        case 0x20: return "SS.FDInf"
+        case 0x21: return "SS.Cursr"
+        case 0x22: return "SS.ScSiz"
+        case 0x23: return "SS.KySns"
+        case 0x24: return "SS.ComSt"
+        case 0x25: return "SS.Open"
+        case 0x26: return "SS.Close"
+        case 0x27: return "SS.HngUp"
+        case 0x28: return "SS.FSig"
+        default:   return "0x\(String(code, radix: 16, uppercase: false))"
+        }
+    }
+
+    // Returns a stable LSN for the given absolute host path, allocating a new one if needed.
+    private func lsnForPath(_ path: String) -> Int {
+        if let existing = rfmLSNByPath[path] { return existing }
+        let lsn = rfmLSNCounter
+        rfmLSNByPath[path] = lsn
+        rfmLSNToPath[lsn] = path
+        rfmLSNCounter += 1
+        return lsn
+    }
+
+    // Builds OS-9 directory contents for the open directory descriptor, registering each entry in the LSN map.
+    private func synthesizeDirectoryEntries(for descriptor: RFMPathDescriptor) -> Data {
+        let dirPath = rfmRootPath + descriptor.pathname
+        var entries = Data()
+
+        // '..' and '.' entries — point to parent and self
+        let parentPath: String
+        let selfPath = (URL(fileURLWithPath: dirPath).standardized.path)
+        let deviceRoot = rfmRootPath + "/" + (descriptor.pathname.split(separator: "/").first.map(String.init) ?? "")
+        if selfPath == URL(fileURLWithPath: deviceRoot).standardized.path {
+            parentPath = selfPath   // at device root: '..' loops back to self
+        } else {
+            parentPath = URL(fileURLWithPath: dirPath + "/..").standardized.path
+        }
+        entries.append(contentsOf: RFMPathDescriptor.makeOS9DirEntry("..", lsn: lsnForPath(parentPath)))
+        entries.append(contentsOf: RFMPathDescriptor.makeOS9DirEntry(".",  lsn: lsnForPath(selfPath)))
+
+        if let contents = try? FileManager.default.contentsOfDirectory(atPath: dirPath) {
+            for name in contents.sorted() {
+                let childPath = dirPath + "/" + name
+                entries.append(contentsOf: RFMPathDescriptor.makeOS9DirEntry(name, lsn: lsnForPath(childPath)))
+            }
+        }
+        return entries
+    }
+
     private func OPRFMMAKDIR(data: Data) -> Int {
         var result = 0
-        let expectedCount = 3
+        let expectedCount = 4
         var capturedPathNumber = 0
+        var capturedProcessID = 0
+        var capturedParentProcessID = 0
 
         if data.count >= expectedCount {
             capturedPathNumber = Int(data[0])
+            capturedProcessID = Int(data[1])
+            capturedParentProcessID = Int(data[2])
             result = expectedCount
             processor = OPRFMGETMKDIRPATH
         }
@@ -1048,7 +1303,9 @@ public class DriveWireHost : Codable {
         func OPRFMGETMKDIRPATH(data: Data) -> Int {
             guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
             let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
-            let pathname = String(bytes: pathBytes, encoding: .ascii) ?? ""
+            let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
+                                              processID: capturedProcessID,
+                                              parentProcessID: capturedParentProcessID)
             var errorCode: UInt8 = 216
             if !pathname.isEmpty && !pathname.contains("\0") {
                 let localPath = (pathname as NSString).isAbsolutePath
@@ -1060,7 +1317,8 @@ public class DriveWireHost : Codable {
                         try FileManager.default.createDirectory(
                             atPath: resolved, withIntermediateDirectories: true)
                         errorCode = 0
-                        log += "OP_RFM_MAKDIR(\(capturedPathNumber), \(pathname)) -> 0\n"
+                        log += "OP_RFM_MAKDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0\n"
+                        print("OP_RFM_MAKDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0")
                     } catch { errorCode = 216 }
                 } else { errorCode = 214 }
             }
@@ -1071,18 +1329,76 @@ public class DriveWireHost : Codable {
     }
 
     private func OPRFMCHGDIR(data: Data) -> Int {
-        // rfm.asm chgdir uses sendit — only the sub-opcode is sent, no path data.
-        resetState()
-        return 0
+        var result = 0
+        let expectedCount = 4
+        var capturedPathNumber = 0
+        var capturedProcessID = 0
+        var capturedParentProcessID = 0
+
+        if data.count >= expectedCount {
+            capturedPathNumber = Int(data[0])
+            capturedProcessID = Int(data[1])
+            capturedParentProcessID = Int(data[2])
+            result = expectedCount
+            processor = OPRFMGETCHGDIRPATH
+        }
+
+        return result
+
+        func OPRFMGETCHGDIRPATH(data: Data) -> Int {
+            guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
+            let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
+                                              processID: capturedProcessID,
+                                              parentProcessID: capturedParentProcessID)
+            let expandedPathname = expandOS9MultiDots(pathname)
+            var errorCode: UInt8 = 216
+            if !expandedPathname.isEmpty && !expandedPathname.contains("\0") {
+                let localPath = (expandedPathname as NSString).isAbsolutePath
+                    ? rfmRootPath + expandedPathname : rfmRootPath + "/" + expandedPathname
+                let resolved = URL(filePath: localPath).standardized.path
+                let normalizedRoot = URL(filePath: rfmRootPath).standardized.path
+                // Accept paths within rfmRootPath, OR above it (will be clamped to device root).
+                let deviceRoot = "/" + (expandedPathname.split(separator: "/").first.map(String.init) ?? "")
+                let effectiveResolved = (resolved == normalizedRoot || resolved.hasPrefix(normalizedRoot + "/"))
+                    ? resolved : normalizedRoot + deviceRoot
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: effectiveResolved, isDirectory: &isDir), isDir.boolValue {
+                    var relativePath = String(effectiveResolved.dropFirst(normalizedRoot.count))
+                    if relativePath.isEmpty { relativePath = deviceRoot }
+                    // Only store this process's CWD when it differs from the parent's.
+                    // If it matches, remove any stale entry so the parent lookup always wins.
+                    // This prevents a child's chgdir(".") from caching a value that would
+                    // hide a subsequent chd by the parent.
+                    if relativePath == rfmCurrentDir[capturedParentProcessID] {
+                        rfmCurrentDir.removeValue(forKey: capturedProcessID)
+                    } else {
+                        rfmCurrentDir[capturedProcessID] = relativePath
+                    }
+                    errorCode = 0
+                    log += "OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0\n"
+                    print("OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0")
+                } else {
+                    errorCode = 216  // E$PNNF — directory not found
+                }
+            }
+            delegate?.dataAvailable(host: self, data: Data([errorCode]))
+            resetState()
+            return crOffset - data.startIndex + 1
+        }
     }
 
     private func OPRFMDELETE(data: Data) -> Int {
         var result = 0
-        let expectedCount = 3
+        let expectedCount = 4
         var capturedPathNumber = 0
+        var capturedProcessID = 0
+        var capturedParentProcessID = 0
 
         if data.count >= expectedCount {
             capturedPathNumber = Int(data[0])
+            capturedProcessID = Int(data[1])
+            capturedParentProcessID = Int(data[2])
             result = expectedCount
             processor = OPRFMGETDELETEPATH
         }
@@ -1092,7 +1408,9 @@ public class DriveWireHost : Codable {
         func OPRFMGETDELETEPATH(data: Data) -> Int {
             guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
             let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
-            let pathname = String(bytes: pathBytes, encoding: .ascii) ?? ""
+            let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
+                                              processID: capturedProcessID,
+                                              parentProcessID: capturedParentProcessID)
             var errorCode: UInt8 = 216
             if !pathname.isEmpty && !pathname.contains("\0") {
                 let localPath = (pathname as NSString).isAbsolutePath
@@ -1116,7 +1434,8 @@ public class DriveWireHost : Codable {
                             errorCode = 0
                         }
                         if errorCode == 0 {
-                            log += "OP_RFM_DELETE(\(capturedPathNumber), \(pathname)) -> 0\n"
+                            log += "OP_RFM_DELETE(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0\n"
+                        print("OP_RFM_DELETE(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0")
                         }
                     } catch { errorCode = 216 }
                 } else { errorCode = 214 }
@@ -1132,7 +1451,7 @@ public class DriveWireHost : Codable {
     private func OPRFMSEEK(data: Data) -> Int {
         var result = 0
         let expectedCount = 5
-        var errorCode: UInt8 = 0
+        let errorCode: UInt8 = 0
 
         if data.count >= expectedCount {
             let pathNumber = Int(data[0])
@@ -1141,7 +1460,8 @@ public class DriveWireHost : Codable {
             result = expectedCount
             resetState()
             delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            log += "OP_RFM_SEEK(\(pathNumber), \(position)) -> \(errorCode)\n"
+            log += "OP_RFM_SEEK(path#\(pathNumber), pos=\(position)) -> \(errorCode)\n"
+            print("OP_RFM_SEEK(path#\(pathNumber), pos=\(position)) -> \(errorCode)")
         }
 
         return result
@@ -1155,22 +1475,25 @@ public class DriveWireHost : Codable {
 
         if data.count >= expectedCount {
             let pathNumber = Int(data[0])
-            let maxBytes = min(Int(data[1]) * 256 + Int(data[2]), 255)
+            let maxBytes = Int(data[1]) * 256 + Int(data[2])
             result = expectedCount
 
             if var descriptor = rfmPaths[pathNumber] {
                 let (errorCode, lineData) = descriptor.readFromFile(maximumCount: maxBytes)
                 rfmPaths[pathNumber] = descriptor
+                let ec = errorCode != 0 ? Int(errorCode) : Int(lineData.count)
+                log += "OP_RFM_READ(path#\(pathNumber), max=\(maxBytes)) -> \(ec)\n"
+                print("OP_RFM_READ(path#\(pathNumber), max=\(maxBytes)) -> \(ec)")
                 if errorCode != 0 {
-                    delegate?.dataAvailable(host: self, data: Data([0x00]))
+                    delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
                 } else {
-                    delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count)]))
+                    delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
                     if !lineData.isEmpty {
                         delegate?.dataAvailable(host: self, data: lineData)
                     }
                 }
             } else {
-                delegate?.dataAvailable(host: self, data: Data([0x00]))
+                delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
             }
             resetState()
         }
@@ -1195,6 +1518,8 @@ public class DriveWireHost : Codable {
                     _ = descriptor.writeToFile(data: Data(data[headerCount..<totalCount]))
                     rfmPaths[k] = descriptor
                 }
+                log += "OP_RFM_WRITE(path#\(pathNumber), bytes=\(byteCount))\n"
+                print("OP_RFM_WRITE(path#\(pathNumber), bytes=\(byteCount))")
                 result = totalCount
                 resetState()
             }
@@ -1210,22 +1535,25 @@ public class DriveWireHost : Codable {
 
         if data.count >= expectedCount {
             let pathNumber = Int(data[0])
-            let maxBytes = min(Int(data[1]) * 256 + Int(data[2]), 255)
+            let maxBytes = Int(data[1]) * 256 + Int(data[2])
             result = expectedCount
 
             if var descriptor = rfmPaths[pathNumber] {
                 let (errorCode, lineData) = descriptor.readLineFromFile(maximumCount: maxBytes)
                 rfmPaths[pathNumber] = descriptor
+                let ec = errorCode != 0 ? Int(errorCode) : Int(lineData.count)
+                log += "OP_RFM_READLN(path#\(pathNumber), max=\(maxBytes)) -> \(ec)\n"
+                print("OP_RFM_READLN(path#\(pathNumber), max=\(maxBytes)) -> \(ec)")
                 if errorCode != 0 {
-                    delegate?.dataAvailable(host: self, data: Data([0x00]))
+                    delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
                 } else {
-                    delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count)]))
+                    delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
                     if !lineData.isEmpty {
                         delegate?.dataAvailable(host: self, data: lineData)
                     }
                 }
             } else {
-                delegate?.dataAvailable(host: self, data: Data([0x00]))
+                delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
             }
             resetState()
         }
@@ -1249,6 +1577,8 @@ public class DriveWireHost : Codable {
                     _ = descriptor.writeToFile(data: Data(data[headerCount..<totalCount]), translateCR: true)
                     rfmPaths[k] = descriptor
                 }
+                log += "OP_RFM_WRITLN(path#\(pathNumber), bytes=\(byteCount))\n"
+                print("OP_RFM_WRITLN(path#\(pathNumber), bytes=\(byteCount))")
                 result = totalCount
                 resetState()
             }
@@ -1257,24 +1587,85 @@ public class DriveWireHost : Codable {
         return result
     }
 
-    // Receives: path#(1) + SS.code(1). rfm.asm's getstt handlers are stubs, so send nothing.
+    // Receives: path#(1) + SS.code(1). SS.FD additionally receives 2-byte count then sends FD.
     private func OPRFMGETSTT(data: Data) -> Int {
         var result = 0
         let expectedCount = 2
+        var capturedPathNumber = 0
 
         if data.count >= expectedCount {
-            let pathNumber = Int(data[0])
+            capturedPathNumber = Int(data[0])
             let statCode = Int(data[1])
             result = expectedCount
-            resetState()
-            log += "OP_RFM_GETSTT(\(pathNumber), \(statCode))\n"
+            log += "OP_RFM_GETSTT(path#\(capturedPathNumber), \(DriveWireHost.ssCodeName(statCode)))\n"
+            print("OP_RFM_GETSTT(path#\(capturedPathNumber), \(DriveWireHost.ssCodeName(statCode)))")
+            if statCode == 0x02 {  // SS.Size — send 4-byte file size
+                let size = rfmPaths[capturedPathNumber]?.fileContents.count ?? 0
+                let msg = "OP_RFM_GETSTT(path#\(capturedPathNumber), SS.Size) -> \(size)"
+                log += msg + "\n"; print(msg)
+                delegate?.dataAvailable(host: self, data: Data([
+                    UInt8((size >> 24) & 0xFF), UInt8((size >> 16) & 0xFF),
+                    UInt8((size >> 8) & 0xFF),  UInt8(size & 0xFF)]))
+                resetState()
+            } else if statCode == 0x05 {  // SS.Pos — send 4-byte current position
+                let pos = rfmPaths[capturedPathNumber]?.filePosition ?? 0
+                let msg = "OP_RFM_GETSTT(path#\(capturedPathNumber), SS.Pos) -> \(pos)"
+                log += msg + "\n"; print(msg)
+                delegate?.dataAvailable(host: self, data: Data([
+                    UInt8((pos >> 24) & 0xFF), UInt8((pos >> 16) & 0xFF),
+                    UInt8((pos >> 8) & 0xFF),  UInt8(pos & 0xFF)]))
+                resetState()
+            } else if statCode == 0x06 {  // SS.EOF — send 0 (not EOF) or E$EOF (211)
+                let isEOF = rfmPaths[capturedPathNumber].map { $0.filePosition >= $0.fileContents.count } ?? true
+                let response: UInt8 = isEOF ? 211 : 0
+                let msg = "OP_RFM_GETSTT(path#\(capturedPathNumber), SS.EOF) -> \(isEOF ? "EOF" : "OK")"
+                log += msg + "\n"; print(msg)
+                delegate?.dataAvailable(host: self, data: Data([response]))
+                resetState()
+            } else if statCode == 0x0F {  // SS.FD
+                processor = OPRFMGETSSFD
+            } else if statCode == 0x20 {  // SS.FDInf
+                processor = OPRFMGETSSFDINF
+            } else {
+                resetState()
+            }
         }
 
         return result
+
+        func OPRFMGETSSFD(data: Data) -> Int {
+            guard data.count >= 2 else { return 0 }
+            let count = min(Int(data[0]) * 256 + Int(data[1]), 256)
+            let fd = rfmPaths[capturedPathNumber]?.synthesizeFD(count: count)
+                ?? Data(repeating: 0, count: count)
+            delegate?.dataAvailable(host: self, data: fd)
+            log += "OP_RFM_GETSTT_FD(path#\(capturedPathNumber), bytes=\(count))\n"
+            print("OP_RFM_GETSTT_FD(path#\(capturedPathNumber), bytes=\(count))")
+            resetState()
+            return 2
+        }
+
+        func OPRFMGETSSFDINF(data: Data) -> Int {
+            guard data.count >= 4 else { return 0 }
+            // data[0]=Y_hi=LSN[0], data[1]=Y_lo=length, data[2]=U_hi=LSN[1], data[3]=U_lo=LSN[2]
+            let lsn = Int(data[0]) << 16 | Int(data[2]) << 8 | Int(data[3])
+            var tempDesc = RFMPathDescriptor()
+            if let hostPath = rfmLSNToPath[lsn] {
+                tempDesc.attributes = (try? FileManager.default.attributesOfItem(atPath: hostPath)) ?? [:]
+            }
+            let fd = tempDesc.synthesizeFD(count: 256)
+            delegate?.dataAvailable(host: self, data: fd)
+            let path = rfmLSNToPath[lsn] ?? "unknown"
+            log += "OP_RFM_GETSTT_FDInf(lsn=0x\(String(lsn, radix: 16)), path=\(path))\n"
+            print("OP_RFM_GETSTT_FDInf(lsn=0x\(String(lsn, radix: 16)), path=\(path))")
+            resetState()
+            return 4
+        }
     }
 
     // Receives nothing (rfm.asm sendit only sends the sub-op). No response.
     private func OPRFMSETSTT(data: Data) -> Int {
+        print("OP_RFM_SETSTT")
         resetState()
         return 0
     }
@@ -1289,17 +1680,13 @@ public class DriveWireHost : Codable {
 
         if data.count >= expectedCount {
             let pathNumber = Int(data[0])
-            if let descriptor = rfmPaths[pathNumber], descriptor.shouldCreate && !descriptor.pendingClose {
-                // First close of a CREATE'd path — stay open for child writes
-                rfmPaths[pathNumber]?.pendingClose = true
-            } else {
-                rfmPaths[pathNumber]?.localFile?.closeFile()
-                rfmPaths.removeValue(forKey: pathNumber)
-            }
+            rfmPaths[pathNumber]?.localFile?.closeFile()
+            rfmPaths.removeValue(forKey: pathNumber)
             result = expectedCount
             delegate?.dataAvailable(host: self, data: Data([0x00]))
             resetState()
-            log += "OP_RFM_CLOSE(\(pathNumber))\n"
+            log += "OP_RFM_CLOSE(path#\(pathNumber))\n"
+            print("OP_RFM_CLOSE(path#\(pathNumber))")
         }
 
         return result
@@ -1397,7 +1784,8 @@ extension DriveWireHost {
                 
                 // Send the response code to the guest.
                 delegate?.dataAvailable(host: self, data: Data([UInt8(error)]))
-                
+                let msg = "OP_READEX(drive=\(statistics.lastDriveNumber), lsn=0x\(String(statistics.lastLSN, radix: 16))) -> \(error)"
+                log += msg + "\n"; print(msg)
                 // Reset the state machine.
                 resetState()
             }
@@ -1426,9 +1814,13 @@ extension DriveWireHost {
 
             // We read 5 bytes into this buffer (OP_READEX, 1 byte drive number, 3 byte LSN)
             result = 5;
-            
-            // Check if the drive number exists in our virtual drive list.
-            if let virtualDrive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) {
+
+            // Check if this LSN belongs to a synthesized RFM file descriptor.
+            if let hostPath = rfmLSNToPath[vLSN] {
+                var tempDesc = RFMPathDescriptor()
+                tempDesc.attributes = (try? FileManager.default.attributesOfItem(atPath: hostPath)) ?? [:]
+                sectorBuffer = tempDesc.synthesizeFD(count: 256)
+            } else if let virtualDrive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) {
                 // It exists! Read sector from disk image.
                 statistics.lastDriveNumber = driveNumber
                 statistics.readCount = statistics.readCount + 1
@@ -1438,8 +1830,6 @@ extension DriveWireHost {
                 // It doesn't exist. Set the error code.
                 error = DriveWireProtocolError.E_UNIT.rawValue
             }
-
-            // Send the error code
             delegate?.dataAvailable(host: self, data: Data([UInt8(error)]))
             
             // If we have an OK response, we send the sector and checksum.

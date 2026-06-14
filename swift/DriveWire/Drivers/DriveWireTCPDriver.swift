@@ -238,6 +238,7 @@ class DriveWireTCPServerDriver: NSObject, DriveWireDelegate, ObservableObject {
                 self?.receive(from: conn)
             case .failed, .cancelled:
                 print("DriveWire guest disconnected")
+                self?.host.resetRFMState()
                 self?.connection = nil
             default:
                 break
@@ -257,6 +258,7 @@ class DriveWireTCPServerDriver: NSObject, DriveWireDelegate, ObservableObject {
                 self?.receive(from: conn)
             } else {
                 print("DriveWire guest disconnected")
+                self?.host.resetRFMState()
                 self?.connection = nil
             }
         }
