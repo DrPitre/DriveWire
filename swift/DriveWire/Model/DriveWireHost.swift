@@ -1489,6 +1489,7 @@ public class DriveWireHost : Codable {
                 } else {
                     delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
                     if !lineData.isEmpty {
+                        Thread.sleep(forTimeInterval: 0.002)
                         delegate?.dataAvailable(host: self, data: lineData)
                     }
                 }
@@ -1549,6 +1550,7 @@ public class DriveWireHost : Codable {
                 } else {
                     delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
                     if !lineData.isEmpty {
+                        Thread.sleep(forTimeInterval: 0.002)
                         delegate?.dataAvailable(host: self, data: lineData)
                     }
                 }
