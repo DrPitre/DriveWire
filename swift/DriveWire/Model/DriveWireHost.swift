@@ -307,7 +307,8 @@ public class DriveWireHost : Codable {
 
     var rfmRootPath: String = NSHomeDirectory()
     private var rfmPaths: [Int: RFMPathDescriptor] = [:]
-    private var rfmCurrentDir: [Int: String] = [:]
+    private var rfmCurrentDir: [Int: String] = [:]      // data directory per process
+    private var rfmCurrentExecDir: [Int: String] = [:] // execution directory per process
     // Maps host path ↔ unique LSN for synthesized RFM directory entries.
     // LSNs start above a typical NitrOS-9 DW image (~524k sectors for DW format).
     private var rfmLSNByPath: [String: Int] = [:]
@@ -684,6 +685,7 @@ public class DriveWireHost : Codable {
         }
         rfmPaths.removeAll()
         rfmCurrentDir.removeAll()
+        rfmCurrentExecDir.removeAll()
         rfmLSNByPath.removeAll()
         rfmLSNToPath.removeAll()
         rfmLSNCounter = 0x600000
@@ -1160,8 +1162,10 @@ public class DriveWireHost : Codable {
             let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
             let pid = rfmPaths[capturedPathNumber]?.processID ?? 0
             let ppid = rfmPaths[capturedPathNumber]?.parentProcessID ?? 0
+            let mode = rfmPaths[capturedPathNumber]?.mode ?? 0
+            let isExec = (mode & 0x04) != 0
             let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
-                                              processID: pid, parentProcessID: ppid)
+                                              processID: pid, parentProcessID: ppid, isExec: isExec)
             rfmPaths[capturedPathNumber]?.pathname = pathname
             let errorCode = rfmPaths[capturedPathNumber]?.openLocalFile(rootPath: rfmRootPath, shouldCreate: shouldCreate) ?? 0xFF
             if errorCode != 0 {
@@ -1173,7 +1177,11 @@ public class DriveWireHost : Codable {
                 rfmPaths[capturedPathNumber]?.fileContents = synthesizeDirectoryEntries(for: descriptor)
             }
             delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            let msg = "OP_RFM_\(shouldCreate ? "CREATE" : "OPEN")(path#\(capturedPathNumber), pid=\(pid), ppid=\(ppid), mode=0x\(String(rfmPaths[capturedPathNumber]?.mode ?? 0, radix: 16)), cwd=\(rfmCurrentDir[pid] ?? rfmCurrentDir[ppid] ?? "none"), resolved=\(pathname)) -> \(errorCode)"
+            let dirLabel = isExec ? "execDir" : "cwd"
+            let dirVal = isExec
+                ? (rfmCurrentExecDir[pid] ?? rfmCurrentExecDir[ppid] ?? "none")
+                : (rfmCurrentDir[pid] ?? rfmCurrentDir[ppid] ?? "none")
+            let msg = "OP_RFM_\(shouldCreate ? "CREATE" : "OPEN")(path#\(capturedPathNumber), pid=\(pid), ppid=\(ppid), mode=0x\(String(mode, radix: 16)), \(dirLabel)=\(dirVal), resolved=\(pathname)) -> \(errorCode)"
             log += msg + "\n"
             print(msg)
             resetState()
@@ -1181,12 +1189,13 @@ public class DriveWireHost : Codable {
         }
     }
 
-    private func resolveRFMPathname(_ pathname: String, processID: Int, parentProcessID: Int) -> String {
+    private func resolveRFMPathname(_ pathname: String, processID: Int, parentProcessID: Int, isExec: Bool = false) -> String {
         guard !(pathname as NSString).isAbsolutePath else { return pathname }
+        let dirMap = isExec ? rfmCurrentExecDir : rfmCurrentDir
         let base: String
-        if let cwd = rfmCurrentDir[processID] {
+        if let cwd = dirMap[processID] {
             base = cwd
-        } else if let cwd = rfmCurrentDir[parentProcessID] {
+        } else if let cwd = dirMap[parentProcessID] {
             base = cwd
         } else {
             return pathname
@@ -1289,11 +1298,13 @@ public class DriveWireHost : Codable {
         var capturedPathNumber = 0
         var capturedProcessID = 0
         var capturedParentProcessID = 0
+        var capturedMode = 0
 
         if data.count >= expectedCount {
             capturedPathNumber = Int(data[0])
             capturedProcessID = Int(data[1])
             capturedParentProcessID = Int(data[2])
+            capturedMode = Int(data[3])
             result = expectedCount
             processor = OPRFMGETMKDIRPATH
         }
@@ -1303,9 +1314,11 @@ public class DriveWireHost : Codable {
         func OPRFMGETMKDIRPATH(data: Data) -> Int {
             guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
             let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let isExec = (capturedMode & 0x04) != 0
             let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
                                               processID: capturedProcessID,
-                                              parentProcessID: capturedParentProcessID)
+                                              parentProcessID: capturedParentProcessID,
+                                              isExec: isExec)
             var errorCode: UInt8 = 216
             if !pathname.isEmpty && !pathname.contains("\0") {
                 let localPath = (pathname as NSString).isAbsolutePath
@@ -1334,11 +1347,13 @@ public class DriveWireHost : Codable {
         var capturedPathNumber = 0
         var capturedProcessID = 0
         var capturedParentProcessID = 0
+        var capturedMode = 0
 
         if data.count >= expectedCount {
             capturedPathNumber = Int(data[0])
             capturedProcessID = Int(data[1])
             capturedParentProcessID = Int(data[2])
+            capturedMode = Int(data[3])
             result = expectedCount
             processor = OPRFMGETCHGDIRPATH
         }
@@ -1348,9 +1363,11 @@ public class DriveWireHost : Codable {
         func OPRFMGETCHGDIRPATH(data: Data) -> Int {
             guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
             let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let isExec = (capturedMode & 0x04) != 0
             let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
                                               processID: capturedProcessID,
-                                              parentProcessID: capturedParentProcessID)
+                                              parentProcessID: capturedParentProcessID,
+                                              isExec: isExec)
             let expandedPathname = expandOS9MultiDots(pathname)
             var errorCode: UInt8 = 216
             if !expandedPathname.isEmpty && !expandedPathname.contains("\0") {
@@ -1368,16 +1385,23 @@ public class DriveWireHost : Codable {
                     if relativePath.isEmpty { relativePath = deviceRoot }
                     // Only store this process's CWD when it differs from the parent's.
                     // If it matches, remove any stale entry so the parent lookup always wins.
-                    // This prevents a child's chgdir(".") from caching a value that would
-                    // hide a subsequent chd by the parent.
-                    if relativePath == rfmCurrentDir[capturedParentProcessID] {
-                        rfmCurrentDir.removeValue(forKey: capturedProcessID)
+                    if isExec {
+                        if relativePath == rfmCurrentExecDir[capturedParentProcessID] {
+                            rfmCurrentExecDir.removeValue(forKey: capturedProcessID)
+                        } else {
+                            rfmCurrentExecDir[capturedProcessID] = relativePath
+                        }
                     } else {
-                        rfmCurrentDir[capturedProcessID] = relativePath
+                        if relativePath == rfmCurrentDir[capturedParentProcessID] {
+                            rfmCurrentDir.removeValue(forKey: capturedProcessID)
+                        } else {
+                            rfmCurrentDir[capturedProcessID] = relativePath
+                        }
                     }
                     errorCode = 0
-                    log += "OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0\n"
-                    print("OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0")
+                    let dirLabel = isExec ? "execDir" : "cwd"
+                    log += "OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), \(dirLabel)=\(relativePath)) -> 0\n"
+                    print("OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), \(dirLabel)=\(relativePath)) -> 0")
                 } else {
                     errorCode = 216  // E$PNNF — directory not found
                 }
@@ -1394,11 +1418,13 @@ public class DriveWireHost : Codable {
         var capturedPathNumber = 0
         var capturedProcessID = 0
         var capturedParentProcessID = 0
+        var capturedMode = 0
 
         if data.count >= expectedCount {
             capturedPathNumber = Int(data[0])
             capturedProcessID = Int(data[1])
             capturedParentProcessID = Int(data[2])
+            capturedMode = Int(data[3])
             result = expectedCount
             processor = OPRFMGETDELETEPATH
         }
@@ -1408,9 +1434,11 @@ public class DriveWireHost : Codable {
         func OPRFMGETDELETEPATH(data: Data) -> Int {
             guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
             let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let isExec = (capturedMode & 0x04) != 0
             let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
                                               processID: capturedProcessID,
-                                              parentProcessID: capturedParentProcessID)
+                                              parentProcessID: capturedParentProcessID,
+                                              isExec: isExec)
             var errorCode: UInt8 = 216
             if !pathname.isEmpty && !pathname.contains("\0") {
                 let localPath = (pathname as NSString).isAbsolutePath
