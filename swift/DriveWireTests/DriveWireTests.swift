@@ -6,6 +6,7 @@
 //
 
 import XCTest
+import Network
 
 final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
     var host : DriveWireHost?
@@ -282,6 +283,28 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         host!.send(data: &poll2)
         let second = read(bytes: 2)
         XCTAssertEqual(Set([first[0], second[0]]), Set([UInt8(2), UInt8(3)]))
+    }
+
+    func testTCPServerLoopback() throws {
+        let driver = DriveWireTCPServerDriver(beckerPort: 62504, channelPortBase: 62810, bridgedChannelCount: 2)
+        driver.logging = false
+        try driver.start()
+
+        let guest = NWConnection(host: "127.0.0.1", port: 62504, using: .tcp)
+        let responded = XCTestExpectation(description: "OP_DWINIT answered over TCP")
+        guest.stateUpdateHandler = { state in
+            if case .ready = state {
+                guest.send(content: Data([0x5A, 0x01]), completion: .contentProcessed { _ in })
+                guest.receive(minimumIncompleteLength: 1, maximumLength: 16) { content, _, _, _ in
+                    XCTAssertEqual(content?.first, 0x00)
+                    responded.fulfill()
+                }
+            }
+        }
+        guest.start(queue: .global())
+        wait(for: [responded], timeout: 5.0)
+        guest.cancel()
+        driver.stop()
     }
 
     func testPerformanceExample() throws {
