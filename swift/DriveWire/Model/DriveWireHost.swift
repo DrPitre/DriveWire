@@ -915,18 +915,34 @@ public class DriveWireHost : Codable {
         return 1
     }
     
+    /// Routes bytes the guest wrote to a channel out to the delegate.
+    private func deliverGuestBytes(_ bytes : Data, channel : UInt8) {
+        guard let ch = vserialChannel(channel), ch.isOpen else {
+            log = log + "serial write to closed or invalid channel \(channel)" + "\n"
+            return
+        }
+        delegate?.channelDataAvailable(host: self, channel: channel, data: bytes)
+    }
+
     private func OP_SERWRITE(data : Data) -> Int {
+        let expectedCount = 3
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERWRITE
         resetState()
+        deliverGuestBytes(Data([data[2]]), channel: data[1])
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
-    
+
     private func OP_SERWRITEM(data : Data) -> Int {
+        guard data.count >= 3 else { return 0 }
+        let expectedCount = 3 + Int(data[2])
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERWRITEM
         resetState()
+        deliverGuestBytes(data.subdata(in: 3..<expectedCount), channel: data[1])
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
     
     private func OP_SERGETSTAT(data : Data) -> Int {
@@ -962,15 +978,24 @@ public class DriveWireHost : Codable {
     }
     
     private func OP_FASTWRITE_Serial(data : Data) -> Int {
+        let expectedCount = 2
+        guard data.count >= expectedCount else { return 0 }
+        currentTransaction = data[0]
         resetState()
+        deliverGuestBytes(Data([data[1]]), channel: fastwriteChannel)
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
-    
+
     private func OP_FASTWRITE_Screen(data : Data) -> Int {
+        let expectedCount = 2
+        guard data.count >= expectedCount else { return 0 }
+        currentTransaction = data[0]
         resetState()
+        // VWindow channels are not implemented; consume correctly and log.
+        log = log + "OP_FASTWRITE_Screen(\(fastwriteChannel)) unsupported" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
     
     private func OP_RFM(data : Data) -> Int {

@@ -179,6 +179,45 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         XCTAssertTrue(host!.virtualChannels[3].isOpen)
     }
 
+    var channelData : [UInt8: Data] = [:]
+
+    func channelDataAvailable(host: DriveWireHost, channel: UInt8, data: Data) {
+        channelData[channel, default: Data()].append(data)
+    }
+
+    func testSerialWriteDeliversByte() throws {
+        var s = Data([host!.OPSERINIT, 1, host!.OPSERWRITE, 1, 0x42])
+        host!.send(data: &s)
+        XCTAssertEqual(channelData[1], Data([0x42]))
+    }
+
+    func testSerialWriteMultipleDeliversBytes() throws {
+        var s = Data([host!.OPSERINIT, 5, host!.OPSERWRITEM, 5, 3, 0x41, 0x42, 0x43])
+        host!.send(data: &s)
+        XCTAssertEqual(channelData[5], Data([0x41, 0x42, 0x43]))
+    }
+
+    func testFastwriteDeliversByte() throws {
+        var s = Data([host!.OPSERINIT, 0, 0x80, 0x43])
+        host!.send(data: &s)
+        XCTAssertEqual(channelData[0], Data([0x43]))
+    }
+
+    func testFastwriteSplitAcrossSends() throws {
+        // The opcode and its operand arriving in separate reads must not desync.
+        var first = Data([host!.OPSERINIT, 0, 0x80])
+        host!.send(data: &first)
+        var second = Data([0x44])
+        host!.send(data: &second)
+        XCTAssertEqual(channelData[0], Data([0x44]))
+    }
+
+    func testWriteToClosedChannelIsDropped() throws {
+        var s = Data([host!.OPSERWRITE, 9, 0x42])
+        host!.send(data: &s)
+        XCTAssertNil(channelData[9])
+    }
+
     func testPerformanceExample() throws {
         // This is an example of a performance test case.
         measure {
