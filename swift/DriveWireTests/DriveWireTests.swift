@@ -218,6 +218,72 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         XCTAssertNil(channelData[9])
     }
 
+    func testSerialReadNothingWaiting() throws {
+        var s = Data([host!.OPSERREAD])
+        host!.send(data: &s)
+        XCTAssertEqual(read(bytes: 2), Data([0, 0]))
+    }
+
+    func testSerialReadSingleByte() throws {
+        var open = Data([host!.OPSERINIT, 1])
+        host!.send(data: &open)
+        host!.writeToChannel(Data([0x21]), channel: 1)
+        var s = Data([host!.OPSERREAD])
+        host!.send(data: &s)
+        // Response byte 1 = channel + 1, byte 2 = the data byte.
+        XCTAssertEqual(read(bytes: 2), Data([2, 0x21]))
+    }
+
+    func testSerialReadBulkThenReadM() throws {
+        var open = Data([host!.OPSERINIT, 1])
+        host!.send(data: &open)
+        host!.writeToChannel(Data("mdir\r".utf8), channel: 1)
+        var poll = Data([host!.OPSERREAD])
+        host!.send(data: &poll)
+        // Byte 1 = channel + 17, byte 2 = waiting count.
+        XCTAssertEqual(read(bytes: 2), Data([18, 5]))
+        var readm = Data([host!.OPSERREADM, 1, 5])
+        host!.send(data: &readm)
+        XCTAssertEqual(read(bytes: 5), Data("mdir\r".utf8))
+        var poll2 = Data([host!.OPSERREAD])
+        host!.send(data: &poll2)
+        XCTAssertEqual(read(bytes: 2), Data([0, 0]))
+    }
+
+    func testSerialReadMOverRequestSendsNothing() throws {
+        var open = Data([host!.OPSERINIT, 1])
+        host!.send(data: &open)
+        host!.writeToChannel(Data([0x01]), channel: 1)
+        var readm = Data([host!.OPSERREADM, 1, 200])
+        host!.send(data: &readm)
+        XCTAssertEqual(responseData.count, 0)
+    }
+
+    func testHostCloseReportedInPoll() throws {
+        var open = Data([host!.OPSERINIT, 4])
+        host!.send(data: &open)
+        host!.closeChannel(4)
+        var poll = Data([host!.OPSERREAD])
+        host!.send(data: &poll)
+        // Byte 1 = 16 (status), byte 2 high nibble 0 = closed, low nibble = channel.
+        XCTAssertEqual(read(bytes: 2), Data([16, 4]))
+        XCTAssertFalse(host!.virtualChannels[4].isOpen)
+    }
+
+    func testSerialReadRoundRobinFairness() throws {
+        var open = Data([host!.OPSERINIT, 1, host!.OPSERINIT, 2])
+        host!.send(data: &open)
+        host!.writeToChannel(Data([0x41]), channel: 1)
+        host!.writeToChannel(Data([0x42]), channel: 2)
+        var poll = Data([host!.OPSERREAD])
+        host!.send(data: &poll)
+        let first = read(bytes: 2)
+        var poll2 = Data([host!.OPSERREAD])
+        host!.send(data: &poll2)
+        let second = read(bytes: 2)
+        XCTAssertEqual(Set([first[0], second[0]]), Set([UInt8(2), UInt8(3)]))
+    }
+
     func testPerformanceExample() throws {
         // This is an example of a performance test case.
         measure {

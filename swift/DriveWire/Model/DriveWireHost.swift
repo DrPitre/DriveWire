@@ -901,18 +901,85 @@ public class DriveWireHost : Codable {
         return expectedCount
     }
     
+    /// Round-robin cursor so one busy channel can't starve the others.
+    private var nextPollChannel = 0
+    /// Host-side closes not yet reported to the guest via SERREAD.
+    private var pendingClosedChannels : [UInt8] = []
+
+    /// Queues data for the guest to read from a virtual channel.
+    ///
+    /// The guest collects queued bytes with its normal OP_SERREAD polling.
+    /// Bytes queued while the channel is closed are discarded when the guest
+    /// opens it (opening clears the queue), so callers should only write to
+    /// channels the guest has opened.
+    ///
+    /// - Parameters:
+    ///     - data: The bytes to queue.
+    ///     - channel: The virtual serial channel number (0-14).
+    public func writeToChannel(_ data : Data, channel : UInt8) {
+        vserialChannel(channel)?.inputQueue.append(data)
+    }
+
+    /// Closes a channel from the host side.
+    ///
+    /// The guest is informed through a status byte in its next OP_SERREAD poll.
+    ///
+    /// - Parameters:
+    ///     - channel: The virtual serial channel number (0-14).
+    public func closeChannel(_ channel : UInt8) {
+        guard let ch = vserialChannel(channel) else { return }
+        ch.close()
+        pendingClosedChannels.append(channel)
+    }
+
+    /// Builds the two-byte OP_SERREAD/POLL response described in the specification.
+    private func serialReadResponse() -> Data {
+        // Closed-channel notifications take priority over data.
+        if pendingClosedChannels.isEmpty == false {
+            let closed = pendingClosedChannels.removeFirst()
+            return Data([16, closed])
+        }
+        // Round-robin scan for an open channel with waiting data.
+        for offset in 0..<virtualChannels.count {
+            let ch = virtualChannels[(nextPollChannel + offset) % virtualChannels.count]
+            guard ch.isOpen, ch.inputQueue.isEmpty == false else { continue }
+            nextPollChannel = (Int(ch.channelNumber) + 1) % virtualChannels.count
+            if ch.inputQueue.count == 1 {
+                // A single interactive byte rides along in the response itself.
+                let byte = ch.inputQueue.removeFirst()
+                return Data([ch.channelNumber + 1, byte])
+            }
+            // More is waiting: advertise the count for an OP_SERREADM fetch.
+            return Data([ch.channelNumber + 17, UInt8(min(ch.inputQueue.count, 255))])
+        }
+        return Data([0, 0])
+    }
+
     private func OP_SERREAD(data : Data) -> Int {
         currentTransaction = OPSERREAD
         resetState()
-        delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
-        return 1
-    }
-    
-    private func OP_SERREADM(data : Data) -> Int {
-        currentTransaction = OPSERREADM
-        resetState()
+        delegate?.dataAvailable(host: self, data: serialReadResponse())
         delegate?.transactionCompleted(opCode: currentTransaction)
         return 1
+    }
+
+    private func OP_SERREADM(data : Data) -> Int {
+        let expectedCount = 3
+        guard data.count >= expectedCount else { return 0 }
+        currentTransaction = OPSERREADM
+        resetState()
+        let requested = Int(data[2])
+        if let ch = vserialChannel(data[1]), ch.inputQueue.count >= requested {
+            let bytes = Data(ch.inputQueue.prefix(requested))
+            ch.inputQueue.removeFirst(requested)
+            delegate?.dataAvailable(host: self, data: bytes)
+        } else {
+            // Per the specification, over-asking is a guest error; the server
+            // deliberately sends nothing and lets the guest's read time out.
+            log = log + "OP_SERREADM over-request on channel \(data[1])" + "\n"
+        }
+        delegate?.transactionCompleted(opCode: currentTransaction)
+        return expectedCount
     }
     
     /// Routes bytes the guest wrote to a channel out to the delegate.
