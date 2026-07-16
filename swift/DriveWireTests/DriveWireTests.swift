@@ -299,7 +299,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
             if case .ready = state {
                 guest.send(content: Data([0x5A, 0x01]), completion: .contentProcessed { _ in })
                 guest.receive(minimumIncompleteLength: 1, maximumLength: 16) { content, _, _, _ in
-                    XCTAssertEqual(content?.first, 0x00)
+                    XCTAssertEqual(content?.first, 0xFF)
                     responded.fulfill()
                 }
             }
