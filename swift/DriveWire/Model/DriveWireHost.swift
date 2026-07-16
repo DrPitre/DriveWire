@@ -589,9 +589,12 @@ public class DriveWireHost : Codable {
         if data.count >= expectedCount {
             // Save capabilities byte.
             guestCapabilityByte = data[1]
-            
-            // Send the host capabilities byte.
-            delegate?.dataAvailable(host: self, data: Data([0x00]))
+
+            // Send the host capabilities byte. This must be non-zero: the
+            // NitrOS-9 driver interprets a zero (or absent) response as a DW3
+            // server and disables its DW4 extensions, including the virtual
+            // serial channel poller.
+            delegate?.dataAvailable(host: self, data: Data([0xFF]))
             result = expectedCount
             
             // Reset the state machine.
@@ -1002,6 +1005,18 @@ public class DriveWireHost : Codable {
     }
 
     private func OP_SERWRITEM(data : Data) -> Int {
+        guard data.count >= 2 else { return 0 }
+        // The NitrOS-9 boot sequence emits bare $64 $00 pairs (naming a
+        // never-opened channel, with no count or payload). Consume exactly
+        // two bytes for a SERWRITEM naming an unopened channel -- reading a
+        // count byte here desyncs the stream on every boot.
+        if vserialChannel(data[1])?.isOpen != true {
+            currentTransaction = OPSERWRITEM
+            resetState()
+            log = log + "OP_SERWRITEM to unopened channel \(data[1]) ignored" + "\n"
+            delegate?.transactionCompleted(opCode: currentTransaction)
+            return 2
+        }
         guard data.count >= 3 else { return 0 }
         let expectedCount = 3 + Int(data[2])
         guard data.count >= expectedCount else { return 0 }

@@ -42,7 +42,10 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         expectation = XCTestExpectation(description: "Waiting for response")
         host!.send(data: &s)
         let _ = XCTWaiter.wait(for: [expectation!], timeout: 5.0)
-        let expectedResult = 0x00
+        // A non-zero response is required: the NitrOS-9 driver treats a zero
+        // (or missing) response as a DW3 server and disables its DW4
+        // extensions, including the virtual serial channel poller.
+        let expectedResult = 0xFF
         let actualResult = read(bytes: 1)[0]
         XCTAssert(actualResult == expectedResult, "Error: result should be \(expectedResult), but was \(actualResult)")
     }
@@ -305,6 +308,20 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         wait(for: [responded], timeout: 5.0)
         guest.cancel()
         driver.stop()
+    }
+
+    func testSerialWriteMBootNoiseStaysInSync() throws {
+        // The NitrOS-9 EOU boot emits bare $64 $00 pairs (SERWRITEM naming
+        // never-opened channel 0, with no count or payload). Servers must
+        // consume exactly 2 bytes for these; reading a count byte desyncs
+        // the whole stream on every boot.
+        var noise = Data()
+        for _ in 0..<20 {
+            noise.append(contentsOf: [host!.OPSERWRITEM, 0])
+        }
+        noise.append(contentsOf: [host!.OPSERINIT, 1])
+        host!.send(data: &noise)
+        XCTAssertTrue(host!.virtualChannels[1].isOpen)
     }
 
     func testPerformanceExample() throws {
