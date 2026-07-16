@@ -20,6 +20,19 @@ public protocol DriveWireDelegate {
     
     /// Informs the delegate that a DriveWire transaction completed.
     func transactionCompleted(opCode : UInt8)
+
+    /// Informs the delegate that a virtual serial channel has data from the guest.
+    ///
+    /// - Parameters:
+    ///     - host: The DriveWire host object.
+    ///     - channel: The virtual serial channel number (0-14).
+    ///     - data: The bytes the guest wrote to the channel.
+    func channelDataAvailable(host : DriveWireHost, channel : UInt8, data : Data)
+}
+
+public extension DriveWireDelegate {
+    /// A default so delegates that don't serve virtual serial channels compile unchanged.
+    func channelDataAvailable(host : DriveWireHost, channel : UInt8, data : Data) {}
 }
 
 /// Statistical information about the host.
@@ -90,6 +103,12 @@ public class DriveWireHost : Codable {
     public var currentSubTransaction : UInt8 = 0
     /// An array of virtual drives.
     public var virtualDrives : [VirtualDrive] = []
+
+    /// The virtual serial channels, indexed by channel number (0-14).
+    ///
+    /// Channel state is runtime-only and deliberately not part of the
+    /// document's `Codable` representation.
+    public var virtualChannels : [VirtualChannel] = (0..<15).map { VirtualChannel(channelNumber: UInt8($0)) }
     
     /// The guest's capability byte sent from ``OPDWINIT``.
     private var guestCapabilityByte : UInt8 = 0x00
@@ -851,18 +870,35 @@ public class DriveWireHost : Codable {
         return 1
     }
     
+    /// Returns the virtual serial channel for a wire channel number.
+    ///
+    /// Returns `nil` for numbers outside 0-14; the 128-142 range is the
+    /// unimplemented VWindow space.
+    private func vserialChannel(_ number : UInt8) -> VirtualChannel? {
+        guard Int(number) < virtualChannels.count else { return nil }
+        return virtualChannels[Int(number)]
+    }
+
     private func OP_SERINIT(data : Data) -> Int {
+        let expectedCount = 2
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERINIT
         resetState()
+        vserialChannel(data[1])?.open()
+        log = log + "OP_SERINIT(\(data[1]))" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
-    
+
     private func OP_SERTERM(data : Data) -> Int {
+        let expectedCount = 2
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERTERM
         resetState()
+        vserialChannel(data[1])?.close()
+        log = log + "OP_SERTERM(\(data[1]))" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
     
     private func OP_SERREAD(data : Data) -> Int {
@@ -894,17 +930,35 @@ public class DriveWireHost : Codable {
     }
     
     private func OP_SERGETSTAT(data : Data) -> Int {
+        let expectedCount = 3
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERGETSTAT
         resetState()
+        // Logging only, per the specification.
+        log = log + "OP_SERGETSTAT(\(data[1]),\(data[2]))" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
-    
+
     private func OP_SERSETSTAT(data : Data) -> Int {
+        let ssComSt : UInt8 = 0x28, ssOpen : UInt8 = 0x29, ssClose : UInt8 = 0x2A
+        guard data.count >= 3 else { return 0 }
+        // SS.ComSt carries a 26-byte device descriptor after the code byte.
+        let expectedCount = data[2] == ssComSt ? 29 : 3
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERSETSTAT
         resetState()
+        switch data[2] {
+        case ssOpen:
+            vserialChannel(data[1])?.open()
+        case ssClose:
+            vserialChannel(data[1])?.close()
+        default:
+            break
+        }
+        log = log + "OP_SERSETSTAT(\(data[1]),\(data[2]))" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
     
     private func OP_FASTWRITE_Serial(data : Data) -> Int {

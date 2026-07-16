@@ -26,7 +26,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         do {
             try host!.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
             try host!.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
-        } catch DriveWireError.driveAlreadyExists {
+        } catch DriveWireHostError.driveAlreadyExists {
             host!.ejectVirtualDisk(driveNumber: 0)
         }
     }
@@ -148,6 +148,35 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         } catch {
             return (244, Data())
         }
+    }
+
+    func testSerialChannelOpensAndCloses() throws {
+        var open = Data([host!.OPSERINIT, 1])
+        host!.send(data: &open)
+        XCTAssertTrue(host!.virtualChannels[1].isOpen)
+        var close = Data([host!.OPSERTERM, 1])
+        host!.send(data: &close)
+        XCTAssertFalse(host!.virtualChannels[1].isOpen)
+    }
+
+    func testSerialSetStatOpensAndCloses() throws {
+        var open = Data([host!.OPSERSETSTAT, 2, 0x29])
+        host!.send(data: &open)
+        XCTAssertTrue(host!.virtualChannels[2].isOpen)
+        var close = Data([host!.OPSERSETSTAT, 2, 0x2A])
+        host!.send(data: &close)
+        XCTAssertFalse(host!.virtualChannels[2].isOpen)
+    }
+
+    func testSerialSetStatComStConsumes29Bytes() throws {
+        // SS.ComSt carries a 26-byte device descriptor. If the processor
+        // miscounts, the trailing SERINIT below lands mid-stream and channel 3
+        // never opens -- this asserts the stream stays in sync.
+        var payload = Data([host!.OPSERSETSTAT, 0, 0x28])
+        payload.append(Data(repeating: 0xAA, count: 26))
+        payload.append(Data([host!.OPSERINIT, 3]))
+        host!.send(data: &payload)
+        XCTAssertTrue(host!.virtualChannels[3].isOpen)
     }
 
     func testPerformanceExample() throws {
