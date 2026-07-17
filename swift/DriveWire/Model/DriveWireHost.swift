@@ -148,6 +148,7 @@ public class DriveWireHost : Codable {
     private var virtualSerialTCPConnections = [UInt8: VirtualSerialTCPConnection]()
     private var driveWireAPIConfig = [String: String]()
     private var virtualDriveParameters = [Int: [String: String]]()
+    private var midiBackend: DriveWireMIDIBackend = DriveWireMIDIBackendFactory.makeDefault()
 
     private final class VirtualSerialTCPConnection {
         private let connection: NWConnection
@@ -1515,10 +1516,14 @@ public class DriveWireHost : Codable {
         }
 
         switch match(command, in: ["output", "status", "synth"]) {
+        case .success("output"):
+            return midiOutput(Array(arguments.dropFirst()))
         case .success("status"):
             return midiStatus()
+        case .success("synth"):
+            return midiSynth(Array(arguments.dropFirst()))
         case .success(let name):
-            return .failure(204, "Command 'dw midi \(name)' requires a MIDI subsystem, which is not available in this Swift server.")
+            return .failure(204, "Command 'dw midi \(name)' is not implemented yet.")
         case .failure(let message):
             return .failure(10, message)
         }
@@ -1727,8 +1732,64 @@ public class DriveWireHost : Codable {
 
     private func midiStatus() -> DriveWireAPIResult {
         var text = "\r\nDriveWire MIDI status:\r\n\n"
-        text += "MIDI is disabled.\r\n"
+        for line in midiBackend.statusLines() {
+            text += line + "\r\n"
+        }
+        text += "\r\n"
         return .success(text)
+    }
+
+    private func midiOutput(_ arguments: [String]) -> DriveWireAPIResult {
+        if let argument = arguments.first {
+            guard arguments.count == 1, let outputIndex = Int(argument) else {
+                return .failure(10, "Syntax error: dw midi output requires a numeric device #")
+            }
+
+            do {
+                try midiBackend.selectOutput(index: outputIndex)
+                return .success("MIDI output set to \(midiBackend.selectedOutputName ?? "device #\(outputIndex)").\r\n")
+            } catch {
+                return .failure(204, error.localizedDescription)
+            }
+        }
+
+        var text = "\r\nDriveWire MIDI output devices:\r\n\n"
+        let devices = midiBackend.outputDevices()
+        if devices.isEmpty {
+            text += "No MIDI output devices available.\r\n"
+        } else {
+            for device in devices {
+                let marker = device.isSelected ? "*" : " "
+                text += String(format: "%@%3d  %@\r\n", marker, device.index, device.name)
+            }
+        }
+        text += "\r\n"
+        return .success(text)
+    }
+
+    private func midiSynth(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "reset", help: "Reset the selected MIDI output"),
+                DriveWireAPICommand(name: "status", help: "Show MIDI synthesizer status")
+            ]))
+        }
+
+        switch match(command, in: ["reset", "status"]) {
+        case .success("reset"):
+            do {
+                try midiBackend.reset()
+                return .success("MIDI synthesizer reset sent.\r\n")
+            } catch {
+                return .failure(204, error.localizedDescription)
+            }
+        case .success("status"):
+            return midiStatus()
+        case .success(let name):
+            return .failure(204, "Command 'dw midi synth \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
     }
 
     private func netShow() -> DriveWireAPIResult {
@@ -2056,7 +2117,7 @@ public class DriveWireHost : Codable {
             "config": "View and update DriveWire protocol handler configuration.",
             "disk": "Create, insert, eject, inspect, and write DriveWire disk images.",
             "log": "View recent Swift server log entries.",
-            "midi": "MIDI commands are recognized, but MIDI output is not available in this Swift server.",
+            "midi": "Show MIDI status, select an output device, and reset the selected synthesizer.",
             "net": "Show TCP connections used by virtual serial ports.",
             "port": "Show, close, or connect virtual serial ports.",
             "server": "Show server status and access host-side files."
