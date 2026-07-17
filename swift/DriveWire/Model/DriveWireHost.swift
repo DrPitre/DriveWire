@@ -8,6 +8,7 @@
 import Foundation
 import AppKit
 import AppIntents
+import Network
 
 /// An interface for receiving information from the DriveWire host.
 public protocol DriveWireDelegate {
@@ -143,8 +144,63 @@ public class DriveWireHost : Codable {
     private var virtualSerialInput = [UInt8: Data]()
     private var virtualSerialCommandBuffers = [UInt8: String]()
     private var pendingClosedVirtualSerialChannels: [UInt8] = []
+    private var virtualSerialTCPConnections = [UInt8: VirtualSerialTCPConnection]()
     private var driveWireAPIConfig = [String: String]()
     private var virtualDriveParameters = [Int: [String: String]]()
+
+    private final class VirtualSerialTCPConnection {
+        private let connection: NWConnection
+        private let queue: DispatchQueue
+        private let onReceive: (Data) -> Void
+        private let onClose: () -> Void
+
+        let host: String
+        let port: UInt16
+
+        init(host: String, port: UInt16, onReceive: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
+            self.host = host
+            self.port = port
+            self.onReceive = onReceive
+            self.onClose = onClose
+            self.queue = DispatchQueue(label: "DriveWire.VirtualSerialTCP.\(host).\(port)")
+            self.connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+        }
+
+        func start() {
+            connection.stateUpdateHandler = { [weak self] state in
+                if case .failed = state {
+                    self?.onClose()
+                } else if case .cancelled = state {
+                    self?.onClose()
+                }
+            }
+            receiveNext()
+            connection.start(queue: queue)
+        }
+
+        func send(_ data: Data) {
+            guard !data.isEmpty else { return }
+            connection.send(content: data, completion: .contentProcessed { _ in })
+        }
+
+        func close() {
+            connection.cancel()
+        }
+
+        private func receiveNext() {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] data, _, isComplete, error in
+                guard let self else { return }
+                if let data, !data.isEmpty {
+                    self.onReceive(data)
+                }
+                if isComplete || error != nil {
+                    self.onClose()
+                } else {
+                    self.receiveNext()
+                }
+            }
+        }
+    }
     
     struct RFMPathDescriptor {
         var processID = 0
@@ -1142,6 +1198,8 @@ public class DriveWireHost : Codable {
         case 0x29:
             openVirtualSerialChannels.insert(ch)
         case 0x2A:
+            virtualSerialTCPConnections[ch]?.close()
+            virtualSerialTCPConnections[ch] = nil
             openVirtualSerialChannels.remove(ch)
         default:
             break
@@ -1194,6 +1252,11 @@ public class DriveWireHost : Codable {
     }
 
     private func writeVirtualSerial(channel: UInt8, data: Data) {
+        if let connection = virtualSerialTCPConnections[channel] {
+            connection.send(data)
+            return
+        }
+
         for byte in data {
             if byte == 0x0D {
                 let command = virtualSerialCommandBuffers[channel, default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1290,6 +1353,12 @@ public class DriveWireHost : Codable {
             return parseConfigCommand(Array(arguments.dropFirst()))
         case .success("disk"):
             return parseDiskCommand(Array(arguments.dropFirst()))
+        case .success("log"):
+            return parseLogCommand(Array(arguments.dropFirst()))
+        case .success("midi"):
+            return parseMIDICommand(Array(arguments.dropFirst()))
+        case .success("net"):
+            return parseNetCommand(Array(arguments.dropFirst()))
         case .success("port"):
             return parsePortCommand(Array(arguments.dropFirst()))
         case .success("server"):
@@ -1340,6 +1409,8 @@ public class DriveWireHost : Codable {
         }
 
         switch match(command, in: ["create", "dos", "dump", "eject", "insert", "reload", "set", "show", "write"]) {
+        case .success("create"):
+            return diskCreate(Array(arguments.dropFirst()))
         case .success("dump"):
             return diskDump(Array(arguments.dropFirst()))
         case .success("eject"):
@@ -1361,6 +1432,59 @@ public class DriveWireHost : Codable {
         }
     }
 
+    private func parseLogCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "show", help: "Show last 20 (or #) log entries")
+            ]))
+        }
+
+        switch match(command, in: ["show"]) {
+        case .success("show"):
+            return logShow(Array(arguments.dropFirst()))
+        case .success(let name):
+            return .failure(204, "Command 'dw log \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parseMIDICommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "output", help: "Set midi output to device #"),
+                DriveWireAPICommand(name: "status", help: "Show MIDI status"),
+                DriveWireAPICommand(name: "synth", help: "Manage the MIDI synthesizer")
+            ]))
+        }
+
+        switch match(command, in: ["output", "status", "synth"]) {
+        case .success("status"):
+            return midiStatus()
+        case .success(let name):
+            return .failure(204, "Command 'dw midi \(name)' requires a MIDI subsystem, which is not available in this Swift server.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parseNetCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "show", help: "Show networking status")
+            ]))
+        }
+
+        switch match(command, in: ["show"]) {
+        case .success("show"):
+            return netShow()
+        case .success(let name):
+            return .failure(204, "Command 'dw net \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
     private func parsePortCommand(_ arguments: [String]) -> DriveWireAPIResult {
         guard let command = arguments.first else {
             return .success(shortHelp(for: [
@@ -1373,6 +1497,8 @@ public class DriveWireHost : Codable {
         switch match(command, in: ["close", "open", "show"]) {
         case .success("close"):
             return portClose(Array(arguments.dropFirst()))
+        case .success("open"):
+            return portOpen(Array(arguments.dropFirst()))
         case .success("show"):
             return portShow()
         case .success(let name):
@@ -1400,15 +1526,16 @@ public class DriveWireHost : Codable {
             return serverDir(Array(arguments.dropFirst()))
         case .success("list"):
             return serverList(Array(arguments.dropFirst()))
+        case .success("help"):
+            return serverHelp(Array(arguments.dropFirst()))
         case .success("print"):
             return serverPrint(Array(arguments.dropFirst()))
         case .success("status"):
             return serverStatus()
         case .success("show"):
-            return .success(shortHelp(for: [
-                DriveWireAPICommand(name: "handlers", help: "Show handler information"),
-                DriveWireAPICommand(name: "threads", help: "Show thread information")
-            ]))
+            return serverShow(Array(arguments.dropFirst()))
+        case .success("turbo"):
+            return serverTurbo()
         case .success(let name):
             return .failure(204, "Command 'dw server \(name)' is not implemented yet.")
         case .failure(let message):
@@ -1495,6 +1622,86 @@ public class DriveWireHost : Codable {
         let value = arguments.dropFirst().joined(separator: " ")
         driveWireAPIConfig[item] = value
         return .success("Item '\(item)' set to '\(value)'\r\n")
+    }
+
+    private func logShow(_ arguments: [String]) -> DriveWireAPIResult {
+        let lineCount: Int
+        if let argument = arguments.first {
+            guard arguments.count == 1, let parsed = Int(argument), parsed >= 0 else {
+                return .failure(10, "Syntax error: non numeric # of log lines")
+            }
+            lineCount = parsed
+        } else {
+            lineCount = 20
+        }
+
+        let lines = logStorage.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let selected = lines.suffix(lineCount).joined(separator: "\r\n")
+        var text = "\r\nDriveWire Server Log (\(lines.count) events in buffer):\r\n\n"
+        if !selected.isEmpty {
+            text += selected
+            if !text.hasSuffix("\r\n") {
+                text += "\r\n"
+            }
+        }
+        return .success(text)
+    }
+
+    private func midiStatus() -> DriveWireAPIResult {
+        var text = "\r\nDriveWire MIDI status:\r\n\n"
+        text += "MIDI is disabled.\r\n"
+        return .success(text)
+    }
+
+    private func netShow() -> DriveWireAPIResult {
+        var text = "\r\nDriveWire Network Connections:\r\n\n"
+        let connections = virtualSerialTCPConnections.sorted { $0.key < $1.key }
+        if connections.isEmpty {
+            text += "No active network connections.\r\n"
+        } else {
+            for (index, item) in connections.enumerated() {
+                let channel = Int(item.key)
+                let connection = item.value
+                text += "Connection \(index): \(connection.host):\(connection.port) (connected to port /N\(channel + 1))\r\n"
+            }
+        }
+        text += "\r\n"
+        return .success(text)
+    }
+
+    private func diskCreate(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let driveArgument = arguments.first else {
+            return .failure(10, "Syntax error")
+        }
+        guard let driveNumber = parseDriveNumber(driveArgument) else {
+            return .failure(101, "Invalid drive number '\(driveArgument)'")
+        }
+
+        if arguments.count == 1 {
+            ejectVirtualDisk(driveNumber: driveNumber)
+            let drive = VirtualDrive(driveNumber: driveNumber)
+            virtualDrives.append(drive)
+            return .success("New image created for drive \(driveNumber).\r\n")
+        }
+
+        let path = arguments.dropFirst().joined(separator: " ")
+        let url = serverFileURL(from: path)
+        guard !FileManager.default.fileExists(atPath: url.path) else {
+            return .failure(202, "File already exists")
+        }
+
+        do {
+            let parent = url.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            guard FileManager.default.createFile(atPath: url.path, contents: Data()) else {
+                return .failure(202, "Unable to create file")
+            }
+            ejectVirtualDisk(driveNumber: driveNumber)
+            try insertVirtualDisk(driveNumber: driveNumber, imagePath: url.path)
+            return .success("New disk image created for drive \(driveNumber).\r\n")
+        } catch {
+            return .failure(202, error.localizedDescription)
+        }
     }
 
     private func diskShow(_ arguments: [String]) -> DriveWireAPIResult {
@@ -1634,6 +1841,44 @@ public class DriveWireHost : Codable {
         }
     }
 
+    private func portOpen(_ arguments: [String]) -> DriveWireAPIResult {
+        guard arguments.count >= 2 else {
+            return .failure(10, "dw port open requires a port # and tcphost:port as an argument")
+        }
+        guard let portNumber = Int(arguments[0]), portNumber >= 0, portNumber < 15 else {
+            return .failure(10, "Syntax error: non numeric port #")
+        }
+
+        let hostPort = arguments[1]
+        guard let separator = hostPort.lastIndex(of: ":") else {
+            return .failure(10, "Syntax error: expected tcphost:port")
+        }
+        let host = String(hostPort[..<separator])
+        let portText = String(hostPort[hostPort.index(after: separator)...])
+        guard !host.isEmpty, let tcpPort = UInt16(portText), tcpPort > 0 else {
+            return .failure(10, "Syntax error: non numeric tcp port")
+        }
+
+        let channel = UInt8(portNumber)
+        virtualSerialTCPConnections[channel]?.close()
+        openVirtualSerialChannels.insert(channel)
+
+        let connection = VirtualSerialTCPConnection(host: host, port: tcpPort, onReceive: { [weak self] data in
+            DispatchQueue.main.async {
+                self?.virtualSerialInput[channel, default: Data()].append(data)
+            }
+        }, onClose: { [weak self] in
+            DispatchQueue.main.async {
+                self?.virtualSerialTCPConnections[channel] = nil
+                self?.openVirtualSerialChannels.remove(channel)
+            }
+        })
+        virtualSerialTCPConnections[channel] = connection
+        connection.start()
+
+        return .success("Port #\(portNumber) open.\r\n")
+    }
+
     private func portClose(_ arguments: [String]) -> DriveWireAPIResult {
         guard let portArgument = arguments.first else {
             return .failure(10, "dw port close requires a port # as an argument")
@@ -1643,6 +1888,8 @@ public class DriveWireHost : Codable {
         }
 
         let channel = UInt8(portNumber)
+        virtualSerialTCPConnections[channel]?.close()
+        virtualSerialTCPConnections[channel] = nil
         openVirtualSerialChannels.remove(channel)
         virtualSerialInput[channel]?.removeAll()
         virtualSerialCommandBuffers[channel] = ""
@@ -1660,6 +1907,9 @@ public class DriveWireHost : Codable {
                 text += "open".padding(toLength: 8, withPad: " ", startingAt: 0)
                 text += " "
                 text += "buf: \(waiting)".padding(toLength: 9, withPad: " ", startingAt: 0)
+                if let connection = virtualSerialTCPConnections[channel] {
+                    text += " tcp: \(connection.host):\(connection.port)"
+                }
             } else {
                 text += " closed"
             }
@@ -1678,6 +1928,95 @@ public class DriveWireHost : Codable {
         text += "Reads:         \(statistics.readCount)\r\n"
         text += "Writes:        \(statistics.writeCount)\r\n"
         return .success(text)
+    }
+
+    private func serverShow(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "serial", help: "Show serial status"),
+                DriveWireAPICommand(name: "threads", help: "Show thread information"),
+                DriveWireAPICommand(name: "timers", help: "Show instance timers")
+            ]))
+        }
+
+        switch match(command, in: ["serial", "threads", "timers"]) {
+        case .success("serial"):
+            return serverShowSerial()
+        case .success("threads"):
+            return serverShowThreads()
+        case .success("timers"):
+            return serverShowTimers()
+        case .success(let name):
+            return .failure(204, "Command 'dw server show \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func serverHelp(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "reload", help: "Reload help topics"),
+                DriveWireAPICommand(name: "show", help: "Show help topic")
+            ]))
+        }
+
+        switch match(command, in: ["reload", "show"]) {
+        case .success("show"):
+            return serverHelpShow(Array(arguments.dropFirst()))
+        case .success("reload"):
+            return .success("Help topics reloaded.\r\n")
+        case .success(let name):
+            return .failure(204, "Command 'dw server help \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func serverHelpShow(_ arguments: [String]) -> DriveWireAPIResult {
+        let topics = [
+            "config": "View and update DriveWire protocol handler configuration.",
+            "disk": "Create, insert, eject, inspect, and write DriveWire disk images.",
+            "log": "View recent Swift server log entries.",
+            "midi": "MIDI commands are recognized, but MIDI output is not available in this Swift server.",
+            "net": "Show TCP connections used by virtual serial ports.",
+            "port": "Show, close, or connect virtual serial ports.",
+            "server": "Show server status and access host-side files."
+        ]
+
+        if let topic = arguments.first {
+            if let text = topics[topic.lowercased()] {
+                return .success("Help for \(topic):\r\n\r\n\(text)\r\n")
+            }
+            return .failure(142, "Help topic '\(topic)' not found.")
+        }
+
+        return .success("Help Topics:\r\n\r\n" + topics.keys.sorted().joined(separator: "\r\n") + "\r\n")
+    }
+
+    private func serverShowSerial() -> DriveWireAPIResult {
+        var text = "\r\nDriveWire serial status:\r\n\n"
+        text += "Open virtual channels: \(openVirtualSerialChannels.sorted().map { "/N\(Int($0) + 1)" }.joined(separator: ", "))\r\n"
+        text += "TCP-backed channels: \(virtualSerialTCPConnections.count)\r\n"
+        text += "Pending close notifications: \(pendingClosedVirtualSerialChannels.count)\r\n"
+        return .success(text)
+    }
+
+    private func serverShowThreads() -> DriveWireAPIResult {
+        var text = "\r\nDriveWire Server Threads:\r\n\n"
+        text += String(format: "%40@ %3d %-8@ %-14@\r\n", "main", 0, "Swift", Thread.isMainThread ? "RUNNABLE" : "UNKNOWN")
+        text += String(format: "%40@ %3d %-8@ %-14@\r\n", "virtual-serial-tcp", 0, "Swift", virtualSerialTCPConnections.isEmpty ? "IDLE" : "RUNNABLE")
+        return .success(text)
+    }
+
+    private func serverShowTimers() -> DriveWireAPIResult {
+        var text = "DriveWire instance timers (not shown == 0):\r\n\r\n"
+        text += "No active instance timers.\r\n"
+        return .success(text)
+    }
+
+    private func serverTurbo() -> DriveWireAPIResult {
+        .success("Failed to enable DATurbo mode: active device does not support serial baud-rate switching.\r\n")
     }
 
     private func serverDir(_ arguments: [String]) -> DriveWireAPIResult {
@@ -2690,6 +3029,17 @@ extension DriveWireHost {
         private var storageContainer = Data()
         private var isStorageLoaded = false
         
+        /// Creates an empty in-memory virtual drive.
+        ///
+        /// - Parameters:
+        ///     - driveNumber: The number to assign to this virtual drive.
+        init(driveNumber: Int) {
+            self.driveNumber = driveNumber
+            self.imagePath = ""
+            self.storageContainer = Data()
+            self.isStorageLoaded = true
+        }
+
         /// Creates a new virtual drive.
         ///
         /// - Parameters:
