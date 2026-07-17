@@ -533,7 +533,7 @@ private struct VirtualWindowTerminalView: NSViewRepresentable {
         textView.autoresizingMask = [.width]
         textView.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
         textView.textColor = NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 1.0)
-        textView.insertionPointColor = NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 1.0)
+        textView.insertionPointColor = .clear
         textView.selectedTextAttributes = [
             .backgroundColor: NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 0.35)
         ]
@@ -557,13 +557,12 @@ private struct VirtualWindowTerminalView: NSViewRepresentable {
             context.coordinator.onInput(input, context.coordinator.channel)
         }
         textView.setTerminalText(text)
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, textView.bounds.height - scrollView.contentView.bounds.height)))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
 
         DispatchQueue.main.async {
             if textView.window?.firstResponder !== textView {
                 textView.window?.makeFirstResponder(textView)
             }
+            textView.scrollToTerminalEnd()
         }
     }
 
@@ -579,6 +578,8 @@ private struct VirtualWindowTerminalView: NSViewRepresentable {
 
 private final class VirtualWindowTextView: NSTextView {
     var onInput: ((String) -> Void)?
+    private var cursorTimer: Timer?
+    private var isCursorVisible = true
     private let terminalAttributes: [NSAttributedString.Key: Any] = [
         .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .medium),
         .foregroundColor: NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 1.0)
@@ -590,6 +591,25 @@ private final class VirtualWindowTextView: NSTextView {
     func setTerminalText(_ text: String) {
         textStorage?.setAttributedString(NSAttributedString(string: text, attributes: terminalAttributes))
         setSelectedRange(NSRange(location: text.count, length: 0))
+        scrollToTerminalEnd()
+    }
+
+    func scrollToTerminalEnd() {
+        scrollRangeToVisible(NSRange(location: string.count, length: 0))
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            stopCursorTimer()
+        } else {
+            startCursorTimer()
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        drawBlockCursor()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -617,6 +637,80 @@ private final class VirtualWindowTextView: NSTextView {
                 onInput?(characters.replacingOccurrences(of: "\n", with: "\r"))
             }
         }
+    }
+
+    private func startCursorTimer() {
+        stopCursorTimer()
+        cursorTimer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            isCursorVisible.toggle()
+            setNeedsDisplay(bounds)
+        }
+        if let cursorTimer {
+            RunLoop.main.add(cursorTimer, forMode: .common)
+        }
+    }
+
+    private func stopCursorTimer() {
+        cursorTimer?.invalidate()
+        cursorTimer = nil
+    }
+
+    private func drawBlockCursor() {
+        guard isCursorVisible else { return }
+
+        let textLength = string.count
+        setSelectedRange(NSRange(location: textLength, length: 0))
+
+        let font = font ?? .monospacedSystemFont(ofSize: 13, weight: .medium)
+        let characterWidth = max(8, (" " as NSString).size(withAttributes: [.font: font]).width)
+        let cursorHeight = font.ascender - font.descender
+        let cursorOrigin = terminalCursorOrigin(characterWidth: characterWidth, cursorHeight: cursorHeight)
+        let cursorRect = NSRect(
+            x: cursorOrigin.x,
+            y: cursorOrigin.y,
+            width: characterWidth,
+            height: cursorHeight
+        ).integral
+
+        NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 0.75).setFill()
+        cursorRect.fill()
+    }
+
+    private func terminalCursorOrigin(characterWidth: CGFloat, cursorHeight: CGFloat) -> NSPoint {
+        guard
+            let layoutManager,
+            let textContainer
+        else {
+            return NSPoint(x: textContainerInset.width, y: textContainerInset.height)
+        }
+
+        layoutManager.ensureLayout(for: textContainer)
+
+        if string.isEmpty {
+            return NSPoint(x: textContainerInset.width, y: textContainerInset.height)
+        }
+
+        let nsString = string as NSString
+        let textLength = nsString.length
+        let previousCharacter = nsString.character(at: textLength - 1)
+        if previousCharacter == 0x0A || previousCharacter == 0x0D {
+            let lineHeight = layoutManager.defaultLineHeight(for: font ?? .monospacedSystemFont(ofSize: 13, weight: .medium))
+            let glyphIndex = max(layoutManager.numberOfGlyphs - 1, 0)
+            let previousRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+            return NSPoint(
+                x: textContainerInset.width,
+                y: textContainerInset.height + previousRect.maxY
+            )
+        }
+
+        let glyphIndex = max(layoutManager.glyphIndexForCharacter(at: textLength - 1), 0)
+        let glyphRect = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyphIndex, length: 1), in: textContainer)
+        let lineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+        return NSPoint(
+            x: textContainerInset.width + glyphRect.maxX,
+            y: textContainerInset.height + lineRect.minY + max(0, (lineRect.height - cursorHeight) / 2)
+        )
     }
 }
 

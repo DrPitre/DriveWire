@@ -1274,7 +1274,7 @@ public class DriveWireHost : Codable {
             isVirtualWindowChannel($0) && !(virtualSerialInput[$0]?.isEmpty ?? true)
         }) {
             let byte = readVirtualSerial(channel: channel, count: 1).first ?? 0
-            return Data([virtualWindowGuestChannel(forInternalChannel: channel) &+ 1, byte])
+            return Data([virtualWindowGuestChannel(forInternalChannel: channel), byte])
         }
 
         if let channel = virtualSerialInput.keys.sorted().first(where: {
