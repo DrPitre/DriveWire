@@ -144,6 +144,7 @@ public class DriveWireHost : Codable {
     private var virtualSerialInput = [UInt8: Data]()
     private var virtualSerialCommandBuffers = [UInt8: String]()
     private var pendingClosedVirtualSerialChannels: [UInt8] = []
+    private var clientRestartRequested = false
     private var virtualSerialTCPConnections = [UInt8: VirtualSerialTCPConnection]()
     private var driveWireAPIConfig = [String: String]()
     private var virtualDriveParameters = [Int: [String: String]]()
@@ -1211,6 +1212,11 @@ public class DriveWireHost : Codable {
     }
 
     private func pollVirtualSerial() -> Data {
+        if clientRestartRequested {
+            clientRestartRequested = false
+            return Data([16, 255])
+        }
+
         if let channel = pendingClosedVirtualSerialChannels.first,
            virtualSerialInput[channel]?.isEmpty ?? true {
             pendingClosedVirtualSerialChannels.removeFirst()
@@ -1338,8 +1344,10 @@ public class DriveWireHost : Codable {
     private func parseDriveWireAPI(_ arguments: [String]) -> DriveWireAPIResult {
         guard let command = arguments.first else {
             return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "client", help: "Commands that manage the attached client device"),
                 DriveWireAPICommand(name: "config", help: "Commands to manipulate the config"),
                 DriveWireAPICommand(name: "disk", help: "Manage disks and disksets"),
+                DriveWireAPICommand(name: "instance", help: "Commands to control instances"),
                 DriveWireAPICommand(name: "log", help: "View server logs"),
                 DriveWireAPICommand(name: "midi", help: "Manage MIDI"),
                 DriveWireAPICommand(name: "net", help: "Show network information"),
@@ -1348,11 +1356,15 @@ public class DriveWireHost : Codable {
             ]))
         }
 
-        switch match(command, in: ["config", "disk", "log", "midi", "net", "port", "server"]) {
+        switch match(command, in: ["client", "config", "disk", "instance", "log", "midi", "net", "port", "server"]) {
+        case .success("client"):
+            return parseClientCommand(Array(arguments.dropFirst()))
         case .success("config"):
             return parseConfigCommand(Array(arguments.dropFirst()))
         case .success("disk"):
             return parseDiskCommand(Array(arguments.dropFirst()))
+        case .success("instance"):
+            return parseInstanceCommand(Array(arguments.dropFirst()))
         case .success("log"):
             return parseLogCommand(Array(arguments.dropFirst()))
         case .success("midi"):
@@ -1365,6 +1377,24 @@ public class DriveWireHost : Codable {
             return parseServerCommand(Array(arguments.dropFirst()))
         case .success(let name):
             return .failure(204, "Command 'dw \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parseClientCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "restart", help: "Restart client device")
+            ]))
+        }
+
+        switch match(command, in: ["restart"]) {
+        case .success("restart"):
+            clientRestartRequested = true
+            return .success("Restart pending\r\n")
+        case .success(let name):
+            return .failure(204, "Command 'dw client \(name)' is not implemented yet.")
         case .failure(let message):
             return .failure(10, message)
         }
@@ -1427,6 +1457,32 @@ public class DriveWireHost : Codable {
             return diskWrite(Array(arguments.dropFirst()))
         case .success(let name):
             return .failure(204, "Command 'dw disk \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parseInstanceCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "restart", help: "Restart instance #"),
+                DriveWireAPICommand(name: "show", help: "Show instance status"),
+                DriveWireAPICommand(name: "start", help: "Start instance #"),
+                DriveWireAPICommand(name: "stop", help: "Stop instance #")
+            ]))
+        }
+
+        switch match(command, in: ["restart", "show", "start", "stop"]) {
+        case .success("show"):
+            return instanceShow()
+        case .success("start"):
+            return instanceLifecycle(arguments: Array(arguments.dropFirst()), action: "start")
+        case .success("stop"):
+            return instanceLifecycle(arguments: Array(arguments.dropFirst()), action: "stop")
+        case .success("restart"):
+            return instanceLifecycle(arguments: Array(arguments.dropFirst()), action: "restart")
+        case .success(let name):
+            return .failure(204, "Command 'dw instance \(name)' is not implemented yet.")
         case .failure(let message):
             return .failure(10, message)
         }
@@ -1622,6 +1678,28 @@ public class DriveWireHost : Codable {
         let value = arguments.dropFirst().joined(separator: " ")
         driveWireAPIConfig[item] = value
         return .success("Item '\(item)' set to '\(value)'\r\n")
+    }
+
+    private func instanceShow() -> DriveWireAPIResult {
+        var text = "DriveWire protocol handler instances:\r\n\n"
+        text += "#0  (Ready)     "
+        text += String(format: "Proto: %-11@", "DriveWire")
+        text += String(format: "Type: %-11@", "swift")
+        text += "Drives: \(virtualDrives.count) Ports: \(openVirtualSerialChannels.count)\r\n"
+        return .success(text)
+    }
+
+    private func instanceLifecycle(arguments: [String], action: String) -> DriveWireAPIResult {
+        guard let argument = arguments.first, arguments.count == 1 else {
+            return .failure(10, "Syntax error: dw instance \(action) requires an instance # as an argument")
+        }
+        guard let instanceNumber = Int(argument) else {
+            return .failure(10, "dw instance \(action) requires a numeric instance # as an argument")
+        }
+        guard instanceNumber == 0 else {
+            return .failure(218, "Invalid instance number.")
+        }
+        return .failure(204, "Instance \(action) is not supported by the single-instance Swift server.")
     }
 
     private func logShow(_ arguments: [String]) -> DriveWireAPIResult {
@@ -1999,6 +2077,7 @@ public class DriveWireHost : Codable {
         text += "Open virtual channels: \(openVirtualSerialChannels.sorted().map { "/N\(Int($0) + 1)" }.joined(separator: ", "))\r\n"
         text += "TCP-backed channels: \(virtualSerialTCPConnections.count)\r\n"
         text += "Pending close notifications: \(pendingClosedVirtualSerialChannels.count)\r\n"
+        text += "Client restart pending: \(clientRestartRequested ? "true" : "false")\r\n"
         return .success(text)
     }
 
