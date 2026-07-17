@@ -17,6 +17,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
     override func setUpWithError() throws {
         // Put setup code here. This method is called before the invocation of each test method in the class.
         host = DriveWireHost(delegate: self)
+        host?.bridgedChannels = Set(0...15)
     }
 
     override func tearDownWithError() throws {
@@ -157,19 +158,19 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
     func testSerialChannelOpensAndCloses() throws {
         var open = Data([host!.OPSERINIT, 1])
         host!.send(data: &open)
-        XCTAssertTrue(host!.virtualChannels[1].isOpen)
+        XCTAssertTrue(host!.isChannelOpen(1))
         var close = Data([host!.OPSERTERM, 1])
         host!.send(data: &close)
-        XCTAssertFalse(host!.virtualChannels[1].isOpen)
+        XCTAssertFalse(host!.isChannelOpen(1))
     }
 
     func testSerialSetStatOpensAndCloses() throws {
         var open = Data([host!.OPSERSETSTAT, 2, 0x29])
         host!.send(data: &open)
-        XCTAssertTrue(host!.virtualChannels[2].isOpen)
+        XCTAssertTrue(host!.isChannelOpen(2))
         var close = Data([host!.OPSERSETSTAT, 2, 0x2A])
         host!.send(data: &close)
-        XCTAssertFalse(host!.virtualChannels[2].isOpen)
+        XCTAssertFalse(host!.isChannelOpen(2))
     }
 
     func testSerialSetStatComStConsumes29Bytes() throws {
@@ -180,7 +181,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         payload.append(Data(repeating: 0xAA, count: 26))
         payload.append(Data([host!.OPSERINIT, 3]))
         host!.send(data: &payload)
-        XCTAssertTrue(host!.virtualChannels[3].isOpen)
+        XCTAssertTrue(host!.isChannelOpen(3))
     }
 
     var channelData : [UInt8: Data] = [:]
@@ -254,13 +255,13 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         XCTAssertEqual(read(bytes: 2), Data([0, 0]))
     }
 
-    func testSerialReadMOverRequestSendsNothing() throws {
+    func testSerialReadMOverRequestReturnsAvailable() throws {
         var open = Data([host!.OPSERINIT, 1])
         host!.send(data: &open)
         host!.writeToChannel(Data([0x01]), channel: 1)
         var readm = Data([host!.OPSERREADM, 1, 200])
         host!.send(data: &readm)
-        XCTAssertEqual(responseData.count, 0)
+        XCTAssertEqual(responseData, Data([0x01]))
     }
 
     func testHostCloseReportedInPoll() throws {
@@ -271,7 +272,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         host!.send(data: &poll)
         // Byte 1 = 16 (status), byte 2 high nibble 0 = closed, low nibble = channel.
         XCTAssertEqual(read(bytes: 2), Data([16, 4]))
-        XCTAssertFalse(host!.virtualChannels[4].isOpen)
+        XCTAssertFalse(host!.isChannelOpen(4))
     }
 
     func testSerialReadRoundRobinFairness() throws {
@@ -321,7 +322,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         }
         noise.append(contentsOf: [host!.OPSERINIT, 1])
         host!.send(data: &noise)
-        XCTAssertTrue(host!.virtualChannels[1].isOpen)
+        XCTAssertTrue(host!.isChannelOpen(1))
     }
 
     func testPerformanceExample() throws {

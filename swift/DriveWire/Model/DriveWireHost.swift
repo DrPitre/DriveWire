@@ -21,18 +21,21 @@ public protocol DriveWireDelegate {
     /// Informs the delegate that a DriveWire transaction completed.
     func transactionCompleted(opCode : UInt8)
 
-    /// Informs the delegate that a virtual serial channel has data from the guest.
+    /// Informs the delegate that a bridged virtual serial channel produced guest output.
+    ///
+    /// Only channels listed in ``DriveWireHost/bridgedChannels`` report here;
+    /// all other channels feed the host's built-in dw command processor.
     ///
     /// - Parameters:
     ///     - host: The DriveWire host object.
-    ///     - channel: The virtual serial channel number (0-14).
-    ///     - data: The bytes the guest wrote to the channel.
+    ///     - channel: The virtual serial channel the guest wrote to.
+    ///     - data: The bytes the guest wrote.
     func channelDataAvailable(host : DriveWireHost, channel : UInt8, data : Data)
 }
 
-public extension DriveWireDelegate {
-    /// A default so delegates that don't serve virtual serial channels compile unchanged.
-    func channelDataAvailable(host : DriveWireHost, channel : UInt8, data : Data) {}
+extension DriveWireDelegate {
+    /// Discards bridged channel output for delegates that don't bridge channels.
+    public func channelDataAvailable(host : DriveWireHost, channel : UInt8, data : Data) {}
 }
 
 /// Statistical information about the host.
@@ -77,14 +80,50 @@ public enum DriveWireProtocolError : Int {
 ///
 @Observable
 public class DriveWireHost : Codable {
-    var log : String = ""
+    private static let maximumLogCharacters = 24_000
+    private static let trimmedLogPrefix = "... older log entries trimmed ...\n"
+    private static let emitConsoleOutput = false
+
+    public var detailedOpcodeLogging = false
+
+    private var logStorage = ""
+
+    var log: String {
+        get { logStorage }
+        set { logStorage = Self.trimmedLog(from: newValue) }
+    }
 
     init() {
+        setupTransactions()
     }
     
     func reloadVirtualDrives() {
         for vd in virtualDrives {
             vd.reload()
+        }
+    }
+
+    private static func trimmedLog(from value: String) -> String {
+        guard value.count > maximumLogCharacters else {
+            return value
+        }
+
+        let retainedCount = maximumLogCharacters - trimmedLogPrefix.count
+        guard retainedCount > 0 else {
+            return String(value.suffix(maximumLogCharacters))
+        }
+
+        return trimmedLogPrefix + value.suffix(retainedCount)
+    }
+
+    private func reportActivity(_ message: String, isFrequent: Bool = false, isError: Bool = false) {
+        let shouldRecord = isError || !isFrequent || detailedOpcodeLogging
+        if shouldRecord {
+            logStorage = Self.trimmedLog(from: logStorage + message + "\n")
+        }
+
+        if isError || (Self.emitConsoleOutput && shouldRecord) {
+            print(message)
         }
     }
     
@@ -103,12 +142,6 @@ public class DriveWireHost : Codable {
     public var currentSubTransaction : UInt8 = 0
     /// An array of virtual drives.
     public var virtualDrives : [VirtualDrive] = []
-
-    /// The virtual serial channels, indexed by channel number (0-14).
-    ///
-    /// Channel state is runtime-only and deliberately not part of the
-    /// document's `Codable` representation.
-    public var virtualChannels : [VirtualChannel] = (0..<15).map { VirtualChannel(channelNumber: UInt8($0)) }
     
     /// The guest's capability byte sent from ``OPDWINIT``.
     private var guestCapabilityByte : UInt8 = 0x00
@@ -122,101 +155,226 @@ public class DriveWireHost : Codable {
     private var validateWithCRC = false
     private var fastwriteChannel : UInt8 = 0
     private var processor : ((Data) -> Int)?
+    /// Channels whose raw guest bytes flow to the delegate's
+    /// ``DriveWireDelegate/channelDataAvailable(host:channel:data:)`` instead
+    /// of the built-in dw command processor.
+    public var bridgedChannels = Set<UInt8>()
+    private var openVirtualSerialChannels = Set<UInt8>()
+    private var virtualSerialInput = [UInt8: Data]()
+    private var virtualSerialCommandBuffers = [UInt8: String]()
+    private var pendingClosedVirtualSerialChannels: [UInt8] = []
+    private var driveWireAPIConfig = [String: String]()
+    private var virtualDriveParameters = [Int: [String: String]]()
     
     struct RFMPathDescriptor {
         var processID = 0
+        var parentProcessID = 0
         var pathNumber = 0
         var pathDescriptorAddress = 0
         var mode = 0
         var filePosition = 0
-        var pathnameLength = 0
         var pathname = ""
-        var errorCode : UInt8 = 0
         var localFile : FileHandle? = nil
         var fileContents : Data = Data()
         var attributes = [FileAttributeKey : Any]()
-        
-        mutating func openLocalFile() -> UInt8 {
-            var errorCode : UInt8 = 0
-            
-            var localPathname = pathname
-            if (localPathname as NSString).isAbsolutePath == false {
-                // TODO: resolve relative paths
+
+        mutating func openLocalFile(rootPath: String, shouldCreate: Bool = false) -> UInt8 {
+            guard !pathname.isEmpty && !pathname.contains("\0") else { return 216 }
+
+            let expanded = RFMPathDescriptor.expandMultiDots(pathname)
+            let localPathname: String
+            if (expanded as NSString).isAbsolutePath {
+                localPathname = rootPath + expanded
+            } else {
+                localPathname = rootPath + "/" + expanded
             }
+            let resolvedPath = URL(filePath: localPathname).standardized.path
+            let normalizedRoot = URL(filePath: rootPath).standardized.path
+            guard resolvedPath == normalizedRoot || resolvedPath.hasPrefix(normalizedRoot + "/") else {
+                return 214  // E$FNA — escaped above rfmRootPath (or above device root)
+            }
+
             do {
-                localPathname = "/Users/boisy" + localPathname
-                attributes = try FileManager().attributesOfItem(atPath: localPathname)
-                
-                // Determine if we're opening a directory
+                let fileExists = FileManager.default.fileExists(atPath: localPathname)
                 if mode & 0x80 != 0 {
-                    // We're expecting this to be a directory
-                    if let fileType = attributes[FileAttributeKey.type] as? String, fileType != "NSFileTypeDirectory" {
-                        errorCode = 214
+                    // Directory open — clamp '..' at the device root.
+                    let effectiveLocalPath: String
+                    if resolvedPath == normalizedRoot {
+                        // Resolved to rfmRootPath itself — not a valid CoCo device directory.
+                        // This happens when "." is opened with no CWD set (e.g. before any chd).
+                        return 216
+                    } else {
+                        effectiveLocalPath = resolvedPath
                     }
+                    var isDir: ObjCBool = false
+                    guard FileManager.default.fileExists(atPath: effectiveLocalPath, isDirectory: &isDir), isDir.boolValue else {
+                        return 216
+                    }
+                    attributes = (try? FileManager.default.attributesOfItem(atPath: effectiveLocalPath)) ?? [:]
+                    // Store the effective path so DriveWireHost can synthesize directory entries with proper LSNs.
+                    self.pathname = effectiveLocalPath.hasPrefix(rootPath)
+                        ? String(effectiveLocalPath.dropFirst(rootPath.count))
+                        : effectiveLocalPath
                 } else {
-                    localFile = try FileHandle(forReadingFrom: URL(filePath: localPathname))
-                    if let localFile = localFile {
-                        fileContents = localFile.availableData
+                    if !fileExists {
+                        guard shouldCreate else { return 216 }
+                        // Check parent directory is writable before creating
+                        let parent = (localPathname as NSString).deletingLastPathComponent
+                        guard FileManager.default.isWritableFile(atPath: parent) else { return 214 }
+                        guard FileManager.default.createFile(atPath: localPathname, contents: nil) else {
+                            return 216
+                        }
+                    } else {
+                        attributes = try FileManager.default.attributesOfItem(atPath: localPathname)
+                        if attributes[.type] as? FileAttributeType == .typeDirectory {
+                            return 214  // E$FNA — path is a directory, not a file
+                        }
+                        let needsWrite = (mode & 0x0A) != 0 || shouldCreate
+                        if needsWrite && !FileManager.default.isWritableFile(atPath: localPathname) {
+                            return 214  // E$FNA — write access denied
+                        }
+                        if !FileManager.default.isReadableFile(atPath: localPathname) {
+                            return 214  // E$FNA — read access denied
+                        }
+                    }
+                    let url = URL(filePath: localPathname)
+                    let needsWrite = (mode & 0x0A) != 0 || shouldCreate
+                    localFile = needsWrite
+                        ? try FileHandle(forUpdating: url)
+                        : try FileHandle(forReadingFrom: url)
+                    if let f = localFile {
+                        fileContents = f.availableData
                     }
                 }
             } catch {
-                errorCode = 216
+                return 216
             }
-            
-            return errorCode
+            return 0
         }
 
-        mutating func readLineFromFile(offset : Int, maximumCount : Int) -> (UInt8, Data) {
-            var errorCode : UInt8 = 0
-            var data = Data()
-            
-            var byte : UInt8 = 0
-            repeat {
-                do {
-                    if filePosition >= fileContents.count {
-                        errorCode = 211
-                        break
-                    }
-                    byte = fileContents[filePosition]
-                    filePosition = filePosition + 1
-                    if byte == 0x0A {
-                        byte = 0x0D
-                    }
-                    data = data + Data([byte])
-                } catch {
-                    errorCode = 211
-                }
-            } while filePosition < fileContents.count && data.count <= maximumCount && byte != 0x0D && errorCode == 0
-
-            return (errorCode, data)
+        // Build one 32-byte OS-9 directory entry: name[0..28] with last char | 0x80, then 3-byte LSN.
+        static func makeOS9DirEntry(_ name: String, lsn: Int) -> Data {
+            var entry = Data(repeating: 0, count: 32)
+            let bytes = Array(name.utf8.prefix(29))
+            for (i, b) in bytes.enumerated() {
+                entry[i] = i == bytes.count - 1 ? (b | 0x80) : b
+            }
+            entry[29] = UInt8((lsn >> 16) & 0xFF)
+            entry[30] = UInt8((lsn >> 8) & 0xFF)
+            entry[31] = UInt8(lsn & 0xFF)
+            return entry
         }
 
-        mutating func readFromFile(offset : Int, maximumCount : Int) -> (UInt8, Data) {
-            var errorCode : UInt8 = 0
-            var data = Data()
-            
-            var byte : UInt8 = 0
-            repeat {
-                do {
-                    if filePosition >= fileContents.count {
-                        errorCode = 211
-                        break
-                    }
-                    byte = fileContents[filePosition]
-                    filePosition = filePosition + 1
-                    data = data + Data([byte])
-                } catch {
-                    errorCode = 211
-                }
-            } while filePosition < fileContents.count && data.count < maximumCount && errorCode == 0
+        // Expand OS-9 multi-dot path components: N dots = N-1 parent-dir references.
+        static func expandMultiDots(_ path: String) -> String {
+            return path.components(separatedBy: "/").map { c in
+                guard !c.isEmpty, c.allSatisfy({ $0 == "." }), c.count >= 2 else { return c }
+                return Array(repeating: "..", count: c.count - 1).joined(separator: "/")
+            }.joined(separator: "/")
+        }
 
-            return (errorCode, data)
+        // Synthesize an OS-9 file descriptor sector from host file attributes.
+        // Layout: FD.ATT(1) FD.OWN(2) FD.DAT(5) FD.LNK(1) FD.SIZ(4) FD.Creat(3) FD.SEG(zeros...)
+        func synthesizeFD(count: Int) -> Data {
+            var fd = Data(repeating: 0, count: max(count, 16))
+            let isDir = attributes[.type] as? FileAttributeType == .typeDirectory
+
+            // FD.ATT: DIR=0x80, owner R/W/E = 0x07, public R = 0x08
+            var att: UInt8 = isDir ? 0x8F : 0x0F
+            if let posix = attributes[.posixPermissions] as? Int {
+                att = isDir ? 0x80 : 0x00
+                if posix & 0o400 != 0 { att |= 0x01 }  // owner read
+                if posix & 0o200 != 0 { att |= 0x02 }  // owner write
+                if posix & 0o100 != 0 { att |= 0x04 }  // owner exec
+                if posix & 0o004 != 0 { att |= 0x08 }  // public read
+                if posix & 0o002 != 0 { att |= 0x10 }  // public write
+                if posix & 0o001 != 0 { att |= 0x20 }  // public exec
+            }
+            fd[0] = att
+
+            // FD.OWN (bytes 1-2): owner — 0
+            // FD.DAT (bytes 3-7): modification date YYMMDDHHMM
+            if let mod = attributes[.modificationDate] as? Date {
+                let c = Calendar.current
+                fd[3] = UInt8(max(0, min(255, c.component(.year, from: mod) - 1900)))
+                fd[4] = UInt8(c.component(.month, from: mod))
+                fd[5] = UInt8(c.component(.day, from: mod))
+                fd[6] = UInt8(c.component(.hour, from: mod))
+                fd[7] = UInt8(c.component(.minute, from: mod))
+            }
+            // FD.LNK (byte 8): link count
+            fd[8] = 1
+            // FD.SIZ (bytes 9-12): file size, big-endian
+            let sz = attributes[.size] as? Int ?? 0
+            fd[9]  = UInt8((sz >> 24) & 0xFF)
+            fd[10] = UInt8((sz >> 16) & 0xFF)
+            fd[11] = UInt8((sz >> 8) & 0xFF)
+            fd[12] = UInt8(sz & 0xFF)
+            // FD.Creat (bytes 13-15): creation date YYMMDD
+            if let cr = attributes[.creationDate] as? Date {
+                let c = Calendar.current
+                fd[13] = UInt8(max(0, min(255, c.component(.year, from: cr) - 1900)))
+                fd[14] = UInt8(c.component(.month, from: cr))
+                fd[15] = UInt8(c.component(.day, from: cr))
+            }
+            // FD.SEG (bytes 16+): segment list — all zeros for RFM (no physical sectors)
+            return Data(fd.prefix(count))
+        }
+
+        mutating func readLineFromFile(maximumCount: Int) -> (UInt8, Data) {
+            guard filePosition < fileContents.count else { return (211, Data()) }
+            var data = Data()
+            while filePosition < fileContents.count && data.count < maximumCount {
+                var byte = fileContents[filePosition]
+                filePosition += 1
+                if byte == 0x0A { byte = 0x0D }
+                data.append(byte)
+                if byte == 0x0D { break }
+            }
+            return (0, data)
+        }
+
+        mutating func readFromFile(maximumCount: Int) -> (UInt8, Data) {
+            guard filePosition < fileContents.count else { return (211, Data()) }
+            let end = min(filePosition + maximumCount, fileContents.count)
+            let data = Data(fileContents[filePosition..<end])
+            filePosition = end
+            return (0, data)
+        }
+
+        mutating func writeToFile(data: Data, translateCR: Bool = false) -> UInt8 {
+            guard let file = localFile else { return 216 }
+            let bytesToWrite: Data
+            if translateCR {
+                // Content ends at first $0D (everything after is stale buffer data).
+                // Convert $0D → $0A, discard remainder. Also stop at $FF (OS-9 padding).
+                var out = Data()
+                for byte in data {
+                    if byte == 0xFF { break }
+                    if byte == 0x0D { out.append(0x0A); break }
+                    out.append(byte)
+                }
+                bytesToWrite = out
+            } else {
+                bytesToWrite = data
+            }
+            file.seek(toFileOffset: UInt64(filePosition))
+            file.write(bytesToWrite)
+            file.synchronizeFile()
+            filePosition += bytesToWrite.count
+            return 0
         }
     }
 
-    var rfmWorkingDataDirectoryPathDescriptor = RFMPathDescriptor()
-    var rfmWorkingExecutionDirectoryPathDescriptor = RFMPathDescriptor()
-    var rfmPathDescriptor = RFMPathDescriptor()
+    var rfmRootPath: String = NSHomeDirectory()
+    private var rfmPaths: [Int: RFMPathDescriptor] = [:]
+    private var rfmCurrentDir: [Int: String] = [:]      // data directory per process
+    private var rfmCurrentExecDir: [Int: String] = [:] // execution directory per process
+    // Maps host path ↔ unique LSN for synthesized RFM directory entries.
+    // LSNs start above a typical NitrOS-9 DW image (~524k sectors for DW format).
+    private var rfmLSNByPath: [String: Int] = [:]
+    private var rfmLSNToPath: [Int: String] = [:]
+    private var rfmLSNCounter: Int = 0x600000
     
     /// The no-operation transaction code.
     ///
@@ -425,8 +583,8 @@ public class DriveWireHost : Codable {
         dwTransaction.append(DWOp(opcode:OPNAMEOBJCREATE, processor: self.OP_NAMEOBJ_CREATE))
         dwTransaction.append(DWOp(opcode:OPNOP, processor: self.OP_NOP))
         dwTransaction.append(DWOp(opcode:OPTIME, processor: self.OP_TIME))
-        dwTransaction.append(DWOp(opcode:OPINIT, processor: self.OP_INIT))
-        dwTransaction.append(DWOp(opcode:OPTERM, processor: self.OP_TERM))
+        dwTransaction.append(DWOp(opcode:0x49, processor: self.OP_INIT))   // OPINIT (historical)
+        dwTransaction.append(DWOp(opcode:0x54, processor: self.OP_TERM))   // OPTERM (historical)
         dwTransaction.append(DWOp(opcode:OPREAD, processor: self.OP_READ))
         dwTransaction.append(DWOp(opcode:OPREADEX, processor: self.OP_READEX))
         dwTransaction.append(DWOp(opcode:OPREREAD, processor: self.OP_REREAD))
@@ -435,8 +593,8 @@ public class DriveWireHost : Codable {
         dwTransaction.append(DWOp(opcode:OPREWRITE, processor: self.OP_REWRITE))
         dwTransaction.append(DWOp(opcode:OPGETSTAT, processor: self.OP_GETSTAT))
         dwTransaction.append(DWOp(opcode:OPSETSTAT, processor: self.OP_SETSTAT))
-        dwTransaction.append(DWOp(opcode:OPRESET3, processor: self.OP_RESET))
-        dwTransaction.append(DWOp(opcode:OPRESET2, processor: self.OP_RESET))
+        dwTransaction.append(DWOp(opcode:0xF8, processor: self.OP_RESET))  // OPRESET3 (historical)
+        dwTransaction.append(DWOp(opcode:0xFE, processor: self.OP_RESET))  // OPRESET2 (historical)
         dwTransaction.append(DWOp(opcode:OPRESET, processor: self.OP_RESET))
         dwTransaction.append(DWOp(opcode:OPWIREBUG, processor: self.OP_WIREBUG))
         dwTransaction.append(DWOp(opcode:OPPRINTFLUSH, processor: self.OP_PRINTFLUSH))
@@ -540,9 +698,10 @@ public class DriveWireHost : Codable {
         repeat
         {
             bytesConsumed = self.processor!(serialBuffer)
-            
+
             if bytesConsumed > 0  && serialBuffer.count >= bytesConsumed {
-                // chop off consumed bytes
+                // Bytes were consumed — cancel the idle watchdog while mid-transaction.
+                invalidateWatchdog()
                 serialBuffer.replaceSubrange(0..<bytesConsumed, with: Data([]))
             }
         } while bytesConsumed > 0 && serialBuffer.count > 0
@@ -580,6 +739,19 @@ public class DriveWireHost : Codable {
         processor = OP_OPCODE
         invalidateWatchdog()
     }
+
+    func resetRFMState() {
+        for descriptor in rfmPaths.values {
+            descriptor.localFile?.closeFile()
+        }
+        rfmPaths.removeAll()
+        rfmCurrentDir.removeAll()
+        rfmCurrentExecDir.removeAll()
+        rfmLSNByPath.removeAll()
+        rfmLSNToPath.removeAll()
+        rfmLSNCounter = 0x600000
+        print("RFM state reset")
+    }
     
     private func OP_DWINIT(data : Data) -> Int {
         var result = 0
@@ -589,11 +761,10 @@ public class DriveWireHost : Codable {
         if data.count >= expectedCount {
             // Save capabilities byte.
             guestCapabilityByte = data[1]
-
+            
             // Send the host capabilities byte. This must be non-zero: the
-            // NitrOS-9 driver interprets a zero (or absent) response as a DW3
-            // server and disables its DW4 extensions, including the virtual
-            // serial channel poller.
+            // NitrOS-9 driver treats zero as a DW3 server and disables DW4
+            // extensions, including the virtual serial poller.
             delegate?.dataAvailable(host: self, data: Data([0xFF]))
             result = expectedCount
             
@@ -605,6 +776,20 @@ public class DriveWireHost : Codable {
     }
     
     private var nameLength = 0
+
+    private static func decodedNameObjectPath(from data: Data, length: Int) -> String? {
+        guard length > 0, data.count >= length else {
+            return nil
+        }
+
+        let nameBytes = Array(data.prefix(length)).map { $0 & 0x7F }
+        guard nameBytes.allSatisfy({ $0 >= 0x20 && $0 != 0x7F }) else {
+            return nil
+        }
+
+        let name = String(bytes: nameBytes, encoding: .ascii) ?? ""
+        return name.isEmpty ? nil : name
+    }
     
     private func OP_NAMEOBJ_MOUNT(data : Data) -> Int {
         var result = 0
@@ -626,12 +811,12 @@ public class DriveWireHost : Codable {
             if data.count >= nameLength {
                 resetState()
                 result = nameLength;
-                let name = String(bytes: data, encoding: .ascii)!
-                
+
                 // determine if a named object with this name already exists
-                if let vd = findVirtualDisk(name: name) {
+                if let name = Self.decodedNameObjectPath(from: data, length: nameLength),
+                   let vd = findVirtualDisk(name: name) {
                     response = UInt8(vd.driveNumber)
-                } else {
+                } else if let name = Self.decodedNameObjectPath(from: data, length: nameLength) {
                     do {
                         let nextFreeDrive = findAvailableVirtualDrive()
                         try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
@@ -643,17 +828,17 @@ public class DriveWireHost : Codable {
                 delegate?.dataAvailable(host: self, data: Data([response]))
                 delegate?.transactionCompleted(opCode: currentTransaction)
             }
-            
+
             return result
         }
     }
-    
+
     private func OP_NAMEOBJ_CREATE(data : Data) -> Int {
         var nameLength = 0
         var result = 0
         let expectedCount = 2
         var response : UInt8 = 0
-        currentTransaction = OPNAMEOBJMOUNT
+        currentTransaction = OPNAMEOBJCREATE
         if data.count >= expectedCount {
             nameLength = Int(data[1])
             
@@ -669,24 +854,24 @@ public class DriveWireHost : Codable {
             if data.count >= nameLength {
                 resetState()
                 result = nameLength;
-                let name = String(bytes: data, encoding: .ascii)!
-                
+
                 // determine if a named object with this name already exists
-                if let _ = findVirtualDisk(name: name) {
+                if let name = Self.decodedNameObjectPath(from: data, length: nameLength),
+                   let _ = findVirtualDisk(name: name) {
                     response = 0
-                } else {
+                } else if let name = Self.decodedNameObjectPath(from: data, length: nameLength) {
                     let nextFreeDrive = findAvailableVirtualDrive()
                     do {
                         try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
                         response = UInt8(nextFreeDrive);
                     } catch {
-                        
+
                     }
                 }
                 delegate?.dataAvailable(host: self, data: Data([response]))
                 delegate?.transactionCompleted(opCode: currentTransaction)
             }
-            
+
             return result
         }
     }
@@ -711,23 +896,26 @@ public class DriveWireHost : Codable {
         resetState()
         delegate?.dataAvailable(host: self, data: Data([year, month, day, hour, minute, second]))
         delegate?.transactionCompleted(opCode: currentTransaction)
+        let msg = "OP_TIME -> \(1900 + Int(year))/\(month)/\(day) \(hour):\(String(format:"%02d",minute)):\(String(format:"%02d",second))"
+        log += msg + "\n"; print(msg)
         return 1
     }
-    
+
     private func OP_INIT(data : Data) -> Int {
-        currentTransaction = OPINIT
+        currentTransaction = 0x49   // OPINIT (historical)
         resetState()
-        statistics = DriveWireStatistics()  // reset statistics
+        statistics = DriveWireStatistics()
+        resetRFMState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        log = log + "OP_INIT" + "\n"
+        log += "OP_INIT\n"; print("OP_INIT")
         return 1
     }
-    
+
     private func OP_TERM(data : Data) -> Int {
-        currentTransaction = OPTERM
+        currentTransaction = 0x54   // OPTERM (historical)
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        log = log + "OP_TERM" + "\n"
+        log += "OP_TERM\n"; print("OP_TERM")
         return 1
     }
     
@@ -771,6 +959,8 @@ public class DriveWireHost : Codable {
             statistics.lastDriveNumber = driveNumber
             delegate?.dataAvailable(host: self, data: Data([UInt8(error)]))
             delegate?.transactionCompleted(opCode: currentTransaction)
+            let msg = "OP_WRITE(drive=\(driveNumber), lsn=0x\(String(vLSN, radix: 16))) -> \(error)"
+            reportActivity(msg, isFrequent: true, isError: error != DriveWireProtocolError.E_NONE.rawValue)
         }
         
         return result
@@ -799,7 +989,7 @@ public class DriveWireHost : Codable {
             delegate?.transactionCompleted(opCode: currentTransaction)
         }
         
-        log = log + "OP_GETSTAT(" + String(statistics.lastDriveNumber) + "," + String(statistics.lastGetStat) + ")" + "\n"
+        reportActivity("OP_GETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastGetStat))))", isFrequent: true)
         return result
     }
     
@@ -817,15 +1007,16 @@ public class DriveWireHost : Codable {
             delegate?.transactionCompleted(opCode: currentTransaction)
         }
         
-        log = log + "OP_SETSTAT(" + String(statistics.lastDriveNumber) + "," + String(statistics.lastGetStat) + ")" + "\n"
+        reportActivity("OP_SETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastSetStat))))", isFrequent: true)
         return result
     }
     
     private func OP_RESET(data : Data) -> Int {
         currentTransaction = OPRESET
         resetState()
+        resetRFMState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        log = log + "OP_RESET" + "\n"
+        log += "OP_RESET\n"; print("OP_RESET")
         return 1
     }
     
@@ -873,211 +1064,813 @@ public class DriveWireHost : Codable {
         return 1
     }
     
-    /// Returns the virtual serial channel for a wire channel number.
-    ///
-    /// Returns `nil` for numbers outside 0-14; the 128-142 range is the
-    /// unimplemented VWindow space.
-    private func vserialChannel(_ number : UInt8) -> VirtualChannel? {
-        guard Int(number) < virtualChannels.count else { return nil }
-        return virtualChannels[Int(number)]
-    }
-
     private func OP_SERINIT(data : Data) -> Int {
-        let expectedCount = 2
-        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERINIT
+        guard data.count >= 2 else { return 0 }
+        let ch = data[1]
+        openVirtualSerialChannels.insert(ch)
         resetState()
-        vserialChannel(data[1])?.open()
-        log = log + "OP_SERINIT(\(data[1]))" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return expectedCount
+        let msg = "OP_SERINIT(ch=\(ch))"; log += msg + "\n"; print(msg)
+        return 2
     }
 
     private func OP_SERTERM(data : Data) -> Int {
-        let expectedCount = 2
-        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERTERM
+        guard data.count >= 2 else { return 0 }
+        let ch = data[1]
+        openVirtualSerialChannels.remove(ch)
         resetState()
-        vserialChannel(data[1])?.close()
-        log = log + "OP_SERTERM(\(data[1]))" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return expectedCount
-    }
-    
-    /// Round-robin cursor so one busy channel can't starve the others.
-    private var nextPollChannel = 0
-    /// Host-side closes not yet reported to the guest via SERREAD.
-    private var pendingClosedChannels : [UInt8] = []
-
-    /// Queues data for the guest to read from a virtual channel.
-    ///
-    /// The guest collects queued bytes with its normal OP_SERREAD polling.
-    /// Bytes queued while the channel is closed are discarded when the guest
-    /// opens it (opening clears the queue), so callers should only write to
-    /// channels the guest has opened.
-    ///
-    /// - Parameters:
-    ///     - data: The bytes to queue.
-    ///     - channel: The virtual serial channel number (0-14).
-    public func writeToChannel(_ data : Data, channel : UInt8) {
-        vserialChannel(channel)?.inputQueue.append(data)
-    }
-
-    /// Closes a channel from the host side.
-    ///
-    /// The guest is informed through a status byte in its next OP_SERREAD poll.
-    ///
-    /// - Parameters:
-    ///     - channel: The virtual serial channel number (0-14).
-    public func closeChannel(_ channel : UInt8) {
-        guard let ch = vserialChannel(channel) else { return }
-        ch.close()
-        pendingClosedChannels.append(channel)
-    }
-
-    /// Builds the two-byte OP_SERREAD/POLL response described in the specification.
-    private func serialReadResponse() -> Data {
-        // Closed-channel notifications take priority over data.
-        if pendingClosedChannels.isEmpty == false {
-            let closed = pendingClosedChannels.removeFirst()
-            return Data([16, closed])
-        }
-        // Round-robin scan for an open channel with waiting data.
-        for offset in 0..<virtualChannels.count {
-            let ch = virtualChannels[(nextPollChannel + offset) % virtualChannels.count]
-            guard ch.isOpen, ch.inputQueue.isEmpty == false else { continue }
-            nextPollChannel = (Int(ch.channelNumber) + 1) % virtualChannels.count
-            if ch.inputQueue.count == 1 {
-                // A single interactive byte rides along in the response itself.
-                let byte = ch.inputQueue.removeFirst()
-                return Data([ch.channelNumber + 1, byte])
-            }
-            // More is waiting: advertise the count for an OP_SERREADM fetch.
-            return Data([ch.channelNumber + 17, UInt8(min(ch.inputQueue.count, 255))])
-        }
-        return Data([0, 0])
+        let msg = "OP_SERTERM(ch=\(ch))"; log += msg + "\n"; print(msg)
+        return 2
     }
 
     private func OP_SERREAD(data : Data) -> Int {
         currentTransaction = OPSERREAD
+        guard data.count >= 1 else { return 0 }
         resetState()
-        delegate?.dataAvailable(host: self, data: serialReadResponse())
+        let response = pollVirtualSerial()
+        delegate?.dataAvailable(host: self, data: response)
         delegate?.transactionCompleted(opCode: currentTransaction)
+        reportActivity("OP_SERREAD -> \(response[0]),\(response[1])", isFrequent: true)
         return 1
     }
 
     private func OP_SERREADM(data : Data) -> Int {
-        let expectedCount = 3
-        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERREADM
+        guard data.count >= 3 else { return 0 }
+        let ch = data[1]
+        let count = Int(data[2])
+        let response = readVirtualSerial(channel: ch, count: count)
         resetState()
-        let requested = Int(data[2])
-        if let ch = vserialChannel(data[1]), ch.inputQueue.count >= requested {
-            let bytes = Data(ch.inputQueue.prefix(requested))
-            ch.inputQueue.removeFirst(requested)
-            delegate?.dataAvailable(host: self, data: bytes)
-        } else {
-            // Per the specification, over-asking is a guest error; the server
-            // deliberately sends nothing and lets the guest's read time out.
-            log = log + "OP_SERREADM over-request on channel \(data[1])" + "\n"
-        }
+        delegate?.dataAvailable(host: self, data: response)
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return expectedCount
-    }
-    
-    /// Routes bytes the guest wrote to a channel out to the delegate.
-    private func deliverGuestBytes(_ bytes : Data, channel : UInt8) {
-        guard let ch = vserialChannel(channel), ch.isOpen else {
-            log = log + "serial write to closed or invalid channel \(channel)" + "\n"
-            return
-        }
-        delegate?.channelDataAvailable(host: self, channel: channel, data: bytes)
+        reportActivity("OP_SERREADM(ch=\(ch), bytes=\(count))", isFrequent: true)
+        return 3
     }
 
     private func OP_SERWRITE(data : Data) -> Int {
-        let expectedCount = 3
-        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERWRITE
+        guard data.count >= 3 else { return 0 }
+        let ch = data[1]; let byte = data[2]
+        writeVirtualSerial(channel: ch, data: Data([byte]))
         resetState()
-        deliverGuestBytes(Data([data[2]]), channel: data[1])
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return expectedCount
+        let msg = "OP_SERWRITE(ch=\(ch), byte=0x\(String(byte, radix: 16)))"; log += msg + "\n"; print(msg)
+        return 3
     }
 
     private func OP_SERWRITEM(data : Data) -> Int {
+        currentTransaction = OPSERWRITEM
         guard data.count >= 2 else { return 0 }
-        // The NitrOS-9 boot sequence emits bare $64 $00 pairs (naming a
-        // never-opened channel, with no count or payload). Consume exactly
-        // two bytes for a SERWRITEM naming an unopened channel -- reading a
-        // count byte here desyncs the stream on every boot.
-        if vserialChannel(data[1])?.isOpen != true {
-            currentTransaction = OPSERWRITEM
+        let ch = data[1]
+        if !openVirtualSerialChannels.contains(ch) {
             resetState()
-            log = log + "OP_SERWRITEM to unopened channel \(data[1]) ignored" + "\n"
             delegate?.transactionCompleted(opCode: currentTransaction)
+            reportActivity("OP_SERWRITEM(ch=\(ch)) ignored for unopened channel", isFrequent: true)
             return 2
         }
         guard data.count >= 3 else { return 0 }
-        let expectedCount = 3 + Int(data[2])
-        guard data.count >= expectedCount else { return 0 }
-        currentTransaction = OPSERWRITEM
+        let count = Int(data[2])
+        let total = 3 + count
+        guard data.count >= total else { return 0 }
+        writeVirtualSerial(channel: ch, data: data.subdata(in: 3..<total))
         resetState()
-        deliverGuestBytes(data.subdata(in: 3..<expectedCount), channel: data[1])
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return expectedCount
+        reportActivity("OP_SERWRITEM(ch=\(ch), bytes=\(count))", isFrequent: true)
+        return total
     }
-    
+
     private func OP_SERGETSTAT(data : Data) -> Int {
-        let expectedCount = 3
-        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERGETSTAT
+        guard data.count >= 3 else { return 0 }
+        let ch = data[1]; let code = data[2]
         resetState()
-        // Logging only, per the specification.
-        log = log + "OP_SERGETSTAT(\(data[1]),\(data[2]))" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return expectedCount
+        let msg = "OP_SERGETSTAT(ch=\(ch), \(DriveWireHost.ssCodeName(Int(code))))"; log += msg + "\n"; print(msg)
+        return 3
     }
 
     private func OP_SERSETSTAT(data : Data) -> Int {
-        let ssComSt : UInt8 = 0x28, ssOpen : UInt8 = 0x29, ssClose : UInt8 = 0x2A
-        guard data.count >= 3 else { return 0 }
-        // SS.ComSt carries a 26-byte device descriptor after the code byte.
-        let expectedCount = data[2] == ssComSt ? 29 : 3
-        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERSETSTAT
-        resetState()
-        switch data[2] {
-        case ssOpen:
-            vserialChannel(data[1])?.open()
-        case ssClose:
-            vserialChannel(data[1])?.close()
+        guard data.count >= 3 else { return 0 }
+        let ch = data[1]; let code = data[2]
+        let expectedCount = code == 0x28 ? 29 : 3
+        guard data.count >= expectedCount else { return 0 }
+        switch code {
+        case 0x29:
+            openVirtualSerialChannels.insert(ch)
+        case 0x2A:
+            openVirtualSerialChannels.remove(ch)
         default:
             break
         }
-        log = log + "OP_SERSETSTAT(\(data[1]),\(data[2]))" + "\n"
-        delegate?.transactionCompleted(opCode: currentTransaction)
-        return expectedCount
-    }
-    
-    private func OP_FASTWRITE_Serial(data : Data) -> Int {
-        let expectedCount = 2
-        guard data.count >= expectedCount else { return 0 }
-        currentTransaction = data[0]
         resetState()
-        deliverGuestBytes(Data([data[1]]), channel: fastwriteChannel)
         delegate?.transactionCompleted(opCode: currentTransaction)
+        let msg = "OP_SERSETSTAT(ch=\(ch), \(DriveWireHost.ssCodeName(Int(code))))"; log += msg + "\n"; print(msg)
         return expectedCount
     }
 
-    private func OP_FASTWRITE_Screen(data : Data) -> Int {
-        let expectedCount = 2
-        guard data.count >= expectedCount else { return 0 }
-        currentTransaction = data[0]
+    private func pollVirtualSerial() -> Data {
+        if let channel = pendingClosedVirtualSerialChannels.first,
+           virtualSerialInput[channel]?.isEmpty ?? true {
+            pendingClosedVirtualSerialChannels.removeFirst()
+            openVirtualSerialChannels.remove(channel)
+            return Data([16, channel])
+        }
+
+        if let channel = virtualSerialInput.keys.sorted().first(where: {
+            isVirtualWindowChannel($0) && !(virtualSerialInput[$0]?.isEmpty ?? true)
+        }) {
+            let byte = readVirtualSerial(channel: channel, count: 1).first ?? 0
+            return Data([channel &+ 1, byte])
+        }
+
+        if let channel = virtualSerialInput.keys.sorted().first(where: {
+            !isVirtualWindowChannel($0) && !(virtualSerialInput[$0]?.isEmpty ?? true)
+        }) {
+            let waiting = virtualSerialInput[channel]?.count ?? 0
+            if waiting >= 3 {
+                return Data([channel &+ 17, UInt8(min(waiting, 255))])
+            }
+            let byte = readVirtualSerial(channel: channel, count: 1).first ?? 0
+            return Data([channel &+ 1, byte])
+        }
+
+        return Data([0x00, 0x00])
+    }
+
+    private func readVirtualSerial(channel: UInt8, count: Int) -> Data {
+        guard count > 0, var queued = virtualSerialInput[channel], !queued.isEmpty else {
+            return Data()
+        }
+
+        let readCount = min(count, queued.count)
+        let response = queued.prefix(readCount)
+        queued.removeFirst(readCount)
+        virtualSerialInput[channel] = queued
+        return Data(response)
+    }
+
+    /// Queues host-side data for the guest to fetch from a virtual serial
+    /// channel via its OP_SERREAD polls.
+    ///
+    /// - Parameters:
+    ///     - data: The bytes to deliver to the guest.
+    ///     - channel: The virtual serial channel to deliver them on.
+    public func writeToChannel(_ data : Data, channel : UInt8) {
+        virtualSerialInput[channel, default: Data()].append(data)
+    }
+
+    /// Reports whether the guest currently has a virtual serial channel open.
+    ///
+    /// - Parameter channel: The virtual serial channel to query.
+    public func isChannelOpen(_ channel : UInt8) -> Bool {
+        openVirtualSerialChannels.contains(channel)
+    }
+
+    /// Closes a virtual serial channel from the host side.
+    ///
+    /// The close is reported to the guest in an OP_SERREAD poll once any
+    /// queued channel input has drained.
+    ///
+    /// - Parameter channel: The virtual serial channel to close.
+    public func closeChannel(_ channel : UInt8) {
+        pendingClosedVirtualSerialChannels.append(channel)
+    }
+
+    private func writeVirtualSerial(channel: UInt8, data: Data) {
+        if bridgedChannels.contains(channel) {
+            // Mirrors the guest-facing contract: writes to a closed channel
+            // are dropped, not delivered.
+            if openVirtualSerialChannels.contains(channel) {
+                delegate?.channelDataAvailable(host: self, channel: channel, data: data)
+            }
+            return
+        }
+        for byte in data {
+            if byte == 0x0D {
+                let command = virtualSerialCommandBuffers[channel, default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+                virtualSerialCommandBuffers[channel] = ""
+                processVirtualSerialCommand(command, channel: channel)
+            } else if byte == 0x08 || byte == 0x7F {
+                var command = virtualSerialCommandBuffers[channel, default: ""]
+                if !command.isEmpty {
+                    command.removeLast()
+                }
+                virtualSerialCommandBuffers[channel] = command
+            } else if byte >= 0x20 {
+                virtualSerialCommandBuffers[channel, default: ""].append(Character(UnicodeScalar(byte)))
+            }
+        }
+    }
+
+    private func processVirtualSerialCommand(_ command: String, channel: UInt8) {
+        guard !command.isEmpty else {
+            return
+        }
+
+        if command.lowercased().hasPrefix("dw ") || command.lowercased() == "dw" {
+            let response = processDriveWireAPICommand(command)
+            enqueueVirtualSerialResponse(response, channel: channel)
+            if response.hasPrefix("OK ") {
+                pendingClosedVirtualSerialChannels.append(channel)
+            }
+        } else {
+            enqueueVirtualSerialResponse(driveWireAPIFailure(code: 10, text: "Unknown command '\(command)'"), channel: channel)
+        }
+        let msg = "VSerial(ch=\(channel)) command: \(command)"
+        log += msg + "\n"; print(msg)
+    }
+
+    private func enqueueVirtualSerialResponse(_ response: String, channel: UInt8) {
+        virtualSerialInput[channel, default: Data()].append(contentsOf: response.data(using: .ascii) ?? Data())
+    }
+
+    private func enqueueDriveWireUtilityResponse(_ text: String, channel: UInt8) {
+        enqueueVirtualSerialResponse(driveWireAPISuccess(text), channel: channel)
+        pendingClosedVirtualSerialChannels.append(channel)
+    }
+
+    private func driveWireAPISuccess(_ text: String) -> String {
+        "OK command successful\n\r" + text
+    }
+
+    private func driveWireAPIFailure(code: UInt8, text: String) -> String {
+        String(format: "FAIL %03d %@\r", Int(code), text)
+    }
+
+    private func processDriveWireAPICommand(_ command: String) -> String {
+        let arguments = Array(command.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init).dropFirst())
+        let result = parseDriveWireAPI(arguments)
+        switch result {
+        case .success(let text):
+            return driveWireAPISuccess(text)
+        case .failure(let code, let text):
+            return driveWireAPIFailure(code: code, text: text)
+        }
+    }
+
+    private enum DriveWireAPIResult {
+        case success(String)
+        case failure(UInt8, String)
+    }
+
+    private struct DriveWireAPICommand {
+        let name: String
+        let help: String
+    }
+
+    private enum DriveWireAPICommandMatch {
+        case success(String)
+        case failure(String)
+    }
+
+    private func parseDriveWireAPI(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "config", help: "Commands to manipulate the config"),
+                DriveWireAPICommand(name: "disk", help: "Manage disks and disksets"),
+                DriveWireAPICommand(name: "log", help: "View server logs"),
+                DriveWireAPICommand(name: "midi", help: "Manage MIDI"),
+                DriveWireAPICommand(name: "net", help: "Show network information"),
+                DriveWireAPICommand(name: "port", help: "Manage virtual serial ports"),
+                DriveWireAPICommand(name: "server", help: "Various server based tools")
+            ]))
+        }
+
+        switch match(command, in: ["config", "disk", "log", "midi", "net", "port", "server"]) {
+        case .success("config"):
+            return parseConfigCommand(Array(arguments.dropFirst()))
+        case .success("disk"):
+            return parseDiskCommand(Array(arguments.dropFirst()))
+        case .success("port"):
+            return parsePortCommand(Array(arguments.dropFirst()))
+        case .success("server"):
+            return parseServerCommand(Array(arguments.dropFirst()))
+        case .success(let name):
+            return .failure(204, "Command 'dw \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parseConfigCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "save", help: "Save current configuration"),
+                DriveWireAPICommand(name: "set", help: "Set config item"),
+                DriveWireAPICommand(name: "show", help: "Show current instance config (or item)")
+            ]))
+        }
+
+        switch match(command, in: ["save", "set", "show"]) {
+        case .success("save"):
+            return .success("Configuration saved.\r\n")
+        case .success("set"):
+            return configSet(Array(arguments.dropFirst()))
+        case .success("show"):
+            return configShow(Array(arguments.dropFirst()))
+        case .success(let name):
+            return .failure(204, "Command 'dw config \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parseDiskCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "create", help: "Create disk image"),
+                DriveWireAPICommand(name: "dos", help: "Manage DOS disk images"),
+                DriveWireAPICommand(name: "eject", help: "Eject disk from drive #"),
+                DriveWireAPICommand(name: "insert", help: "Load disk into drive #"),
+                DriveWireAPICommand(name: "dump", help: "Dump sector from disk"),
+                DriveWireAPICommand(name: "reload", help: "Reload disk in drive #"),
+                DriveWireAPICommand(name: "set", help: "Set disk parameter"),
+                DriveWireAPICommand(name: "show", help: "Show current disk details"),
+                DriveWireAPICommand(name: "write", help: "Write dirty sectors")
+            ]))
+        }
+
+        switch match(command, in: ["create", "dos", "dump", "eject", "insert", "reload", "set", "show", "write"]) {
+        case .success("dump"):
+            return diskDump(Array(arguments.dropFirst()))
+        case .success("eject"):
+            return diskEject(Array(arguments.dropFirst()))
+        case .success("insert"):
+            return diskInsert(Array(arguments.dropFirst()))
+        case .success("reload"):
+            return diskReload(Array(arguments.dropFirst()))
+        case .success("set"):
+            return diskSet(Array(arguments.dropFirst()))
+        case .success("show"):
+            return diskShow(Array(arguments.dropFirst()))
+        case .success("write"):
+            return diskWrite(Array(arguments.dropFirst()))
+        case .success(let name):
+            return .failure(204, "Command 'dw disk \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parsePortCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "close", help: "Close port #"),
+                DriveWireAPICommand(name: "open", help: "Open port #"),
+                DriveWireAPICommand(name: "show", help: "Show port status")
+            ]))
+        }
+
+        switch match(command, in: ["close", "open", "show"]) {
+        case .success("close"):
+            return portClose(Array(arguments.dropFirst()))
+        case .success("show"):
+            return portShow()
+        case .success(let name):
+            return .failure(204, "Command 'dw port \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parseServerCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "dir", help: "List files on server"),
+                DriveWireAPICommand(name: "help", help: "Show help"),
+                DriveWireAPICommand(name: "list", help: "List contents of file on server"),
+                DriveWireAPICommand(name: "print", help: "Print file on server"),
+                DriveWireAPICommand(name: "show", help: "Show various server information"),
+                DriveWireAPICommand(name: "status", help: "Show server status information"),
+                DriveWireAPICommand(name: "turbo", help: "Show turbo status")
+            ]))
+        }
+
+        switch match(command, in: ["dir", "help", "list", "print", "show", "status", "turbo"]) {
+        case .success("dir"):
+            return serverDir(Array(arguments.dropFirst()))
+        case .success("list"):
+            return serverList(Array(arguments.dropFirst()))
+        case .success("print"):
+            return serverPrint(Array(arguments.dropFirst()))
+        case .success("status"):
+            return serverStatus()
+        case .success("show"):
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "handlers", help: "Show handler information"),
+                DriveWireAPICommand(name: "threads", help: "Show thread information")
+            ]))
+        case .success(let name):
+            return .failure(204, "Command 'dw server \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func match(_ input: String, in commands: [String]) -> DriveWireAPICommandMatch {
+        let matches = commands.filter { $0.hasPrefix(input.lowercased()) }
+        if matches.count == 1 {
+            return .success(matches[0])
+        } else if matches.isEmpty {
+            return .failure("Unknown command '\(input)'")
+        } else {
+            return .failure("Ambiguous command, '\(input)' matches \(matches.joined(separator: " or "))")
+        }
+    }
+
+    private func shortHelp(for commands: [DriveWireAPICommand]) -> String {
+        let names = commands.map(\.name).sorted()
+        return "Possible commands:\r\n\r\n" + columnLayout(names) + "\r\n"
+    }
+
+    private func columnLayout(_ values: [String], columns: Int = 80) -> String {
+        guard !values.isEmpty else { return "" }
+        let width = (values.map(\.count).max() ?? 1) + 2
+        let perLine = max(1, (columns - 1) / width)
+        var lines: [String] = []
+        var current = ""
+        for (index, value) in values.enumerated() {
+            if index > 0 && index % perLine == 0 {
+                lines.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+            }
+            current += value.padding(toLength: width, withPad: " ", startingAt: 0)
+        }
+        if !current.isEmpty {
+            lines.append(current.trimmingCharacters(in: .whitespaces))
+        }
+        return lines.joined(separator: "\r\n")
+    }
+
+    private func currentDriveWireAPIConfig() -> [String: String] {
+        var items = [
+            "CMDCols": "80",
+            "DeviceType": "swift",
+            "DetailedOpcodeLogging": detailedOpcodeLogging ? "true" : "false",
+            "HostCapabilityByte": "255",
+            "MountedDrives": "\(virtualDrives.count)",
+            "ProtectedMode": "false"
+        ]
+        for (key, value) in driveWireAPIConfig {
+            items[key] = value
+        }
+        return items
+    }
+
+    private func configShow(_ arguments: [String]) -> DriveWireAPIResult {
+        let items = currentDriveWireAPIConfig()
+
+        if let key = arguments.first {
+            if let value = items.first(where: { $0.key.lowercased() == key.lowercased() }) {
+                return .success("\(value.key) = \(value.value)\r\n")
+            }
+            return .failure(142, "Key '\(key)' is not set.")
+        }
+
+        let text = items.keys.sorted()
+            .map { "\($0) = \(items[$0] ?? "")" }
+            .joined(separator: "\r\n")
+        return .success("Current protocol handler configuration:\r\n\n\(text)\r\n")
+    }
+
+    private func configSet(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let item = arguments.first else {
+            return .failure(10, "Syntax error: dw config set requires an item and value as arguments")
+        }
+
+        if arguments.count == 1 {
+            driveWireAPIConfig.removeValue(forKey: item)
+            return .success("Item '\(item)' removed from config\r\n")
+        }
+
+        let value = arguments.dropFirst().joined(separator: " ")
+        driveWireAPIConfig[item] = value
+        return .success("Item '\(item)' set to '\(value)'\r\n")
+    }
+
+    private func diskShow(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let driveArgument = arguments.first else {
+            var text = "\r\nCurrent DriveWire disks:\r\n\r\n"
+            for drive in virtualDrives.sorted(by: { $0.driveNumber < $1.driveNumber }) {
+                text += String(format: "X%-3d ", drive.driveNumber)
+                text += shortenedPath(drive.imagePath) + "\r\n"
+            }
+            return .success(text)
+        }
+
+        guard let driveNumber = parseDriveNumber(driveArgument) else {
+            return .failure(101, "Invalid drive number '\(driveArgument)'")
+        }
+        guard let drive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+
+        var text = "Details for disk in drive #\(driveNumber):\r\n\r\n"
+        text += shortenedPath(drive.imagePath) + "\r\n\r\n"
+        text += "System params:\r\n"
+        text += "path: \(drive.imagePath)\r\n"
+        let params = virtualDriveParameters[driveNumber] ?? [:]
+        if !params.isEmpty {
+            text += columnLayout(params.keys.sorted().map { "\($0): \(params[$0] ?? "")" }) + "\r\n"
+        }
+        text += "User params:\r\n"
+        return .success(text)
+    }
+
+    private func diskInsert(_ arguments: [String]) -> DriveWireAPIResult {
+        guard arguments.count >= 2 else {
+            return .failure(10, "Syntax error")
+        }
+        guard let driveNumber = parseDriveNumber(arguments[0]) else {
+            return .failure(101, "Invalid drive number '\(arguments[0])'")
+        }
+        let path = arguments.dropFirst().joined(separator: " ")
+        do {
+            try insertVirtualDisk(driveNumber: driveNumber, imagePath: path)
+            return .success("Disk inserted in drive \(driveNumber).\r\n")
+        } catch {
+            return .failure(216, error.localizedDescription)
+        }
+    }
+
+    private func diskEject(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let argument = arguments.first, arguments.count == 1 else {
+            return .failure(10, "Syntax error")
+        }
+        if argument.lowercased() == "all" {
+            virtualDrives.removeAll()
+            return .success("Ejected all disks.\r\n")
+        }
+        guard let driveNumber = parseDriveNumber(argument) else {
+            return .failure(101, "Invalid drive number '\(argument)'")
+        }
+        guard virtualDrives.contains(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+        ejectVirtualDisk(driveNumber: driveNumber)
+        return .success("Disk ejected from drive \(driveNumber).\r\n")
+    }
+
+    private func diskReload(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let argument = arguments.first, arguments.count == 1 else {
+            return .failure(10, "dw disk reload requires a drive # or 'all' as an argument")
+        }
+        if argument.lowercased() == "all" {
+            reloadVirtualDrives()
+            return .success("All disks reloaded.\r\n")
+        }
+        guard let driveNumber = parseDriveNumber(argument) else {
+            return .failure(10, "Syntax error: non numeric drive #")
+        }
+        guard virtualDrives.contains(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+        virtualDrives.first(where: { $0.driveNumber == driveNumber })?.reload()
+        return .success("Disk in drive #\(driveNumber) reloaded.\r\n")
+    }
+
+    private func diskDump(_ arguments: [String]) -> DriveWireAPIResult {
+        guard arguments.count >= 2 else {
+            return .failure(10, "dw disk dump requires a drive # and sector # as arguments")
+        }
+        guard let driveNumber = parseDriveNumber(arguments[0]),
+              let sectorNumber = Int(arguments[1]) else {
+            return .failure(10, "Syntax error: non numeric drive # or sector #")
+        }
+        guard let drive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+
+        let (_, sector) = drive.readSector(lsn: sectorNumber)
+        return .success(hexDump(sector, baseAddress: sectorNumber * 256))
+    }
+
+    private func diskSet(_ arguments: [String]) -> DriveWireAPIResult {
+        guard arguments.count >= 3 else {
+            return .failure(10, "dw disk set requires 3 arguments.")
+        }
+        guard let driveNumber = parseDriveNumber(arguments[0]) else {
+            return .failure(101, "Invalid drive number '\(arguments[0])'")
+        }
+        guard virtualDrives.contains(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+
+        let parameter = arguments[1]
+        let value = arguments.dropFirst(2).joined(separator: " ")
+        virtualDriveParameters[driveNumber, default: [:]][parameter] = value
+        return .success("Param '\(parameter)' set for disk \(driveNumber).\r\n")
+    }
+
+    private func diskWrite(_ arguments: [String]) -> DriveWireAPIResult {
+        guard !arguments.isEmpty else {
+            return .failure(10, "Syntax error")
+        }
+        guard let driveNumber = parseDriveNumber(arguments[0]) else {
+            return .failure(101, "Invalid drive number.")
+        }
+        guard let drive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+
+        let path = arguments.count > 1 ? arguments.dropFirst().joined(separator: " ") : nil
+        do {
+            try drive.save(to: path)
+            if let path {
+                return .success("Wrote disk #\(driveNumber) to '\(path)'\r\n")
+            }
+            return .success("Wrote disk #\(driveNumber) to source image.\r\n")
+        } catch {
+            return .failure(202, error.localizedDescription)
+        }
+    }
+
+    private func portClose(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let portArgument = arguments.first else {
+            return .failure(10, "dw port close requires a port # as an argument")
+        }
+        guard arguments.count == 1, let portNumber = Int(portArgument), portNumber >= 0, portNumber < 15 else {
+            return .failure(10, "Syntax error: non numeric port #")
+        }
+
+        let channel = UInt8(portNumber)
+        openVirtualSerialChannels.remove(channel)
+        virtualSerialInput[channel]?.removeAll()
+        virtualSerialCommandBuffers[channel] = ""
+        return .success("Port #\(portNumber) closed.\r\n")
+    }
+
+    private func portShow() -> DriveWireAPIResult {
+        var text = "\r\nCurrent port status:\r\n\n"
+        for port in 0..<15 {
+            let channel = UInt8(port)
+            text += "/N\(port + 1)".padding(toLength: 6, withPad: " ", startingAt: 0)
+            if openVirtualSerialChannels.contains(channel) {
+                let waiting = virtualSerialInput[channel]?.count ?? 0
+                text += " "
+                text += "open".padding(toLength: 8, withPad: " ", startingAt: 0)
+                text += " "
+                text += "buf: \(waiting)".padding(toLength: 9, withPad: " ", startingAt: 0)
+            } else {
+                text += " closed"
+            }
+            text += "\r\n"
+        }
+        return .success(text)
+    }
+
+    private func serverStatus() -> DriveWireAPIResult {
+        var text = "DriveWire Swift status:\r\n\n"
+        text += "Device:        Swift host\r\n"
+        text += "DW4 support:   enabled\r\n"
+        text += "Virtual disks: \(virtualDrives.count)\r\n"
+        text += "Open ports:    \(openVirtualSerialChannels.count)\r\n"
+        text += "Last opcode:   0x\(String(statistics.lastOpCode, radix: 16))\r\n"
+        text += "Reads:         \(statistics.readCount)\r\n"
+        text += "Writes:        \(statistics.writeCount)\r\n"
+        return .success(text)
+    }
+
+    private func serverDir(_ arguments: [String]) -> DriveWireAPIResult {
+        guard !arguments.isEmpty else {
+            return .failure(10, "dw server dir requires a URI or path as an argument")
+        }
+
+        let path = arguments.joined(separator: " ")
+        let url = serverFileURL(from: path)
+        do {
+            let children = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
+                .map { $0.lastPathComponent }
+                .sorted()
+            var text = "Directory of \(url.path)\r\n\n"
+            let width = (children.map(\.count).max() ?? 1) + 2
+            let perLine = max(1, 80 / max(width, 1))
+            for (index, child) in children.enumerated() {
+                text += child.padding(toLength: width, withPad: " ", startingAt: 0)
+                if (index + 1) % perLine == 0 {
+                    text += "\r\n"
+                }
+            }
+            if !text.hasSuffix("\r\n") {
+                text += "\r\n"
+            }
+            return .success(text)
+        } catch {
+            return .failure(201, error.localizedDescription)
+        }
+    }
+
+    private func serverList(_ arguments: [String]) -> DriveWireAPIResult {
+        guard !arguments.isEmpty else {
+            return .failure(10, "dw server list requires a URI or local file path as an argument")
+        }
+
+        let path = arguments.joined(separator: " ")
+        do {
+            let data = try Data(contentsOf: serverFileURL(from: path))
+            let text: String
+            if let utf8 = String(data: data, encoding: .utf8) {
+                text = utf8
+            } else if let ascii = String(data: data, encoding: .ascii) {
+                text = ascii
+            } else {
+                text = data.map { byte -> String in
+                    if byte == 0x0A {
+                        return "\r\n"
+                    }
+                    return String(UnicodeScalar(Int(byte)) ?? ".")
+                }.joined()
+            }
+            return .success(text.hasSuffix("\r") || text.hasSuffix("\n") ? text : text + "\r\n")
+        } catch {
+            return .failure(202, error.localizedDescription)
+        }
+    }
+
+    private func serverPrint(_ arguments: [String]) -> DriveWireAPIResult {
+        guard !arguments.isEmpty else {
+            return .failure(10, "dw server print requires a URI or local file path as an argument")
+        }
+
+        let path = arguments.joined(separator: " ")
+        do {
+            printBuffer.append(try Data(contentsOf: serverFileURL(from: path)))
+            return .success("Sent item to printer\r\n")
+        } catch {
+            return .failure(202, error.localizedDescription)
+        }
+    }
+
+    private func parseDriveNumber(_ value: String) -> Int? {
+        let trimmed = value.uppercased().hasPrefix("X") ? String(value.dropFirst()) : value
+        guard let number = Int(trimmed), number >= 0, number <= 255 else {
+            return nil
+        }
+        return number
+    }
+
+    private func serverFileURL(from path: String) -> URL {
+        let normalized = path.replacingOccurrences(of: "*", with: "!")
+        if let url = URL(string: normalized), url.isFileURL {
+            return url
+        }
+        if normalized.hasPrefix("~/") {
+            return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(String(normalized.dropFirst(2)))
+        }
+        if (normalized as NSString).isAbsolutePath {
+            return URL(fileURLWithPath: normalized)
+        }
+        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(normalized)
+    }
+
+    private func hexDump(_ data: Data, baseAddress: Int) -> String {
+        var lines: [String] = []
+        let bytes = Array(data)
+        for offset in stride(from: 0, to: bytes.count, by: 16) {
+            let chunk = bytes[offset..<min(offset + 16, bytes.count)]
+            let hex = chunk.map { String(format: "%02X", $0) }.joined(separator: " ")
+                .padding(toLength: 47, withPad: " ", startingAt: 0)
+            let ascii = chunk.map { byte -> String in
+                byte >= 0x20 && byte < 0x7F ? String(UnicodeScalar(byte)) : "."
+            }.joined()
+            lines.append(String(format: "%06X  %@  %@", baseAddress + offset, hex, ascii))
+        }
+        return lines.joined(separator: "\r\n") + "\r\n"
+    }
+
+    private func shortenedPath(_ path: String) -> String {
+        let home = NSHomeDirectory()
+        if path == home {
+            return "~"
+        }
+        if path.hasPrefix(home + "/") {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
+    }
+
+    private func isVirtualWindowChannel(_ channel: UInt8) -> Bool {
+        channel >= 0x80 && channel <= 0x8F
+    }
+
+    private func OP_FASTWRITE_Serial(data : Data) -> Int {
+        guard data.count >= 2 else { return 0 }
+        writeVirtualSerial(channel: fastwriteChannel, data: Data([data[1]]))
         resetState()
-        // VWindow channels are not implemented; consume correctly and log.
-        log = log + "OP_FASTWRITE_Screen(\(fastwriteChannel)) unsupported" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return expectedCount
+        return 2
+    }
+    
+    private func OP_FASTWRITE_Screen(data : Data) -> Int {
+        guard data.count >= 2 else { return 0 }
+        writeVirtualSerial(channel: 0x80 &+ fastwriteChannel, data: Data([data[1]]))
+        resetState()
+        delegate?.transactionCompleted(opCode: currentTransaction)
+        return 2
     }
     
     private func OP_RFM(data : Data) -> Int {
@@ -1126,432 +1919,604 @@ public class DriveWireHost : Codable {
     }
     
     private func OPRFMCREATE(data : Data) -> Int {
-        var result = 0
-        let expectedCount = 2
-        
-        if data.count >= expectedCount {
-            
-            resetState()
-        }
-        
-        return result
+        return rfmOpen(data: data, shouldCreate: true)
     }
-    
-    // Format of command from the client at this point
-    // - 2 byte: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 1 byte: Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 1 byte: Mode Byte from caller's R$A
-    // - 2 bytes: length of pathname
+
+    // Receives: path#(1) + processID(1) + mode(1), then pathname terminated by CR ($0D).
+    // Sends back: 1-byte error code.
     private func OPRFMOPEN(data : Data) -> Int {
+        return rfmOpen(data: data, shouldCreate: false)
+    }
+
+    private func rfmOpen(data: Data, shouldCreate: Bool) -> Int {
         var result = 0
-        let expectedCount = 7
+        let expectedCount = 4
+        var capturedPathNumber = 0
 
         if data.count >= expectedCount {
-            rfmPathDescriptor = RFMPathDescriptor()
-            rfmPathDescriptor.processID = Int(data[0])
-            rfmPathDescriptor.pathNumber = Int(data[1])
-            rfmPathDescriptor.pathDescriptorAddress = Int(data[2]) * 256 + Int(data[3])
-            rfmPathDescriptor.mode = Int(data[4])
-            rfmPathDescriptor.pathnameLength = Int(data[5]) * 256 + Int(data[6])
-            
+            capturedPathNumber = Int(data[0])
+            var descriptor = RFMPathDescriptor()
+            descriptor.pathNumber = capturedPathNumber
+            descriptor.processID = Int(data[1])
+            descriptor.parentProcessID = Int(data[2])
+            descriptor.mode = Int(data[3])
+            rfmPaths[capturedPathNumber] = descriptor
             result = expectedCount
             processor = OPRFMGETPATH
-            log = log + "OP_RFM_OPEN("
         }
-        
+
         return result
-    }
 
-    private func OPRFMGETPATH(data : Data) -> Int {
-        var result = 0
-        let expectedCount = rfmPathDescriptor.pathnameLength
-
-        if data.count >= expectedCount {
-            var lsn0 : UInt8 = 0
-            var lsn1 : UInt8 = 0
-            var lsn2 : UInt8 = 0
-            
-            if currentSubTransaction == DWRFMTransaction.OP_RFM_CHGDIR.rawValue {
-                
-            } else {
-                rfmPathDescriptor.pathname = String(bytes: data, encoding: .ascii)!
+        func OPRFMGETPATH(data: Data) -> Int {
+            guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
+            let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let pid = rfmPaths[capturedPathNumber]?.processID ?? 0
+            let ppid = rfmPaths[capturedPathNumber]?.parentProcessID ?? 0
+            let mode = rfmPaths[capturedPathNumber]?.mode ?? 0
+            let isExec = (mode & 0x04) != 0
+            let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
+                                              processID: pid, parentProcessID: ppid, isExec: isExec)
+            rfmPaths[capturedPathNumber]?.pathname = pathname
+            let errorCode = rfmPaths[capturedPathNumber]?.openLocalFile(rootPath: rfmRootPath, shouldCreate: shouldCreate) ?? 0xFF
+            if errorCode != 0 {
+                // Failed open — remove the descriptor so the slot is clean for reuse.
+                rfmPaths.removeValue(forKey: capturedPathNumber)
             }
-
-            result = expectedCount
-            
-            // Locate the file on the host.
-            let errorCode = rfmPathDescriptor.openLocalFile()
-
-            if errorCode == 0 {
-                // obtain unique identifier
-                lsn0 = 3
-                lsn1 = 2
-                lsn2 = 1
+            // For directory opens, synthesize OS-9 directory entries with stable LSNs.
+            if errorCode == 0, let descriptor = rfmPaths[capturedPathNumber], descriptor.mode & 0x80 != 0 {
+                rfmPaths[capturedPathNumber]?.fileContents = synthesizeDirectoryEntries(for: descriptor)
             }
-            
-            delegate?.dataAvailable(host: self, data: Data([errorCode, lsn0, lsn1, lsn2]))
-            log = log + "\(rfmPathDescriptor.pathDescriptorAddress), \(rfmPathDescriptor.pathNumber), \(rfmPathDescriptor.pathname)) -> [\(errorCode), \(lsn0), \(lsn1), \(lsn2)]\n"
-
+            delegate?.dataAvailable(host: self, data: Data([errorCode]))
+            let dirLabel = isExec ? "execDir" : "dataDir"
+            let dirVal = isExec
+                ? (rfmCurrentExecDir[pid] ?? rfmCurrentExecDir[ppid] ?? "none")
+                : (rfmCurrentDir[pid] ?? rfmCurrentDir[ppid] ?? "none")
+            let msg = "OP_RFM_\(shouldCreate ? "CREATE" : "OPEN")(path#\(capturedPathNumber), pid=\(pid), ppid=\(ppid), mode=0x\(String(mode, radix: 16)), \(dirLabel)=\(dirVal), resolved=\(pathname)) -> \(errorCode)"
+            log += msg + "\n"
+            print(msg)
             resetState()
+            return crOffset - data.startIndex + 1
         }
-        
-        return result
-    }
-    
-    private func OPRFMMAKDIR(data : Data) -> Int {
-        var result = 1
-        return result
     }
 
-    private func OPRFMCHGDIR(data : Data) -> Int {
-        var result = 0
-        let expectedCount = 7
-        var mode = 0
-        
-        if data.count >= expectedCount {
-            let processID = Int(data[0])
-            let pathNumber = Int(data[1])
-            let pathDescriptorAddress = Int(data[2]) * 256 + Int(data[3])
-            mode = Int(data[4])
-            let pathnameLength = Int(data[5]) * 256 + Int(data[6])
+    private func resolveRFMPathname(_ pathname: String, processID: Int, parentProcessID: Int, isExec: Bool = false) -> String {
+        guard !(pathname as NSString).isAbsolutePath else { return pathname }
+        let dirMap = isExec ? rfmCurrentExecDir : rfmCurrentDir
+        let base: String
+        if let cwd = dirMap[processID] {
+            base = cwd
+        } else if let cwd = dirMap[parentProcessID] {
+            base = cwd
+        } else {
+            return pathname
+        }
+        if pathname == "." { return base }
+        return (base as NSString).appendingPathComponent(pathname)
+    }
 
-            if mode & 0x4 != 0 {
-                // execution directory
-                rfmWorkingExecutionDirectoryPathDescriptor.processID = processID
-                rfmWorkingExecutionDirectoryPathDescriptor.pathNumber = pathNumber
-                rfmWorkingExecutionDirectoryPathDescriptor.pathDescriptorAddress = pathDescriptorAddress
-                rfmWorkingExecutionDirectoryPathDescriptor.mode = mode
-                rfmWorkingExecutionDirectoryPathDescriptor.pathnameLength = pathnameLength
-            } else {
-                // data directory
-                rfmWorkingDataDirectoryPathDescriptor.processID = processID
-                rfmWorkingDataDirectoryPathDescriptor.pathNumber = pathNumber
-                rfmWorkingDataDirectoryPathDescriptor.pathDescriptorAddress = pathDescriptorAddress
-                rfmWorkingDataDirectoryPathDescriptor.mode = mode
-                rfmWorkingDataDirectoryPathDescriptor.pathnameLength = pathnameLength
+    // Expand OS-9 multi-dot path components: N dots = N-1 parent-dir references.
+    private func expandOS9MultiDots(_ path: String) -> String {
+        RFMPathDescriptor.expandMultiDots(path)
+    }
+
+    private static func ssCodeName(_ code: Int) -> String {
+        switch code {
+        case 0x00: return "SS.Opt"
+        case 0x01: return "SS.Ready"
+        case 0x02: return "SS.Size"
+        case 0x03: return "SS.Reset"
+        case 0x04: return "SS.WTrk"
+        case 0x05: return "SS.Pos"
+        case 0x06: return "SS.EOF"
+        case 0x07: return "SS.Link"
+        case 0x08: return "SS.ULink"
+        case 0x09: return "SS.Feed"
+        case 0x0A: return "SS.Frz"
+        case 0x0B: return "SS.SPT"
+        case 0x0C: return "SS.SQD"
+        case 0x0D: return "SS.DCmd"
+        case 0x0E: return "SS.DevNm"
+        case 0x0F: return "SS.FD"
+        case 0x10: return "SS.Ticks"
+        case 0x11: return "SS.Lock"
+        case 0x12: return "SS.DStat"
+        case 0x13: return "SS.Joy"
+        case 0x14: return "SS.BlkRd"
+        case 0x15: return "SS.BlkWr"
+        case 0x16: return "SS.Reten"
+        case 0x17: return "SS.WFM"
+        case 0x18: return "SS.RFM"
+        case 0x19: return "SS.ELog"
+        case 0x1A: return "SS.SSig"
+        case 0x1B: return "SS.Relea"
+        case 0x1C: return "SS.AlfaS"
+        case 0x1D: return "SS.Break"
+        case 0x1E: return "SS.RsBit"
+        case 0x1F: return "SS.DirEnt"
+        case 0x20: return "SS.FDInf"
+        case 0x21: return "SS.Cursr"
+        case 0x22: return "SS.ScSiz"
+        case 0x23: return "SS.KySns"
+        case 0x24: return "SS.DevNm"
+        case 0x25: return "SS.FD"
+        case 0x26: return "SS.Ticks"
+        case 0x27: return "SS.Lock"
+        case 0x28: return "SS.ComSt"
+        case 0x29: return "SS.Open"
+        case 0x2A: return "SS.Close"
+        case 0x2B: return "SS.HngUp"
+        case 0x2C: return "SS.FSig"
+        default:   return "0x\(String(code, radix: 16, uppercase: false))"
+        }
+    }
+
+    // Returns a stable LSN for the given absolute host path, allocating a new one if needed.
+    private func lsnForPath(_ path: String) -> Int {
+        if let existing = rfmLSNByPath[path] { return existing }
+        let lsn = rfmLSNCounter
+        rfmLSNByPath[path] = lsn
+        rfmLSNToPath[lsn] = path
+        rfmLSNCounter += 1
+        return lsn
+    }
+
+    // Builds OS-9 directory contents for the open directory descriptor, registering each entry in the LSN map.
+    private func synthesizeDirectoryEntries(for descriptor: RFMPathDescriptor) -> Data {
+        let dirPath = rfmRootPath + descriptor.pathname
+        var entries = Data()
+
+        // '..' and '.' entries — point to parent and self
+        let parentPath: String
+        let selfPath = (URL(fileURLWithPath: dirPath).standardized.path)
+        let deviceRoot = rfmRootPath + "/" + (descriptor.pathname.split(separator: "/").first.map(String.init) ?? "")
+        if selfPath == URL(fileURLWithPath: deviceRoot).standardized.path {
+            parentPath = selfPath   // at device root: '..' loops back to self
+        } else {
+            parentPath = URL(fileURLWithPath: dirPath + "/..").standardized.path
+        }
+        entries.append(contentsOf: RFMPathDescriptor.makeOS9DirEntry("..", lsn: lsnForPath(parentPath)))
+        entries.append(contentsOf: RFMPathDescriptor.makeOS9DirEntry(".",  lsn: lsnForPath(selfPath)))
+
+        if let contents = try? FileManager.default.contentsOfDirectory(atPath: dirPath) {
+            for name in contents.sorted() {
+                let childPath = dirPath + "/" + name
+                entries.append(contentsOf: RFMPathDescriptor.makeOS9DirEntry(name, lsn: lsnForPath(childPath)))
             }
-            
+        }
+        return entries
+    }
+
+    private func OPRFMMAKDIR(data: Data) -> Int {
+        var result = 0
+        let expectedCount = 4
+        var capturedPathNumber = 0
+        var capturedProcessID = 0
+        var capturedParentProcessID = 0
+        var capturedMode = 0
+
+        if data.count >= expectedCount {
+            capturedPathNumber = Int(data[0])
+            capturedProcessID = Int(data[1])
+            capturedParentProcessID = Int(data[2])
+            capturedMode = Int(data[3])
+            result = expectedCount
+            processor = OPRFMGETMKDIRPATH
+        }
+
+        return result
+
+        func OPRFMGETMKDIRPATH(data: Data) -> Int {
+            guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
+            let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let isExec = (capturedMode & 0x04) != 0
+            let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
+                                              processID: capturedProcessID,
+                                              parentProcessID: capturedParentProcessID,
+                                              isExec: isExec)
+            var errorCode: UInt8 = 216
+            if !pathname.isEmpty && !pathname.contains("\0") {
+                let localPath = (pathname as NSString).isAbsolutePath
+                    ? rfmRootPath + pathname : rfmRootPath + "/" + pathname
+                let resolved = URL(filePath: localPath).standardized.path
+                let normalizedRoot = URL(filePath: rfmRootPath).standardized.path
+                if resolved == normalizedRoot || resolved.hasPrefix(normalizedRoot + "/") {
+                    do {
+                        try FileManager.default.createDirectory(
+                            atPath: resolved, withIntermediateDirectories: true)
+                        errorCode = 0
+                        log += "OP_RFM_MAKDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0\n"
+                        print("OP_RFM_MAKDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0")
+                    } catch { errorCode = 216 }
+                } else { errorCode = 214 }
+            }
+            delegate?.dataAvailable(host: self, data: Data([errorCode]))
+            resetState()
+            return crOffset - data.startIndex + 1
+        }
+    }
+
+    private func OPRFMCHGDIR(data: Data) -> Int {
+        var result = 0
+        let expectedCount = 4
+        var capturedPathNumber = 0
+        var capturedProcessID = 0
+        var capturedParentProcessID = 0
+        var capturedMode = 0
+
+        if data.count >= expectedCount {
+            capturedPathNumber = Int(data[0])
+            capturedProcessID = Int(data[1])
+            capturedParentProcessID = Int(data[2])
+            capturedMode = Int(data[3])
             result = expectedCount
             processor = OPRFMGETCHGDIRPATH
         }
-        
+
         return result
-        
-        func OPRFMGETCHGDIRPATH(data : Data) -> Int {
-            var result = 0
-            let expectedCount = rfmPathDescriptor.pathnameLength
-            var errorCode : UInt8 = 0
-            
-            if data.count >= expectedCount {
-                var lsn0 : UInt8 = 0
-                var lsn1 : UInt8 = 0
-                var lsn2 : UInt8 = 0
 
-                if mode & 0x4 != 0 {
-                    // execution directory
-                    rfmWorkingExecutionDirectoryPathDescriptor.pathname = String(bytes: data, encoding: .ascii)!
-                    errorCode = rfmWorkingExecutionDirectoryPathDescriptor.openLocalFile()
+        func OPRFMGETCHGDIRPATH(data: Data) -> Int {
+            guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
+            let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let isExec = (capturedMode & 0x04) != 0
+            let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
+                                              processID: capturedProcessID,
+                                              parentProcessID: capturedParentProcessID,
+                                              isExec: isExec)
+            let expandedPathname = expandOS9MultiDots(pathname)
+            var errorCode: UInt8 = 216
+            if !expandedPathname.isEmpty && !expandedPathname.contains("\0") {
+                let localPath = (expandedPathname as NSString).isAbsolutePath
+                    ? rfmRootPath + expandedPathname : rfmRootPath + "/" + expandedPathname
+                let resolved = URL(filePath: localPath).standardized.path
+                let normalizedRoot = URL(filePath: rfmRootPath).standardized.path
+                // Accept paths within rfmRootPath, OR above it (will be clamped to device root).
+                let deviceRoot = "/" + (expandedPathname.split(separator: "/").first.map(String.init) ?? "")
+                let effectiveResolved = (resolved == normalizedRoot || resolved.hasPrefix(normalizedRoot + "/"))
+                    ? resolved : normalizedRoot + deviceRoot
+                var isDir: ObjCBool = false
+                if FileManager.default.fileExists(atPath: effectiveResolved, isDirectory: &isDir), isDir.boolValue {
+                    var relativePath = String(effectiveResolved.dropFirst(normalizedRoot.count))
+                    if relativePath.isEmpty { relativePath = deviceRoot }
+                    // Only store this process's CWD when it differs from the parent's.
+                    // If it matches, remove any stale entry so the parent lookup always wins.
+                    if isExec {
+                        if relativePath == rfmCurrentExecDir[capturedParentProcessID] {
+                            rfmCurrentExecDir.removeValue(forKey: capturedProcessID)
+                        } else {
+                            rfmCurrentExecDir[capturedProcessID] = relativePath
+                        }
+                    } else {
+                        if relativePath == rfmCurrentDir[capturedParentProcessID] {
+                            rfmCurrentDir.removeValue(forKey: capturedProcessID)
+                        } else {
+                            rfmCurrentDir[capturedProcessID] = relativePath
+                        }
+                    }
+                    errorCode = 0
+                    let dirLabel = isExec ? "execDir" : "dataDir"
+                    let line = "OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), \(dirLabel)=\(relativePath)) -> 0\n"
+                    log += line
+                    print(line)
                 } else {
-                    // data directory
-                    rfmWorkingDataDirectoryPathDescriptor.pathname = String(bytes: data, encoding: .ascii)!
-                    errorCode = rfmWorkingDataDirectoryPathDescriptor.openLocalFile()
+                    errorCode = 216  // E$PNNF — directory not found
+                    let line = "OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID)) -> \(errorCode)\n"
+                    log += line
+                    print(line)
                 }
-
-                result = expectedCount
-                
-                // Locate the file on the host.
-
-                if errorCode == 0 {
-                    // obtain unique identifier
-                    lsn0 = 3
-                    lsn1 = 2
-                    lsn2 = 1
-                }
-                
-                if mode & 0x4 != 0 {
-                    // execution directory
-                    log = log + "OP_RFM_CHGDIR(Execution, \(rfmWorkingExecutionDirectoryPathDescriptor.pathDescriptorAddress), \(rfmWorkingExecutionDirectoryPathDescriptor.pathNumber), \(rfmWorkingExecutionDirectoryPathDescriptor.pathname)) -> [\(errorCode), \(lsn0), \(lsn1), \(lsn2)]\n"
-                } else {
-                    // data directory
-                    log = log + "OP_RFM_CHGDIR(Data, \(rfmWorkingDataDirectoryPathDescriptor.pathDescriptorAddress), \(rfmWorkingDataDirectoryPathDescriptor.pathNumber), \(rfmWorkingDataDirectoryPathDescriptor.pathname)) -> [\(errorCode), \(lsn0), \(lsn1), \(lsn2)]\n"
-                }
-
-                delegate?.dataAvailable(host: self, data: Data([errorCode, lsn0, lsn1, lsn2]))
-
-                resetState()
             }
-            
-            return result
+            delegate?.dataAvailable(host: self, data: Data([errorCode]))
+            resetState()
+            return crOffset - data.startIndex + 1
         }
     }
 
-private func OPRFMDELETE(data : Data) -> Int {
-    var result = 1
-    return result
-}
-
-    // Format of command from the client at this point
-    // - 2 byte: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 1 byte: Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 4 bytes: 32-bit seek position
-    private func OPRFMSEEK(data : Data) -> Int {
+    private func OPRFMDELETE(data: Data) -> Int {
         var result = 0
-        let expectedCount = 7
-        var errorCode : UInt8 = 0
+        let expectedCount = 4
+        var capturedPathNumber = 0
+        var capturedProcessID = 0
+        var capturedParentProcessID = 0
+        var capturedMode = 0
 
         if data.count >= expectedCount {
-            rfmPathDescriptor.pathDescriptorAddress = Int(data[0]) * 256 + Int(data[1])
-            rfmPathDescriptor.pathNumber = Int(data[2])
-            rfmPathDescriptor.filePosition = Int(data[3]) * 16777216 + Int(data[4]) * 65536 + Int(data[5]) * 256 + Int(data[6])
-
+            capturedPathNumber = Int(data[0])
+            capturedProcessID = Int(data[1])
+            capturedParentProcessID = Int(data[2])
+            capturedMode = Int(data[3])
             result = expectedCount
-            resetState()
-            delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            log = log + "OP_RFM_SEEK(\(rfmPathDescriptor.filePosition)) -> R$B=\(errorCode)\n"
+            processor = OPRFMGETDELETEPATH
         }
-        
+
         return result
+
+        func OPRFMGETDELETEPATH(data: Data) -> Int {
+            guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
+            let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
+            let isExec = (capturedMode & 0x04) != 0
+            let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
+                                              processID: capturedProcessID,
+                                              parentProcessID: capturedParentProcessID,
+                                              isExec: isExec)
+            var errorCode: UInt8 = 216
+            if !pathname.isEmpty && !pathname.contains("\0") {
+                let localPath = (pathname as NSString).isAbsolutePath
+                    ? rfmRootPath + pathname : rfmRootPath + "/" + pathname
+                let resolved = URL(filePath: localPath).standardized.path
+                let normalizedRoot = URL(filePath: rfmRootPath).standardized.path
+                if resolved == normalizedRoot || resolved.hasPrefix(normalizedRoot + "/") {
+                    do {
+                        let attrs = try FileManager.default.attributesOfItem(atPath: resolved)
+                        if attrs[.type] as? FileAttributeType == .typeDirectory {
+                            // Only delete if empty (deldir path)
+                            let contents = try FileManager.default.contentsOfDirectory(atPath: resolved)
+                            if contents.isEmpty {
+                                try FileManager.default.removeItem(atPath: resolved)
+                                errorCode = 0
+                            } else {
+                                errorCode = 215  // E$DNE — directory not empty
+                            }
+                        } else {
+                            try FileManager.default.removeItem(atPath: resolved)
+                            errorCode = 0
+                        }
+                        if errorCode == 0 {
+                            log += "OP_RFM_DELETE(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0\n"
+                        print("OP_RFM_DELETE(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), path=\(pathname)) -> 0")
+                        }
+                    } catch { errorCode = 216 }
+                } else { errorCode = 214 }
+            }
+            delegate?.dataAvailable(host: self, data: Data([errorCode]))
+            resetState()
+            return crOffset - data.startIndex + 1
+        }
     }
 
-    // Read data from the client.
-    //
-    // Format of command from the client at this point
-    // - 1 byte:  Process ID
-    // - 1 byte:  Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 2 bytes: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 2 bytes: Number of bytes to read
-    //
-    // If there is an error, then the following bytes are sent to the client, and the transaction terminates:
-    // - 1 byte:  a non-zero error code
-    // - 2 bytes: size to read (0)
-    //
-    // If there is NOT an error, then the following bytes are sent to the client:
-    // - 1 byte: 0 (no error)
-    // - 2 bytes: the number of bytes the client can read
-    //
-    // Upon receiving the non-error 3-byte response, the client will then issue a "ready" response of 1 byte.
-    // When the host receives the "ready" response, it will send the number of bytes to the client.
-    private func OPRFMREAD(data : Data) -> Int {
-        var pathDescriptorAddress = 0
-        var pathNumber = 0
-        var bytesToRead = 0
-        var errorCode : UInt8 = 0
-        var dataToSend = Data([0x00])
-
-        // Format of command from the client at this point
-        // - 1 byte: 0 = acknowledged previous response
-        func OPRFMREADP2(data : Data) -> Int {
-            var result = 0
-            let expectedCount = 1
-            
-            if data.count >= expectedCount {
-                result = expectedCount
-                delegate?.dataAvailable(host: self, data: dataToSend)
-            }
-
-            resetState()
-
-            return result
-        }
-
+    // Receives: path#(1) + X(2) + U(2) where X:U is the 32-bit seek position.
+    // Sends back: 1-byte error code.
+    private func OPRFMSEEK(data: Data) -> Int {
         var result = 0
         let expectedCount = 5
-        
+        let errorCode: UInt8 = 0
+
         if data.count >= expectedCount {
-            pathDescriptorAddress = Int(data[0]) * 256 + Int(data[1])
-            pathNumber = Int(data[2])
-            bytesToRead = Int(data[3]) * 256 + Int(data[4])
+            let pathNumber = Int(data[0])
+            let position = Int(data[1]) * 16777216 + Int(data[2]) * 65536 + Int(data[3]) * 256 + Int(data[4])
+            rfmPaths[pathNumber]?.filePosition = position
             result = expectedCount
-            
-            // Get number of bytes to read from file on this path.
-            
-            // Send the response code to the guest.
-            // Format of response:
-            // - 1 byte: error code
-            // - 2 bytes: length of valid data
-            (errorCode, dataToSend) = rfmPathDescriptor.readFromFile(offset: 0, maximumCount : bytesToRead)
+            resetState()
             delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            delegate?.dataAvailable(host: self, data: Data([UInt8((dataToSend.count >> 8) & 0xFF), UInt8(dataToSend.count & 0xFF)]))
-            if errorCode == 0 {
-                processor = OPRFMREADP2
+            log += "OP_RFM_SEEK(path#\(pathNumber), pos=\(position)) -> \(errorCode)\n"
+            print("OP_RFM_SEEK(path#\(pathNumber), pos=\(position)) -> \(errorCode)")
+        }
+
+        return result
+    }
+
+    // Receives: path#(1) then maxBytes(2). Sends: count(1) then count bytes.
+    // count=0 signals EOF; rfm.asm treats it as E$EOF.
+    private func OPRFMREAD(data: Data) -> Int {
+        var result = 0
+        let expectedCount = 3
+
+        if data.count >= expectedCount {
+            let pathNumber = Int(data[0])
+            let maxBytes = Int(data[1]) * 256 + Int(data[2])
+            result = expectedCount
+
+            if var descriptor = rfmPaths[pathNumber] {
+                let (errorCode, lineData) = descriptor.readFromFile(maximumCount: maxBytes)
+                rfmPaths[pathNumber] = descriptor
+                let ec = errorCode != 0 ? Int(errorCode) : Int(lineData.count)
+                log += "OP_RFM_READ(path#\(pathNumber), max=\(maxBytes)) -> \(ec)\n"
+                print("OP_RFM_READ(path#\(pathNumber), max=\(maxBytes)) -> \(ec)")
+                if errorCode != 0 {
+                    delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
+                } else {
+                    delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
+                    if !lineData.isEmpty {
+                        Thread.sleep(forTimeInterval: 0.002)
+                        delegate?.dataAvailable(host: self, data: lineData)
+                    }
+                }
+            } else {
+                delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
+            }
+            resetState()
+        }
+
+        return result
+    }
+
+    // Receives: path#(1) then count(2) then count bytes. No response.
+    // Receives: path#(1) then count(2) then count bytes. No response.
+    private func OPRFMWRITE(data: Data) -> Int {
+        var result = 0
+        let headerCount = 3
+
+        if data.count >= headerCount {
+            let pathNumber = Int(data[0])
+            let byteCount = Int(data[1]) * 256 + Int(data[2])
+            let totalCount = headerCount + byteCount
+            if data.count >= totalCount {
+                let key = rfmPaths[pathNumber] != nil ? pathNumber
+                    : rfmPaths.first { $0.value.localFile != nil }?.key
+                if let k = key, var descriptor = rfmPaths[k] {
+                    _ = descriptor.writeToFile(data: Data(data[headerCount..<totalCount]))
+                    rfmPaths[k] = descriptor
+                }
+                log += "OP_RFM_WRITE(path#\(pathNumber), bytes=\(byteCount))\n"
+                print("OP_RFM_WRITE(path#\(pathNumber), bytes=\(byteCount))")
+                result = totalCount
+                resetState()
+            }
+        }
+
+        return result
+    }
+
+    // Receives: path#(1) then maxBytes(2). Sends: count(1) then count bytes.
+    private func OPRFMREADLN(data: Data) -> Int {
+        var result = 0
+        let expectedCount = 3
+
+        if data.count >= expectedCount {
+            let pathNumber = Int(data[0])
+            let maxBytes = Int(data[1]) * 256 + Int(data[2])
+            result = expectedCount
+
+            if var descriptor = rfmPaths[pathNumber] {
+                let (errorCode, lineData) = descriptor.readLineFromFile(maximumCount: maxBytes)
+                rfmPaths[pathNumber] = descriptor
+                let ec = errorCode != 0 ? Int(errorCode) : Int(lineData.count)
+                log += "OP_RFM_READLN(path#\(pathNumber), max=\(maxBytes)) -> \(ec)\n"
+                print("OP_RFM_READLN(path#\(pathNumber), max=\(maxBytes)) -> \(ec)")
+                if errorCode != 0 {
+                    delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
+                } else {
+                    delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
+                    if !lineData.isEmpty {
+                        Thread.sleep(forTimeInterval: 0.002)
+                        delegate?.dataAvailable(host: self, data: lineData)
+                    }
+                }
+            } else {
+                delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
+            }
+            resetState()
+        }
+
+        return result
+    }
+
+    // Receives: path#(1) then count(2) then count bytes. No response.
+    private func OPRFMWRITLN(data: Data) -> Int {
+        var result = 0
+        let headerCount = 3
+
+        if data.count >= headerCount {
+            let pathNumber = Int(data[0])
+            let byteCount = Int(data[1]) * 256 + Int(data[2])
+            let totalCount = headerCount + byteCount
+            if data.count >= totalCount {
+                let key = rfmPaths[pathNumber] != nil ? pathNumber
+                    : rfmPaths.first { $0.value.localFile != nil }?.key
+                if let k = key, var descriptor = rfmPaths[k] {
+                    _ = descriptor.writeToFile(data: Data(data[headerCount..<totalCount]), translateCR: true)
+                    rfmPaths[k] = descriptor
+                }
+                log += "OP_RFM_WRITLN(path#\(pathNumber), bytes=\(byteCount))\n"
+                print("OP_RFM_WRITLN(path#\(pathNumber), bytes=\(byteCount))")
+                result = totalCount
+                resetState()
+            }
+        }
+
+        return result
+    }
+
+    // Receives: path#(1) + SS.code(1). SS.FD additionally receives 2-byte count then sends FD.
+    private func OPRFMGETSTT(data: Data) -> Int {
+        var result = 0
+        let expectedCount = 2
+        var capturedPathNumber = 0
+
+        if data.count >= expectedCount {
+            capturedPathNumber = Int(data[0])
+            let statCode = Int(data[1])
+            result = expectedCount
+            log += "OP_RFM_GETSTT(path#\(capturedPathNumber), \(DriveWireHost.ssCodeName(statCode)))\n"
+            print("OP_RFM_GETSTT(path#\(capturedPathNumber), \(DriveWireHost.ssCodeName(statCode)))")
+            if statCode == 0x02 {  // SS.Size — send 4-byte file size
+                let size = rfmPaths[capturedPathNumber]?.fileContents.count ?? 0
+                let msg = "OP_RFM_GETSTT(path#\(capturedPathNumber), SS.Size) -> \(size)"
+                log += msg + "\n"; print(msg)
+                delegate?.dataAvailable(host: self, data: Data([
+                    UInt8((size >> 24) & 0xFF), UInt8((size >> 16) & 0xFF),
+                    UInt8((size >> 8) & 0xFF),  UInt8(size & 0xFF)]))
+                resetState()
+            } else if statCode == 0x05 {  // SS.Pos — send 4-byte current position
+                let pos = rfmPaths[capturedPathNumber]?.filePosition ?? 0
+                let msg = "OP_RFM_GETSTT(path#\(capturedPathNumber), SS.Pos) -> \(pos)"
+                log += msg + "\n"; print(msg)
+                delegate?.dataAvailable(host: self, data: Data([
+                    UInt8((pos >> 24) & 0xFF), UInt8((pos >> 16) & 0xFF),
+                    UInt8((pos >> 8) & 0xFF),  UInt8(pos & 0xFF)]))
+                resetState()
+            } else if statCode == 0x06 {  // SS.EOF — send 0 (not EOF) or E$EOF (211)
+                let isEOF = rfmPaths[capturedPathNumber].map { $0.filePosition >= $0.fileContents.count } ?? true
+                let response: UInt8 = isEOF ? 211 : 0
+                let msg = "OP_RFM_GETSTT(path#\(capturedPathNumber), SS.EOF) -> \(isEOF ? "EOF" : "OK")"
+                log += msg + "\n"; print(msg)
+                delegate?.dataAvailable(host: self, data: Data([response]))
+                resetState()
+            } else if statCode == 0x0F {  // SS.FD
+                processor = OPRFMGETSSFD
+            } else if statCode == 0x20 {  // SS.FDInf
+                processor = OPRFMGETSSFDINF
             } else {
                 resetState()
             }
         }
-        
+
         return result
-    }
 
-    private func OPRFMWRITE(data : Data) -> Int {
-        var result = 1
-        return result
-    }
+        func OPRFMGETSSFD(data: Data) -> Int {
+            guard data.count >= 2 else { return 0 }
+            let count = min(Int(data[0]) * 256 + Int(data[1]), 256)
+            let fd = rfmPaths[capturedPathNumber]?.synthesizeFD(count: count)
+                ?? Data(repeating: 0, count: count)
+            delegate?.dataAvailable(host: self, data: fd)
+            log += "OP_RFM_GETSTT_FD(path#\(capturedPathNumber), bytes=\(count))\n"
+            print("OP_RFM_GETSTT_FD(path#\(capturedPathNumber), bytes=\(count))")
+            resetState()
+            return 2
+        }
 
-    // Read data from the client up to a new line.
-    //
-    // Format of command from the client at this point
-    // - 1 byte:  Process ID
-    // - 1 byte:  Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 2 bytes: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 2 bytes: Number of bytes to read
-    //
-    // If there is an error, then the following bytes are sent to the client, and the transaction terminates:
-    // - 1 byte:  a non-zero error code
-    // - 2 bytes: (0, 0)
-    //
-    // If there is NOT an error, then the following bytes are sent to the client:
-    // - 1 byte: 0 (no error)
-    // - 2 bytes: the number of bytes the client can read
-    //
-    // Upon receiving the non-error 3-byte response, the client will then issue a "ready" response of 1 byte.
-    // When the host receives the "ready" response, it sends the number of requested bytes to the client.
-    private func OPRFMREADLN(data : Data) -> Int {
-        var pathDescriptorAddress = 0
-        var pathNumber = 0
-        var bytesToRead = 0
-        var errorCode : UInt8 = 0
-        var dataToSend = Data([0x00])
-
-        // Format of command from the client at this point
-        // - 1 byte: 0 = acknowledged previous response
-        func OPRFMREADP2(data : Data) -> Int {
-            var result = 0
-            let expectedCount = 1
-            
-            if data.count >= expectedCount {
-                result = expectedCount
-                delegate?.dataAvailable(host: self, data: dataToSend)
+        func OPRFMGETSSFDINF(data: Data) -> Int {
+            guard data.count >= 4 else { return 0 }
+            // data[0]=Y_hi=LSN[0], data[1]=Y_lo=length, data[2]=U_hi=LSN[1], data[3]=U_lo=LSN[2]
+            let lsn = Int(data[0]) << 16 | Int(data[2]) << 8 | Int(data[3])
+            var tempDesc = RFMPathDescriptor()
+            if let hostPath = rfmLSNToPath[lsn] {
+                tempDesc.attributes = (try? FileManager.default.attributesOfItem(atPath: hostPath)) ?? [:]
             }
-
+            let fd = tempDesc.synthesizeFD(count: 256)
+            delegate?.dataAvailable(host: self, data: fd)
+            let path = rfmLSNToPath[lsn] ?? "unknown"
+            log += "OP_RFM_GETSTT_FDInf(lsn=0x\(String(lsn, radix: 16)), path=\(path))\n"
+            print("OP_RFM_GETSTT_FDInf(lsn=0x\(String(lsn, radix: 16)), path=\(path))")
             resetState()
-
-            return result
+            return 4
         }
-
-        var result = 0
-        let expectedCount = 5
-        
-        if data.count >= expectedCount {
-            pathDescriptorAddress = Int(data[0]) * 256 + Int(data[1])
-            pathNumber = Int(data[2])
-            bytesToRead = Int(data[3]) * 256 + Int(data[4])
-            result = expectedCount
-            
-            // Get number of bytes to read from file on this path.
-            
-            // Send the response code to the guest.
-            // Format of response:
-            // - 1 byte: error code
-            // - 2 bytes: length of valid data
-            (errorCode, dataToSend) = rfmPathDescriptor.readLineFromFile(offset: 0, maximumCount: bytesToRead)
-            delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            delegate?.dataAvailable(host: self, data: Data([UInt8((dataToSend.count >> 8) & 0xFF), UInt8(dataToSend.count & 0xFF)]))
-            if errorCode == 0 {
-                processor = OPRFMREADP2
-            } else {
-                resetState()
-            }
-        }
-        
-        return result
     }
 
-    private func OPRFMWRITLN(data : Data) -> Int {
-        var result = 1
-        return result
+    // Receives nothing (rfm.asm sendit only sends the sub-op). No response.
+    private func OPRFMSETSTT(data: Data) -> Int {
+        print("OP_RFM_SETSTT")
+        resetState()
+        return 0
     }
 
-    // Perform a GetStat on behalf of the client.
-    //
-    // Format of command from the client at this point
-    // - 1 byte:  Process ID
-    // - 1 byte:  Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 2 bytes: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 1 byte:  GetStat code
-    //
-    // Responses from the host depend upon the GetStat code.
-    private func OPRFMGETSTT(data : Data) -> Int {
+    // Receives: path#(1). Sends back: 1-byte error code.
+    // Receives: path#(1). Sends back: 1-byte error code.
+    // If the path was opened via CREATE, the shell closes its reference after
+    // forking the child writer — keep the descriptor alive for incoming writes.
+    private func OPRFMCLOSE(data: Data) -> Int {
         var result = 0
-        let expectedCount = 4
-        var errorCode : UInt8 = 0
+        let expectedCount = 1
 
         if data.count >= expectedCount {
-            rfmPathDescriptor.pathDescriptorAddress = Int(data[0]) * 256 + Int(data[1])
-            rfmPathDescriptor.pathNumber = Int(data[2])
-            let statCode = Int(data[3])
-            
-            switch statCode {
-            case 2:
-                // return file size
-                let count = rfmPathDescriptor.fileContents.count
-                delegate?.dataAvailable(host: self, data: Data([errorCode, UInt8((count & 0xFF000000) >> 24), UInt8((count & 0x00FF0000) >> 16), UInt8((count & 0x0000FF00) >> 8), UInt8((count & 0x000000FF) >> 0)]))
-                log = log + "OP_RFM_GETSTAT(SS.Size) -> R$B=\(errorCode), R$X=\((count & 0xFFFF0000) >> 16), R$U=\((count & 0x0000FFFF) >> 0)\n"
-                
-            default:
-                log = log + "OP_RFM_GETSTAT(\(statCode))\n"
-            }
-            
+            let pathNumber = Int(data[0])
+            rfmPaths[pathNumber]?.localFile?.closeFile()
+            rfmPaths.removeValue(forKey: pathNumber)
             result = expectedCount
+            delegate?.dataAvailable(host: self, data: Data([0x00]))
             resetState()
+            log += "OP_RFM_CLOSE(path#\(pathNumber))\n"
+            print("OP_RFM_CLOSE(path#\(pathNumber))")
         }
-        
-        return result
-    }
 
-    // Perform a SetStat on behalf of the client.
-    //
-    // Format of command from the client at this point
-    // - 1 byte:  Process ID
-    // - 1 byte:  Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 2 bytes: Path descriptor address (we use this as part of a unique identifier for this path)
-    // - 1 byte:  SetStat code
-    //
-    // Responses from the host depend upon the SetStat code.
-    private func OPRFMSETSTT(data : Data) -> Int {
-        var result = 0
-        let expectedCount = 4
-        var errorCode : UInt8 = 0
-
-        if data.count >= expectedCount {
-            rfmPathDescriptor.pathDescriptorAddress = Int(data[0]) * 256 + Int(data[1])
-            rfmPathDescriptor.pathNumber = Int(data[2])
-            let statCode = Int(data[3])
-            
-            result = expectedCount
-            resetState()
-            delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            log = log + "OP_RFM_SETSTAT(\(statCode))\n"
-        }
-        
-        return result
-    }
-
-    // Perform a close on behalf of the client.
-    //
-    // Format of command from the client at this point
-    // - 1 byte:  Process ID
-    // - 1 byte:  Path number (0-15; we use this as part of a unique identifier for this path)
-    // - 2 bytes: Path descriptor address (we use this as part of a unique identifier for this path)
-    //
-    // The host responds with a single error code.
-    private func OPRFMCLOSE(data : Data) -> Int {
-        var result = 0
-        let expectedCount = 4
-        var errorCode : UInt8 = 0
-        
-        if data.count >= expectedCount {
-            let processID = Int(data[0])
-            let pathNumber = Int(data[1])
-            let pathDescriptorAddress = Int(data[2]) * 256 + Int(data[3])
-            
-            result = expectedCount
-
-            errorCode = 0
-            delegate?.dataAvailable(host: self, data: Data([errorCode]))
-
-            resetState()
-        }
-        
         return result
     }
 
@@ -1647,7 +2612,8 @@ extension DriveWireHost {
                 
                 // Send the response code to the guest.
                 delegate?.dataAvailable(host: self, data: Data([UInt8(error)]))
-                
+                let msg = "OP_READEX(drive=\(statistics.lastDriveNumber), lsn=0x\(String(statistics.lastLSN, radix: 16))) -> \(error)"
+                reportActivity(msg, isFrequent: true, isError: error != DriveWireProtocolError.E_NONE.rawValue)
                 // Reset the state machine.
                 resetState()
             }
@@ -1676,9 +2642,13 @@ extension DriveWireHost {
 
             // We read 5 bytes into this buffer (OP_READEX, 1 byte drive number, 3 byte LSN)
             result = 5;
-            
-            // Check if the drive number exists in our virtual drive list.
-            if let virtualDrive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) {
+
+            // Check if this LSN belongs to a synthesized RFM file descriptor.
+            if let hostPath = rfmLSNToPath[vLSN] {
+                var tempDesc = RFMPathDescriptor()
+                tempDesc.attributes = (try? FileManager.default.attributesOfItem(atPath: hostPath)) ?? [:]
+                sectorBuffer = tempDesc.synthesizeFD(count: 256)
+            } else if let virtualDrive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) {
                 // It exists! Read sector from disk image.
                 statistics.lastDriveNumber = driveNumber
                 statistics.readCount = statistics.readCount + 1
@@ -1688,8 +2658,6 @@ extension DriveWireHost {
                 // It doesn't exist. Set the error code.
                 error = DriveWireProtocolError.E_UNIT.rawValue
             }
-
-            // Send the error code
             delegate?.dataAvailable(host: self, data: Data([UInt8(error)]))
             
             // If we have an OK response, we send the sector and checksum.
@@ -1757,14 +2725,14 @@ extension Data {
 extension DriveWireHost {
     /// A representation of a storage device.
     public class VirtualDrive : Codable {
-        
+        enum CodingKeys: String, CodingKey {
+            case driveNumber
+            case imagePath
+            case bookmarkData
+        }
+
         func didReceive(changes: String) {
-            do {
-                let u = URL(fileURLWithPath: self.imagePath)
-                self.storageContainer = try Data(contentsOf:u)
-            } catch {
-                print(error)
-            }
+            reload()
         }
         
         /// The drive number for this drive.
@@ -1775,6 +2743,7 @@ extension DriveWireHost {
         
         private var bookmarkData = Data()
         private var storageContainer = Data()
+        private var isStorageLoaded = false
         
         /// Creates a new virtual drive.
         ///
@@ -1791,10 +2760,20 @@ extension DriveWireHost {
         public func reload() {
             do {
                 let u = URL(fileURLWithPath: self.imagePath)
-                self.storageContainer = try Data(contentsOf:u)
+                self.storageContainer = try Data(contentsOf: u)
+                self.isStorageLoaded = true
             } catch {
+                self.storageContainer = Data()
+                self.isStorageLoaded = false
                 print(error)
             }
+        }
+
+        private func ensureStorageLoaded() {
+            guard !isStorageLoaded, !imagePath.isEmpty else {
+                return
+            }
+            reload()
         }
         
         /// Reads a 256 byte sector from a virtual disk.
@@ -1805,6 +2784,8 @@ extension DriveWireHost {
         /// - Parameters:
         ///     - lsn: The logical sector number to read.
         public func readSector(lsn : Int) -> (Int, Data) {
+            ensureStorageLoaded()
+
             // Seek to the offset in the file represented by the URL.
             let offsetStart = lsn * 256
             let offsetEnd = offsetStart + 256
@@ -1829,6 +2810,8 @@ extension DriveWireHost {
         ///     - lsn: The logical sector number to write.
         ///     - sector: The 256-byte sector to write.
         public func writeSector(lsn : Int, sector : Data) -> Int {
+            ensureStorageLoaded()
+
             // Seek to the offset in the file represented by the URL.
             let offsetStart = lsn * 256
             let offsetEnd = offsetStart + 256
@@ -1841,7 +2824,36 @@ extension DriveWireHost {
                 storageContainer[range] = sector
             }
 
+            isStorageLoaded = true
             return DriveWireProtocolError.E_NONE.rawValue
+        }
+
+        public func save(to path: String? = nil) throws {
+            ensureStorageLoaded()
+            let destination = path ?? imagePath
+            guard !destination.isEmpty else {
+                throw CocoaError(.fileNoSuchFile)
+            }
+            try storageContainer.write(to: URL(fileURLWithPath: destination), options: .atomic)
+            if let path {
+                imagePath = path
+            }
+        }
+
+        public required init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            self.driveNumber = try values.decode(Int.self, forKey: .driveNumber)
+            self.imagePath = try values.decode(String.self, forKey: .imagePath)
+            self.bookmarkData = try values.decodeIfPresent(Data.self, forKey: .bookmarkData) ?? Data()
+            self.storageContainer = Data()
+            self.isStorageLoaded = false
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(driveNumber, forKey: .driveNumber)
+            try container.encode(imagePath, forKey: .imagePath)
+            try container.encode(bookmarkData, forKey: .bookmarkData)
         }
     }
 }

@@ -11,16 +11,13 @@
 		6809D2E02B25410F0092A869 /* DriveWire.docc in Sources */ = {isa = PBXBuildFile; fileRef = 686E2FC42AC8A5B200F94CFD /* DriveWire.docc */; };
 		6818E5A12AC9D5E200A6C300 /* DriveWireHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6818E5A02AC9D5E200A6C300 /* DriveWireHost.swift */; };
 		6818E5A22AC9D6A200A6C300 /* DriveWireHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6818E5A02AC9D5E200A6C300 /* DriveWireHost.swift */; };
-		CAFE0001CAFE0001CAFE0001 /* VirtualChannel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFE0000CAFE0000CAFE0000 /* VirtualChannel.swift */; };
-		CAFE0011CAFE0011CAFE0011 /* DriveWireTCPServerDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFE0010CAFE0010CAFE0010 /* DriveWireTCPServerDriver.swift */; };
-		CAFE0012CAFE0012CAFE0012 /* DriveWireTCPServerDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFE0010CAFE0010CAFE0010 /* DriveWireTCPServerDriver.swift */; };
-		CAFE0013CAFE0013CAFE0013 /* DriveWireTCPServerDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFE0010CAFE0010CAFE0010 /* DriveWireTCPServerDriver.swift */; };
-		CAFE0002CAFE0002CAFE0002 /* VirtualChannel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFE0000CAFE0000CAFE0000 /* VirtualChannel.swift */; };
-		CAFE0003CAFE0003CAFE0003 /* VirtualChannel.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFE0000CAFE0000CAFE0000 /* VirtualChannel.swift */; };
 		6818E8112AC7786C00CD3A16 /* CocoaLumberjack in Frameworks */ = {isa = PBXBuildFile; productRef = 6818E8102AC7786C00CD3A16 /* CocoaLumberjack */; };
 		6818E8132AC7786C00CD3A16 /* CocoaLumberjackSwift in Frameworks */ = {isa = PBXBuildFile; productRef = 6818E8122AC7786C00CD3A16 /* CocoaLumberjackSwift */; };
 		6818E8152AC7786C00CD3A16 /* CocoaLumberjackSwiftLogBackend in Frameworks */ = {isa = PBXBuildFile; productRef = 6818E8142AC7786C00CD3A16 /* CocoaLumberjackSwiftLogBackend */; };
 		683743302E001C03003BCE8D /* DriveWireTCPDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6837432F2E001C03003BCE8D /* DriveWireTCPDriver.swift */; };
+		CAFE0011CAFE0011CAFE0011 /* DriveWireTCPServerDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFE0010CAFE0010CAFE0010 /* DriveWireTCPServerDriver.swift */; };
+		CAFE0012CAFE0012CAFE0012 /* DriveWireTCPServerDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFE0010CAFE0010CAFE0010 /* DriveWireTCPServerDriver.swift */; };
+		CAFE0013CAFE0013CAFE0013 /* DriveWireTCPServerDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAFE0010CAFE0010CAFE0010 /* DriveWireTCPServerDriver.swift */; };
 		683743312E001C03003BCE8D /* DriveWireTCPDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6837432F2E001C03003BCE8D /* DriveWireTCPDriver.swift */; };
 		686E2FC52AC8A5B200F94CFD /* DriveWire.docc in Sources */ = {isa = PBXBuildFile; fileRef = 686E2FC42AC8A5B200F94CFD /* DriveWire.docc */; };
 		689F4F1B2BAF2086000FED7D /* LEDView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 689F4F1A2BAF2086000FED7D /* LEDView.swift */; };
@@ -63,9 +60,8 @@
 /* Begin PBXFileReference section */
 		68015B842AD470CB00AB717A /* drivewire-cli.xctestplan */ = {isa = PBXFileReference; lastKnownFileType = text; path = "drivewire-cli.xctestplan"; sourceTree = "<group>"; };
 		6818E5A02AC9D5E200A6C300 /* DriveWireHost.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = DriveWireHost.swift; sourceTree = "<group>"; };
-		CAFE0000CAFE0000CAFE0000 /* VirtualChannel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VirtualChannel.swift; sourceTree = "<group>"; };
-		CAFE0010CAFE0010CAFE0010 /* DriveWireTCPServerDriver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveWireTCPServerDriver.swift; sourceTree = "<group>"; };
 		6837432F2E001C03003BCE8D /* DriveWireTCPDriver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveWireTCPDriver.swift; sourceTree = "<group>"; };
+		CAFE0010CAFE0010CAFE0010 /* DriveWireTCPServerDriver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveWireTCPServerDriver.swift; sourceTree = "<group>"; };
 		686E2FC42AC8A5B200F94CFD /* DriveWire.docc */ = {isa = PBXFileReference; lastKnownFileType = folder.documentationcatalog; path = DriveWire.docc; sourceTree = "<group>"; };
 		689F4F1A2BAF2086000FED7D /* LEDView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LEDView.swift; sourceTree = "<group>"; };
 		68A4A0CB2AC723290041F161 /* DriveWire.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DriveWire.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -186,7 +182,6 @@
 			isa = PBXGroup;
 			children = (
 				6818E5A02AC9D5E200A6C300 /* DriveWireHost.swift */,
-				CAFE0000CAFE0000CAFE0000 /* VirtualChannel.swift */,
 			);
 			path = Model;
 			sourceTree = "<group>";
@@ -345,14 +340,13 @@
 			files = (
 				68A4A0D12AC723290041F161 /* DriveWireDocument.swift in Sources */,
 				6818E5A12AC9D5E200A6C300 /* DriveWireHost.swift in Sources */,
-				CAFE0001CAFE0001CAFE0001 /* VirtualChannel.swift in Sources */,
-				CAFE0011CAFE0011CAFE0011 /* DriveWireTCPServerDriver.swift in Sources */,
 				68A4A0CF2AC723290041F161 /* DriveWireApp.swift in Sources */,
 				68A4A0D32AC723290041F161 /* ContentView.swift in Sources */,
 				68A4A0EF2AC723820041F161 /* DriveWireSerialDriver.swift in Sources */,
 				689F4F1B2BAF2086000FED7D /* LEDView.swift in Sources */,
 				686E2FC52AC8A5B200F94CFD /* DriveWire.docc in Sources */,
 				683743302E001C03003BCE8D /* DriveWireTCPDriver.swift in Sources */,
+				CAFE0011CAFE0011CAFE0011 /* DriveWireTCPServerDriver.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -361,9 +355,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				6818E5A22AC9D6A200A6C300 /* DriveWireHost.swift in Sources */,
-				CAFE0002CAFE0002CAFE0002 /* VirtualChannel.swift in Sources */,
-				CAFE0012CAFE0012CAFE0012 /* DriveWireTCPServerDriver.swift in Sources */,
 				68A4A0E72AC723670041F161 /* DriveWireTests.swift in Sources */,
+				CAFE0012CAFE0012CAFE0012 /* DriveWireTCPServerDriver.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -372,10 +365,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				683743312E001C03003BCE8D /* DriveWireTCPDriver.swift in Sources */,
+				CAFE0013CAFE0013CAFE0013 /* DriveWireTCPServerDriver.swift in Sources */,
 				68A842102AD329B6009BE6D3 /* main.swift in Sources */,
 				68A842142AD3329A009BE6D3 /* DriveWireHost.swift in Sources */,
-				CAFE0003CAFE0003CAFE0003 /* VirtualChannel.swift in Sources */,
-				CAFE0013CAFE0013CAFE0013 /* DriveWireTCPServerDriver.swift in Sources */,
 				6809D2E02B25410F0092A869 /* DriveWire.docc in Sources */,
 				68A842152AD3329D009BE6D3 /* DriveWireSerialDriver.swift in Sources */,
 			);
@@ -533,7 +525,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 26;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.boisypitre.DriveWire;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -561,7 +553,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 26;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.boisypitre.DriveWire;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -576,7 +568,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.1;
+				MACOSX_DEPLOYMENT_TARGET = 26;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.boisypitre.DriveWire.Tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -592,7 +584,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.1;
+				MACOSX_DEPLOYMENT_TARGET = 26;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.boisypitre.DriveWire.Tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -607,7 +599,7 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
-				MACOSX_DEPLOYMENT_TARGET = 14.6;
+				MACOSX_DEPLOYMENT_TARGET = 26;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_VERSION = 5.0;
@@ -619,7 +611,7 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
-				MACOSX_DEPLOYMENT_TARGET = 14.6;
+				MACOSX_DEPLOYMENT_TARGET = 26;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 5.0;
