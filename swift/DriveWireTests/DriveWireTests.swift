@@ -6,6 +6,7 @@
 //
 
 import XCTest
+import Network
 
 final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
     var host : DriveWireHost?
@@ -26,7 +27,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         do {
             try host!.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
             try host!.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
-        } catch DriveWireError.driveAlreadyExists {
+        } catch DriveWireHostError.driveAlreadyExists {
             host!.ejectVirtualDisk(driveNumber: 0)
         }
     }
@@ -41,7 +42,10 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         expectation = XCTestExpectation(description: "Waiting for response")
         host!.send(data: &s)
         let _ = XCTWaiter.wait(for: [expectation!], timeout: 5.0)
-        let expectedResult = 0x00
+        // A non-zero response is required: the NitrOS-9 driver treats a zero
+        // (or missing) response as a DW3 server and disables its DW4
+        // extensions, including the virtual serial channel poller.
+        let expectedResult = 0xFF
         let actualResult = read(bytes: 1)[0]
         XCTAssert(actualResult == expectedResult, "Error: result should be \(expectedResult), but was \(actualResult)")
     }
@@ -148,6 +152,176 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         } catch {
             return (244, Data())
         }
+    }
+
+    func testSerialChannelOpensAndCloses() throws {
+        var open = Data([host!.OPSERINIT, 1])
+        host!.send(data: &open)
+        XCTAssertTrue(host!.virtualChannels[1].isOpen)
+        var close = Data([host!.OPSERTERM, 1])
+        host!.send(data: &close)
+        XCTAssertFalse(host!.virtualChannels[1].isOpen)
+    }
+
+    func testSerialSetStatOpensAndCloses() throws {
+        var open = Data([host!.OPSERSETSTAT, 2, 0x29])
+        host!.send(data: &open)
+        XCTAssertTrue(host!.virtualChannels[2].isOpen)
+        var close = Data([host!.OPSERSETSTAT, 2, 0x2A])
+        host!.send(data: &close)
+        XCTAssertFalse(host!.virtualChannels[2].isOpen)
+    }
+
+    func testSerialSetStatComStConsumes29Bytes() throws {
+        // SS.ComSt carries a 26-byte device descriptor. If the processor
+        // miscounts, the trailing SERINIT below lands mid-stream and channel 3
+        // never opens -- this asserts the stream stays in sync.
+        var payload = Data([host!.OPSERSETSTAT, 0, 0x28])
+        payload.append(Data(repeating: 0xAA, count: 26))
+        payload.append(Data([host!.OPSERINIT, 3]))
+        host!.send(data: &payload)
+        XCTAssertTrue(host!.virtualChannels[3].isOpen)
+    }
+
+    var channelData : [UInt8: Data] = [:]
+
+    func channelDataAvailable(host: DriveWireHost, channel: UInt8, data: Data) {
+        channelData[channel, default: Data()].append(data)
+    }
+
+    func testSerialWriteDeliversByte() throws {
+        var s = Data([host!.OPSERINIT, 1, host!.OPSERWRITE, 1, 0x42])
+        host!.send(data: &s)
+        XCTAssertEqual(channelData[1], Data([0x42]))
+    }
+
+    func testSerialWriteMultipleDeliversBytes() throws {
+        var s = Data([host!.OPSERINIT, 5, host!.OPSERWRITEM, 5, 3, 0x41, 0x42, 0x43])
+        host!.send(data: &s)
+        XCTAssertEqual(channelData[5], Data([0x41, 0x42, 0x43]))
+    }
+
+    func testFastwriteDeliversByte() throws {
+        var s = Data([host!.OPSERINIT, 0, 0x80, 0x43])
+        host!.send(data: &s)
+        XCTAssertEqual(channelData[0], Data([0x43]))
+    }
+
+    func testFastwriteSplitAcrossSends() throws {
+        // The opcode and its operand arriving in separate reads must not desync.
+        var first = Data([host!.OPSERINIT, 0, 0x80])
+        host!.send(data: &first)
+        var second = Data([0x44])
+        host!.send(data: &second)
+        XCTAssertEqual(channelData[0], Data([0x44]))
+    }
+
+    func testWriteToClosedChannelIsDropped() throws {
+        var s = Data([host!.OPSERWRITE, 9, 0x42])
+        host!.send(data: &s)
+        XCTAssertNil(channelData[9])
+    }
+
+    func testSerialReadNothingWaiting() throws {
+        var s = Data([host!.OPSERREAD])
+        host!.send(data: &s)
+        XCTAssertEqual(read(bytes: 2), Data([0, 0]))
+    }
+
+    func testSerialReadSingleByte() throws {
+        var open = Data([host!.OPSERINIT, 1])
+        host!.send(data: &open)
+        host!.writeToChannel(Data([0x21]), channel: 1)
+        var s = Data([host!.OPSERREAD])
+        host!.send(data: &s)
+        // Response byte 1 = channel + 1, byte 2 = the data byte.
+        XCTAssertEqual(read(bytes: 2), Data([2, 0x21]))
+    }
+
+    func testSerialReadBulkThenReadM() throws {
+        var open = Data([host!.OPSERINIT, 1])
+        host!.send(data: &open)
+        host!.writeToChannel(Data("mdir\r".utf8), channel: 1)
+        var poll = Data([host!.OPSERREAD])
+        host!.send(data: &poll)
+        // Byte 1 = channel + 17, byte 2 = waiting count.
+        XCTAssertEqual(read(bytes: 2), Data([18, 5]))
+        var readm = Data([host!.OPSERREADM, 1, 5])
+        host!.send(data: &readm)
+        XCTAssertEqual(read(bytes: 5), Data("mdir\r".utf8))
+        var poll2 = Data([host!.OPSERREAD])
+        host!.send(data: &poll2)
+        XCTAssertEqual(read(bytes: 2), Data([0, 0]))
+    }
+
+    func testSerialReadMOverRequestSendsNothing() throws {
+        var open = Data([host!.OPSERINIT, 1])
+        host!.send(data: &open)
+        host!.writeToChannel(Data([0x01]), channel: 1)
+        var readm = Data([host!.OPSERREADM, 1, 200])
+        host!.send(data: &readm)
+        XCTAssertEqual(responseData.count, 0)
+    }
+
+    func testHostCloseReportedInPoll() throws {
+        var open = Data([host!.OPSERINIT, 4])
+        host!.send(data: &open)
+        host!.closeChannel(4)
+        var poll = Data([host!.OPSERREAD])
+        host!.send(data: &poll)
+        // Byte 1 = 16 (status), byte 2 high nibble 0 = closed, low nibble = channel.
+        XCTAssertEqual(read(bytes: 2), Data([16, 4]))
+        XCTAssertFalse(host!.virtualChannels[4].isOpen)
+    }
+
+    func testSerialReadRoundRobinFairness() throws {
+        var open = Data([host!.OPSERINIT, 1, host!.OPSERINIT, 2])
+        host!.send(data: &open)
+        host!.writeToChannel(Data([0x41]), channel: 1)
+        host!.writeToChannel(Data([0x42]), channel: 2)
+        var poll = Data([host!.OPSERREAD])
+        host!.send(data: &poll)
+        let first = read(bytes: 2)
+        var poll2 = Data([host!.OPSERREAD])
+        host!.send(data: &poll2)
+        let second = read(bytes: 2)
+        XCTAssertEqual(Set([first[0], second[0]]), Set([UInt8(2), UInt8(3)]))
+    }
+
+    func testTCPServerLoopback() throws {
+        let driver = DriveWireTCPServerDriver(beckerPort: 62504, channelPortBase: 62810, bridgedChannelCount: 2)
+        driver.logging = false
+        try driver.start()
+
+        let guest = NWConnection(host: "127.0.0.1", port: 62504, using: .tcp)
+        let responded = XCTestExpectation(description: "OP_DWINIT answered over TCP")
+        guest.stateUpdateHandler = { state in
+            if case .ready = state {
+                guest.send(content: Data([0x5A, 0x01]), completion: .contentProcessed { _ in })
+                guest.receive(minimumIncompleteLength: 1, maximumLength: 16) { content, _, _, _ in
+                    XCTAssertEqual(content?.first, 0xFF)
+                    responded.fulfill()
+                }
+            }
+        }
+        guest.start(queue: .global())
+        wait(for: [responded], timeout: 5.0)
+        guest.cancel()
+        driver.stop()
+    }
+
+    func testSerialWriteMBootNoiseStaysInSync() throws {
+        // The NitrOS-9 EOU boot emits bare $64 $00 pairs (SERWRITEM naming
+        // never-opened channel 0, with no count or payload). Servers must
+        // consume exactly 2 bytes for these; reading a count byte desyncs
+        // the whole stream on every boot.
+        var noise = Data()
+        for _ in 0..<20 {
+            noise.append(contentsOf: [host!.OPSERWRITEM, 0])
+        }
+        noise.append(contentsOf: [host!.OPSERINIT, 1])
+        host!.send(data: &noise)
+        XCTAssertTrue(host!.virtualChannels[1].isOpen)
     }
 
     func testPerformanceExample() throws {

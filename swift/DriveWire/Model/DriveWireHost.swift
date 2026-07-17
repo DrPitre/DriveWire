@@ -20,6 +20,19 @@ public protocol DriveWireDelegate {
     
     /// Informs the delegate that a DriveWire transaction completed.
     func transactionCompleted(opCode : UInt8)
+
+    /// Informs the delegate that a virtual serial channel has data from the guest.
+    ///
+    /// - Parameters:
+    ///     - host: The DriveWire host object.
+    ///     - channel: The virtual serial channel number (0-14).
+    ///     - data: The bytes the guest wrote to the channel.
+    func channelDataAvailable(host : DriveWireHost, channel : UInt8, data : Data)
+}
+
+public extension DriveWireDelegate {
+    /// A default so delegates that don't serve virtual serial channels compile unchanged.
+    func channelDataAvailable(host : DriveWireHost, channel : UInt8, data : Data) {}
 }
 
 /// Statistical information about the host.
@@ -90,6 +103,12 @@ public class DriveWireHost : Codable {
     public var currentSubTransaction : UInt8 = 0
     /// An array of virtual drives.
     public var virtualDrives : [VirtualDrive] = []
+
+    /// The virtual serial channels, indexed by channel number (0-14).
+    ///
+    /// Channel state is runtime-only and deliberately not part of the
+    /// document's `Codable` representation.
+    public var virtualChannels : [VirtualChannel] = (0..<15).map { VirtualChannel(channelNumber: UInt8($0)) }
     
     /// The guest's capability byte sent from ``OPDWINIT``.
     private var guestCapabilityByte : UInt8 = 0x00
@@ -570,9 +589,12 @@ public class DriveWireHost : Codable {
         if data.count >= expectedCount {
             // Save capabilities byte.
             guestCapabilityByte = data[1]
-            
-            // Send the host capabilities byte.
-            delegate?.dataAvailable(host: self, data: Data([0x00]))
+
+            // Send the host capabilities byte. This must be non-zero: the
+            // NitrOS-9 driver interprets a zero (or absent) response as a DW3
+            // server and disables its DW4 extensions, including the virtual
+            // serial channel poller.
+            delegate?.dataAvailable(host: self, data: Data([0xFF]))
             result = expectedCount
             
             // Reset the state machine.
@@ -851,72 +873,211 @@ public class DriveWireHost : Codable {
         return 1
     }
     
+    /// Returns the virtual serial channel for a wire channel number.
+    ///
+    /// Returns `nil` for numbers outside 0-14; the 128-142 range is the
+    /// unimplemented VWindow space.
+    private func vserialChannel(_ number : UInt8) -> VirtualChannel? {
+        guard Int(number) < virtualChannels.count else { return nil }
+        return virtualChannels[Int(number)]
+    }
+
     private func OP_SERINIT(data : Data) -> Int {
+        let expectedCount = 2
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERINIT
         resetState()
+        vserialChannel(data[1])?.open()
+        log = log + "OP_SERINIT(\(data[1]))" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
-    
+
     private func OP_SERTERM(data : Data) -> Int {
+        let expectedCount = 2
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERTERM
         resetState()
+        vserialChannel(data[1])?.close()
+        log = log + "OP_SERTERM(\(data[1]))" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
     
+    /// Round-robin cursor so one busy channel can't starve the others.
+    private var nextPollChannel = 0
+    /// Host-side closes not yet reported to the guest via SERREAD.
+    private var pendingClosedChannels : [UInt8] = []
+
+    /// Queues data for the guest to read from a virtual channel.
+    ///
+    /// The guest collects queued bytes with its normal OP_SERREAD polling.
+    /// Bytes queued while the channel is closed are discarded when the guest
+    /// opens it (opening clears the queue), so callers should only write to
+    /// channels the guest has opened.
+    ///
+    /// - Parameters:
+    ///     - data: The bytes to queue.
+    ///     - channel: The virtual serial channel number (0-14).
+    public func writeToChannel(_ data : Data, channel : UInt8) {
+        vserialChannel(channel)?.inputQueue.append(data)
+    }
+
+    /// Closes a channel from the host side.
+    ///
+    /// The guest is informed through a status byte in its next OP_SERREAD poll.
+    ///
+    /// - Parameters:
+    ///     - channel: The virtual serial channel number (0-14).
+    public func closeChannel(_ channel : UInt8) {
+        guard let ch = vserialChannel(channel) else { return }
+        ch.close()
+        pendingClosedChannels.append(channel)
+    }
+
+    /// Builds the two-byte OP_SERREAD/POLL response described in the specification.
+    private func serialReadResponse() -> Data {
+        // Closed-channel notifications take priority over data.
+        if pendingClosedChannels.isEmpty == false {
+            let closed = pendingClosedChannels.removeFirst()
+            return Data([16, closed])
+        }
+        // Round-robin scan for an open channel with waiting data.
+        for offset in 0..<virtualChannels.count {
+            let ch = virtualChannels[(nextPollChannel + offset) % virtualChannels.count]
+            guard ch.isOpen, ch.inputQueue.isEmpty == false else { continue }
+            nextPollChannel = (Int(ch.channelNumber) + 1) % virtualChannels.count
+            if ch.inputQueue.count == 1 {
+                // A single interactive byte rides along in the response itself.
+                let byte = ch.inputQueue.removeFirst()
+                return Data([ch.channelNumber + 1, byte])
+            }
+            // More is waiting: advertise the count for an OP_SERREADM fetch.
+            return Data([ch.channelNumber + 17, UInt8(min(ch.inputQueue.count, 255))])
+        }
+        return Data([0, 0])
+    }
+
     private func OP_SERREAD(data : Data) -> Int {
         currentTransaction = OPSERREAD
         resetState()
-        delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
+        delegate?.dataAvailable(host: self, data: serialReadResponse())
+        delegate?.transactionCompleted(opCode: currentTransaction)
         return 1
     }
-    
+
     private func OP_SERREADM(data : Data) -> Int {
+        let expectedCount = 3
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERREADM
         resetState()
+        let requested = Int(data[2])
+        if let ch = vserialChannel(data[1]), ch.inputQueue.count >= requested {
+            let bytes = Data(ch.inputQueue.prefix(requested))
+            ch.inputQueue.removeFirst(requested)
+            delegate?.dataAvailable(host: self, data: bytes)
+        } else {
+            // Per the specification, over-asking is a guest error; the server
+            // deliberately sends nothing and lets the guest's read time out.
+            log = log + "OP_SERREADM over-request on channel \(data[1])" + "\n"
+        }
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
     
+    /// Routes bytes the guest wrote to a channel out to the delegate.
+    private func deliverGuestBytes(_ bytes : Data, channel : UInt8) {
+        guard let ch = vserialChannel(channel), ch.isOpen else {
+            log = log + "serial write to closed or invalid channel \(channel)" + "\n"
+            return
+        }
+        delegate?.channelDataAvailable(host: self, channel: channel, data: bytes)
+    }
+
     private func OP_SERWRITE(data : Data) -> Int {
+        let expectedCount = 3
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERWRITE
         resetState()
+        deliverGuestBytes(Data([data[2]]), channel: data[1])
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
-    
+
     private func OP_SERWRITEM(data : Data) -> Int {
+        guard data.count >= 2 else { return 0 }
+        // The NitrOS-9 boot sequence emits bare $64 $00 pairs (naming a
+        // never-opened channel, with no count or payload). Consume exactly
+        // two bytes for a SERWRITEM naming an unopened channel -- reading a
+        // count byte here desyncs the stream on every boot.
+        if vserialChannel(data[1])?.isOpen != true {
+            currentTransaction = OPSERWRITEM
+            resetState()
+            log = log + "OP_SERWRITEM to unopened channel \(data[1]) ignored" + "\n"
+            delegate?.transactionCompleted(opCode: currentTransaction)
+            return 2
+        }
+        guard data.count >= 3 else { return 0 }
+        let expectedCount = 3 + Int(data[2])
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERWRITEM
         resetState()
+        deliverGuestBytes(data.subdata(in: 3..<expectedCount), channel: data[1])
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
     
     private func OP_SERGETSTAT(data : Data) -> Int {
+        let expectedCount = 3
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERGETSTAT
         resetState()
+        // Logging only, per the specification.
+        log = log + "OP_SERGETSTAT(\(data[1]),\(data[2]))" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
-    
+
     private func OP_SERSETSTAT(data : Data) -> Int {
+        let ssComSt : UInt8 = 0x28, ssOpen : UInt8 = 0x29, ssClose : UInt8 = 0x2A
+        guard data.count >= 3 else { return 0 }
+        // SS.ComSt carries a 26-byte device descriptor after the code byte.
+        let expectedCount = data[2] == ssComSt ? 29 : 3
+        guard data.count >= expectedCount else { return 0 }
         currentTransaction = OPSERSETSTAT
         resetState()
+        switch data[2] {
+        case ssOpen:
+            vserialChannel(data[1])?.open()
+        case ssClose:
+            vserialChannel(data[1])?.close()
+        default:
+            break
+        }
+        log = log + "OP_SERSETSTAT(\(data[1]),\(data[2]))" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
     
     private func OP_FASTWRITE_Serial(data : Data) -> Int {
+        let expectedCount = 2
+        guard data.count >= expectedCount else { return 0 }
+        currentTransaction = data[0]
         resetState()
+        deliverGuestBytes(Data([data[1]]), channel: fastwriteChannel)
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
-    
+
     private func OP_FASTWRITE_Screen(data : Data) -> Int {
+        let expectedCount = 2
+        guard data.count >= expectedCount else { return 0 }
+        currentTransaction = data[0]
         resetState()
+        // VWindow channels are not implemented; consume correctly and log.
+        log = log + "OP_FASTWRITE_Screen(\(fastwriteChannel)) unsupported" + "\n"
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return expectedCount
     }
     
     private func OP_RFM(data : Data) -> Int {
