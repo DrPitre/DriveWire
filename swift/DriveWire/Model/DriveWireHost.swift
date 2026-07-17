@@ -953,17 +953,21 @@ public class DriveWireHost : Codable {
                 resetState()
                 result = nameLength;
 
-                // determine if a named object with this name already exists
-                if let name = Self.decodedNameObjectPath(from: data, length: nameLength),
-                   let _ = findVirtualDisk(name: name) {
-                    response = 0
-                } else if let name = Self.decodedNameObjectPath(from: data, length: nameLength) {
-                    let nextFreeDrive = findAvailableVirtualDrive()
-                    do {
-                        try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
-                        response = UInt8(nextFreeDrive);
-                    } catch {
-
+                // Create fails if the object already exists, whether or not it's currently mounted.
+                if let name = Self.decodedNameObjectPath(from: data, length: nameLength) {
+                    if findVirtualDisk(name: name) != nil || FileManager.default.fileExists(atPath: name) {
+                        response = 0
+                    } else if FileManager.default.createFile(atPath: name, contents: nil) {
+                        let nextFreeDrive = findAvailableVirtualDrive()
+                        do {
+                            try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
+                            response = UInt8(nextFreeDrive);
+                        } catch {
+                            try? FileManager.default.removeItem(atPath: name)
+                            response = 0
+                        }
+                    } else {
+                        response = 0
                     }
                 }
                 delegate?.dataAvailable(host: self, data: Data([response]))
