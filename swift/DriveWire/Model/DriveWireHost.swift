@@ -67,6 +67,18 @@ public struct DriveWireVirtualWindow: Identifiable, Equatable {
     public var displayNumber: Int { Int(channel - 0x80) }
 }
 
+public struct DriveWireVirtualChannelStatus: Identifiable, Equatable {
+    public let channel: UInt8
+    public let number: Int
+    public let isOpen: Bool
+    public let incomingActive: Bool
+    public let outgoingActive: Bool
+    public let pendingBytes: Int
+    public let isTCPBacked: Bool
+
+    public var id: UInt8 { channel }
+}
+
 /// Manages communication with a DriveWire guest.
 ///
 /// DriveWire is a connectivity standard that defines virtual disk drive, virtual printer, and virtual serial port services. A DriveWire *host* provides these services to a *guest*. Connectivity between the host and guest occurs over a physical connection, such as a serial cable. To the guest, it appears that the host's devices are local, when they are actually virtual.
@@ -138,6 +150,17 @@ public class DriveWireHost : Codable {
     /// An array of virtual drives.
     public var virtualDrives : [VirtualDrive] = []
     public private(set) var virtualWindows: [DriveWireVirtualWindow] = []
+    public private(set) var virtualSerialChannels: [DriveWireVirtualChannelStatus] = (1...8).map {
+        DriveWireVirtualChannelStatus(
+            channel: UInt8($0),
+            number: $0,
+            isOpen: false,
+            incomingActive: false,
+            outgoingActive: false,
+            pendingBytes: 0,
+            isTCPBacked: false
+        )
+    }
     
     /// The guest's capability byte sent from ``OPDWINIT``.
     private var guestCapabilityByte : UInt8 = 0x00
@@ -160,6 +183,9 @@ public class DriveWireHost : Codable {
     private var virtualSerialTCPListeners = [UInt16: NWListener]()
     private var pendingVirtualSerialTCPConnections = [Int: PendingVirtualSerialTCPConnection]()
     private var nextVirtualSerialTCPConnectionID = 1
+    private var virtualSerialIncomingPulseTokens = [UInt8: UInt64]()
+    private var virtualSerialOutgoingPulseTokens = [UInt8: UInt64]()
+    private var nextVirtualSerialPulseToken: UInt64 = 1
     private var driveWireAPIConfig = [String: String]()
     private var virtualDriveParameters = [Int: [String: String]]()
     private var midiBackend: DriveWireMIDIBackend = DriveWireMIDIBackendFactory.makeDefault()
@@ -833,6 +859,9 @@ public class DriveWireHost : Codable {
         virtualSerialCommandBuffers.removeAll()
         pendingClosedVirtualSerialChannels.removeAll()
         clientRestartRequested = false
+        virtualSerialIncomingPulseTokens.removeAll()
+        virtualSerialOutgoingPulseTokens.removeAll()
+        nextVirtualSerialPulseToken = 1
         for connection in virtualSerialTCPConnections.values {
             connection.close()
         }
@@ -847,6 +876,7 @@ public class DriveWireHost : Codable {
         pendingVirtualSerialTCPConnections.removeAll()
         nextVirtualSerialTCPConnectionID = 1
         virtualWindows.removeAll()
+        refreshVirtualSerialChannelStatuses()
         printBuffer.removeAll()
         resetRFMState()
     }
@@ -1171,6 +1201,7 @@ public class DriveWireHost : Codable {
         guard data.count >= 2 else { return 0 }
         let ch = data[1]
         openVirtualSerialChannels.insert(ch)
+        refreshVirtualSerialChannelStatuses()
         if isVirtualWindowChannel(ch) {
             openVirtualWindow(channel: ch)
         }
@@ -1184,10 +1215,7 @@ public class DriveWireHost : Codable {
         currentTransaction = OPSERTERM
         guard data.count >= 2 else { return 0 }
         let ch = data[1]
-        openVirtualSerialChannels.remove(ch)
-        if isVirtualWindowChannel(ch) {
-            closeVirtualWindow(channel: ch)
-        }
+        retireVirtualSerialChannel(ch)
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
         let msg = "OP_SERTERM(ch=\(ch))"; log += msg + "\n"; print(msg)
@@ -1269,16 +1297,12 @@ public class DriveWireHost : Codable {
         switch code {
         case 0x29:
             openVirtualSerialChannels.insert(ch)
+            refreshVirtualSerialChannelStatuses()
             if isVirtualWindowChannel(ch) {
                 openVirtualWindow(channel: ch)
             }
         case 0x2A:
-            virtualSerialTCPConnections[ch]?.close()
-            virtualSerialTCPConnections[ch] = nil
-            openVirtualSerialChannels.remove(ch)
-            if isVirtualWindowChannel(ch) {
-                closeVirtualWindow(channel: ch)
-            }
+            retireVirtualSerialChannel(ch)
         default:
             break
         }
@@ -1297,7 +1321,7 @@ public class DriveWireHost : Codable {
         if let channel = pendingClosedVirtualSerialChannels.first,
            virtualSerialInput[channel]?.isEmpty ?? true {
             pendingClosedVirtualSerialChannels.removeFirst()
-            openVirtualSerialChannels.remove(channel)
+            retireVirtualSerialChannel(channel)
             return Data([16, channel])
         }
 
@@ -1331,10 +1355,31 @@ public class DriveWireHost : Codable {
         let response = queued.prefix(readCount)
         queued.removeFirst(readCount)
         virtualSerialInput[channel] = queued
+        pulseVirtualSerialChannel(channel, incoming: false)
+        refreshVirtualSerialChannelStatuses()
         return Data(response)
     }
 
+    private func retireVirtualSerialChannel(_ channel: UInt8) {
+        virtualSerialTCPConnections[channel]?.close()
+        virtualSerialTCPConnections[channel] = nil
+        openVirtualSerialChannels.remove(channel)
+        virtualSerialInput.removeValue(forKey: channel)
+        virtualSerialCommandBuffers.removeValue(forKey: channel)
+        pendingClosedVirtualSerialChannels.removeAll { $0 == channel }
+        virtualSerialIncomingPulseTokens.removeValue(forKey: channel)
+        virtualSerialOutgoingPulseTokens.removeValue(forKey: channel)
+        if isVirtualWindowChannel(channel) {
+            closeVirtualWindow(channel: channel)
+        } else {
+            refreshVirtualSerialChannelStatuses()
+        }
+    }
+
     private func writeVirtualSerial(channel: UInt8, data: Data) {
+        guard !data.isEmpty else { return }
+        pulseVirtualSerialChannel(channel, incoming: true)
+
         if let connection = virtualSerialTCPConnections[channel] {
             connection.send(data)
             return
@@ -1376,6 +1421,7 @@ public class DriveWireHost : Codable {
         }
         guard !bytes.isEmpty else { return }
         virtualSerialInput[channel, default: Data()].append(contentsOf: bytes)
+        refreshVirtualSerialChannelStatuses()
         openVirtualWindow(channel: channel)
     }
 
@@ -1391,6 +1437,7 @@ public class DriveWireHost : Codable {
             return
         }
         virtualWindows[index].isOpen = true
+        refreshVirtualSerialChannelStatuses()
     }
 
     private func closeVirtualWindow(channel: UInt8) {
@@ -1398,6 +1445,7 @@ public class DriveWireHost : Codable {
             return
         }
         virtualWindows[index].isOpen = false
+        refreshVirtualSerialChannelStatuses()
     }
 
     private func appendVirtualWindowOutput(_ data: Data, channel: UInt8) {
@@ -1433,6 +1481,46 @@ public class DriveWireHost : Codable {
             text = String(text.suffix(maximumCharacters))
         }
         virtualWindows[index].text = text
+    }
+
+    private func pulseVirtualSerialChannel(_ channel: UInt8, incoming: Bool) {
+        guard channel >= 1 && channel <= 8 else { return }
+
+        let token = nextVirtualSerialPulseToken
+        nextVirtualSerialPulseToken &+= 1
+        if incoming {
+            virtualSerialIncomingPulseTokens[channel] = token
+        } else {
+            virtualSerialOutgoingPulseTokens[channel] = token
+        }
+        refreshVirtualSerialChannelStatuses()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
+            guard let self else { return }
+            if incoming {
+                guard self.virtualSerialIncomingPulseTokens[channel] == token else { return }
+                self.virtualSerialIncomingPulseTokens.removeValue(forKey: channel)
+            } else {
+                guard self.virtualSerialOutgoingPulseTokens[channel] == token else { return }
+                self.virtualSerialOutgoingPulseTokens.removeValue(forKey: channel)
+            }
+            self.refreshVirtualSerialChannelStatuses()
+        }
+    }
+
+    private func refreshVirtualSerialChannelStatuses() {
+        virtualSerialChannels = (1...8).map { number in
+            let channel = UInt8(number)
+            return DriveWireVirtualChannelStatus(
+                channel: channel,
+                number: number,
+                isOpen: openVirtualSerialChannels.contains(channel),
+                incomingActive: virtualSerialIncomingPulseTokens[channel] != nil,
+                outgoingActive: virtualSerialOutgoingPulseTokens[channel] != nil,
+                pendingBytes: virtualSerialInput[channel]?.count ?? 0,
+                isTCPBacked: virtualSerialTCPConnections[channel] != nil
+            )
+        }
     }
 
     private func virtualWindowIndex(for channel: UInt8, createIfNeeded: Bool) -> Int? {
@@ -1478,6 +1566,7 @@ public class DriveWireHost : Codable {
 
     private func enqueueVirtualSerialResponse(_ response: String, channel: UInt8) {
         virtualSerialInput[channel, default: Data()].append(contentsOf: response.data(using: .ascii) ?? Data())
+        refreshVirtualSerialChannelStatuses()
     }
 
     private func enqueueDriveWireUtilityResponse(_ text: String, channel: UInt8) {
@@ -1529,9 +1618,11 @@ public class DriveWireHost : Codable {
         let host = arguments[0]
         virtualSerialTCPConnections[channel]?.close()
         openVirtualSerialChannels.insert(channel)
+        refreshVirtualSerialChannelStatuses()
 
         let connection = makeVirtualSerialTCPConnection(channel: channel, host: host, port: tcpPort)
         virtualSerialTCPConnections[channel] = connection
+        refreshVirtualSerialChannelStatuses()
         connection.start()
         return virtualSerialTCPSuccess()
     }
@@ -1557,6 +1648,7 @@ public class DriveWireHost : Codable {
             listener.start(queue: .main)
             virtualSerialTCPListeners[tcpPort] = listener
             openVirtualSerialChannels.insert(channel)
+            refreshVirtualSerialChannelStatuses()
             return virtualSerialTCPSuccess()
         } catch {
             return virtualSerialTCPFailure()
@@ -1578,6 +1670,7 @@ public class DriveWireHost : Codable {
             port: pending.localPort
         )
         virtualSerialTCPConnections[channel] = connection
+        refreshVirtualSerialChannelStatuses()
         connection.start()
         return virtualSerialTCPSuccess()
     }
@@ -1617,11 +1710,13 @@ public class DriveWireHost : Codable {
         VirtualSerialTCPConnection(host: host, port: port, onReceive: { [weak self] data in
             DispatchQueue.main.async {
                 self?.virtualSerialInput[channel, default: Data()].append(data)
+                self?.refreshVirtualSerialChannelStatuses()
             }
         }, onClose: { [weak self] in
             DispatchQueue.main.async {
                 self?.virtualSerialTCPConnections[channel] = nil
                 self?.openVirtualSerialChannels.remove(channel)
+                self?.refreshVirtualSerialChannelStatuses()
             }
         })
     }
@@ -1630,11 +1725,13 @@ public class DriveWireHost : Codable {
         VirtualSerialTCPConnection(connection: connection, host: host, port: port, onReceive: { [weak self] data in
             DispatchQueue.main.async {
                 self?.virtualSerialInput[channel, default: Data()].append(data)
+                self?.refreshVirtualSerialChannelStatuses()
             }
         }, onClose: { [weak self] in
             DispatchQueue.main.async {
                 self?.virtualSerialTCPConnections[channel] = nil
                 self?.openVirtualSerialChannels.remove(channel)
+                self?.refreshVirtualSerialChannelStatuses()
             }
         })
     }
@@ -2324,9 +2421,11 @@ public class DriveWireHost : Codable {
         let channel = UInt8(portNumber)
         virtualSerialTCPConnections[channel]?.close()
         openVirtualSerialChannels.insert(channel)
+        refreshVirtualSerialChannelStatuses()
 
         let connection = makeVirtualSerialTCPConnection(channel: channel, host: host, port: tcpPort)
         virtualSerialTCPConnections[channel] = connection
+        refreshVirtualSerialChannelStatuses()
         connection.start()
 
         return .success("Port #\(portNumber) open.\r\n")
@@ -2341,11 +2440,7 @@ public class DriveWireHost : Codable {
         }
 
         let channel = UInt8(portNumber)
-        virtualSerialTCPConnections[channel]?.close()
-        virtualSerialTCPConnections[channel] = nil
-        openVirtualSerialChannels.remove(channel)
-        virtualSerialInput[channel]?.removeAll()
-        virtualSerialCommandBuffers[channel] = ""
+        retireVirtualSerialChannel(channel)
         return .success("Port #\(portNumber) closed.\r\n")
     }
 
@@ -2377,7 +2472,7 @@ public class DriveWireHost : Codable {
         text += "DW4 support:   enabled\r\n"
         text += "Virtual disks: \(virtualDrives.count)\r\n"
         text += "Open ports:    \(openVirtualSerialChannels.count)\r\n"
-        text += "Last opcode:   0x\(String(statistics.lastOpCode, radix: 16))\r\n"
+        text += "Last opcode:   \(Self.opCodeDisplayName(statistics.lastOpCode))\r\n"
         text += "Reads:         \(statistics.readCount)\r\n"
         text += "Writes:        \(statistics.writeCount)\r\n"
         return .success(text)
@@ -2755,6 +2850,51 @@ public class DriveWireHost : Codable {
         RFMPathDescriptor.expandMultiDots(path)
     }
 
+    public static func opCodeDisplayName(_ code: UInt8) -> String {
+        switch code {
+        case 0x00: return "Idle"
+        case 0x01: return "OP_NAMEOBJMOUNT"
+        case 0x02: return "OP_NAMEOBJCREATE"
+        case 0x23: return "OP_TIME"
+        case 0x42: return "OP_WIREBUG"
+        case 0x43: return "OP_SERREAD"
+        case 0x44: return "OP_SERGETSTAT"
+        case 0x45: return "OP_SERINIT"
+        case 0x46: return "OP_PRINTFLUSH"
+        case 0x47: return "OP_GETSTAT"
+        case 0x50: return "OP_PRINT"
+        case 0x52: return "OP_READ"
+        case 0x53: return "OP_SETSTAT"
+        case 0x57: return "OP_WRITE"
+        case 0x49: return "OP_INIT"
+        case 0x54: return "OP_TERM"
+        case 0x5A: return "OP_DWINIT"
+        case 0x63: return "OP_SERREADM"
+        case 0x64: return "OP_SERWRITEM"
+        case 0x72: return "OP_REREAD"
+        case 0x77: return "OP_REWRITE"
+        case 0xC3: return "OP_SERWRITE"
+        case 0xC4: return "OP_SERSETSTAT"
+        case 0xC5: return "OP_SERTERM"
+        case 0xD2: return "OP_READEX"
+        case 0xD6: return "OP_RFM"
+        case 0xF2: return "OP_REREADEX"
+        case 0xF8: return "OP_RESET3"
+        case 0xFE: return "OP_RESET2"
+        case 0xFF: return "OP_RESET"
+        case 0x80...0x8E, 0x91...0x9E: return "OP_FASTWRITE"
+        default: return hexDisplay(code)
+        }
+    }
+
+    public static func statusCodeDisplayName(_ code: UInt8) -> String {
+        ssCodeName(Int(code))
+    }
+
+    private static func hexDisplay<T: BinaryInteger>(_ value: T) -> String {
+        "0x" + String(value, radix: 16, uppercase: true)
+    }
+
     private static func ssCodeName(_ code: Int) -> String {
         switch code {
         case 0x00: return "SS.Opt"
@@ -2802,7 +2942,7 @@ public class DriveWireHost : Codable {
         case 0x2A: return "SS.Close"
         case 0x2B: return "SS.HngUp"
         case 0x2C: return "SS.FSig"
-        default:   return "0x\(String(code, radix: 16, uppercase: false))"
+        default:   return hexDisplay(code)
         }
     }
 

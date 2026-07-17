@@ -395,18 +395,21 @@ struct LabelValueRow: View {
 }
 
 struct VirtualChannelView: View {
-    let channelNumber: Int
+    let status: DriveWireVirtualChannelStatus
 
     var body: some View {
         HStack(spacing: 10) {
-            LEDView(isOn: false, activeColor: DriveWirePalette.accent)
-                .frame(width: 9, height: 9)
-            Text("Channel \(channelNumber)")
+            HStack(spacing: 6) {
+                TrafficLED(label: "ON", isOn: status.isOpen, color: Color(red: 0.42, green: 0.76, blue: 1.0))
+                TrafficLED(label: "IN", isOn: status.incomingActive, color: Color(red: 0.96, green: 0.68, blue: 0.28))
+                TrafficLED(label: "OUT", isOn: status.outgoingActive, color: DriveWirePalette.accent)
+            }
+            Text("Channel \(status.number)")
                 .font(.system(size: 13, weight: .semibold, design: .rounded))
                 .foregroundStyle(.white)
                 .lineLimit(1)
             Spacer(minLength: 8)
-            Text("Idle")
+            Text(statusText)
                 .font(.system(size: 11, weight: .medium, design: .rounded))
                 .foregroundStyle(DriveWirePalette.softText)
         }
@@ -421,10 +424,41 @@ struct VirtualChannelView: View {
                 .stroke(DriveWirePalette.border, lineWidth: 1)
         )
     }
+
+    private var statusText: String {
+        if status.isTCPBacked {
+            return "TCP"
+        }
+        if status.pendingBytes > 0 {
+            return "\(status.pendingBytes) B"
+        }
+        return status.isOpen ? "Open" : "Idle"
+    }
+}
+
+private struct TrafficLED: View {
+    let label: String
+    let isOn: Bool
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 3) {
+            LEDView(isOn: isOn, activeColor: color)
+                .frame(width: 7, height: 7)
+            Text(label)
+                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .foregroundStyle(isOn ? .white : DriveWirePalette.softText.opacity(0.65))
+                .monospacedDigit()
+        }
+        .frame(width: 32, alignment: .leading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(label) \(isOn ? "active" : "idle")")
+    }
 }
 
 struct VirtualChannelsView: View {
-    private let channels = Array(0...7)
+    let host: DriveWireHost
+
     private let columns = [
         GridItem(.flexible(), spacing: 10),
         GridItem(.flexible(), spacing: 10)
@@ -433,8 +467,8 @@ struct VirtualChannelsView: View {
     var body: some View {
         DashboardSection(eyebrow: "Monitoring", title: "Virtual Channels", detail: "Compact status for the eight guest channels.") {
             LazyVGrid(columns: columns, spacing: 10) {
-                ForEach(channels, id: \.self) { channel in
-                    VirtualChannelView(channelNumber: channel)
+                ForEach(host.virtualSerialChannels) { status in
+                    VirtualChannelView(status: status)
                 }
             }
         }
@@ -946,7 +980,7 @@ struct StatisticsGridView: View {
 
     private var tiles: [StatTile] {
         [
-            StatTile(title: "Last Opcode", value: hex(statistics.lastOpCode), tint: DriveWirePalette.accent),
+            StatTile(title: "Last Opcode", value: DriveWireHost.opCodeDisplayName(statistics.lastOpCode), tint: DriveWirePalette.accent),
             StatTile(title: "Last LSN", value: String(statistics.lastLSN), tint: .blue),
             StatTile(title: "Sectors Read", value: String(statistics.readCount), tint: .mint),
             StatTile(title: "Sectors Written", value: String(statistics.writeCount), tint: .orange),
@@ -958,8 +992,8 @@ struct StatisticsGridView: View {
     private var secondaryStatistics: [StatisticItem] {
         [
             StatisticItem(title: "Last Drive", value: String(statistics.lastDriveNumber)),
-            StatisticItem(title: "Last GetStat", value: hex(statistics.lastGetStat)),
-            StatisticItem(title: "Last SetStat", value: hex(statistics.lastSetStat)),
+            StatisticItem(title: "Last GetStat", value: DriveWireHost.statusCodeDisplayName(statistics.lastGetStat)),
+            StatisticItem(title: "Last SetStat", value: DriveWireHost.statusCodeDisplayName(statistics.lastSetStat)),
             StatisticItem(title: "Read Retries", value: String(statistics.reReadCount)),
             StatisticItem(title: "Write Retries", value: String(statistics.reWriteCount)),
             StatisticItem(title: "Last Error", value: hex(statistics.lastError)),
@@ -1310,7 +1344,7 @@ struct ContentView: View {
                             VirtualWindowPanelView(host: activeHost)
                         }
                         LoggingPanelView(logText: activeLogBinding, detailedOpcodeLogging: $document.detailedOpcodeLogging)
-                        VirtualChannelsView()
+                        VirtualChannelsView(host: activeHost)
                     }
                     .padding(18)
                     .frame(maxWidth: .infinity, alignment: .topLeading)
