@@ -6,6 +6,7 @@
 //
 
 import ORSSerial
+import Combine
 
 /// Provides a serial interface to a DriveWire host.
 ///
@@ -28,25 +29,26 @@ class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate
     /// A flag that when set to `true`,  causes the driver to stop running.
     public var quit = false
     
-    /// A flag that when set to `true`,  causes serial traffic to log.
-    public var logging = true
-         
+    /// A flag that when set to `true`, causes raw serial traffic hex dumps to log.
+    public var logging = false
+
+    @Published public private(set) var isConnected = false
+
+    private var isRestoringState = false
     private var serialPort : ORSSerialPort?
     
     /// The serial port associated with this driver.
     public var portName : String = "" {
         didSet {
-            if let sp = serialPort {
-                self.stop()
-                sp.close()
+            guard !isRestoringState else {
+                return
             }
-            
-            if let serialPort = ORSSerialPort(path: "/dev/cu." + self.portName) {
-                self.serialPort = serialPort
-                self.serialPort?.baudRate = NSNumber(value: self.baudRate)
-                serialPort.delegate = self
-                serialPort.open()
+
+            guard oldValue != portName else {
+                return
             }
+
+            connectIfPossible()
         }
     }
     
@@ -62,14 +64,18 @@ class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate
 
     @_documentation(visibility: private)
     internal func serialPortWasRemovedFromSystem(_ serialPort: ORSSerialPort) {
+        isConnected = false
     }
     
     @_documentation(visibility: private)
     internal func serialPortWasOpened(_ serialPort: ORSSerialPort) {
+        isConnected = true
     }
     
     @_documentation(visibility: private)
     internal func serialPort(_ serialPort: ORSSerialPort, didEncounterError error: Error) {
+        isConnected = false
+        log += "Serial error: \(error.localizedDescription)\n"
         print(error)
     }
     
@@ -98,9 +104,39 @@ class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate
         super.init()
         host = DriveWireHost(delegate: self)
     }
+
+    func restoreConnectionIfNeeded() {
+        connectIfPossible()
+    }
+
+    private static func serialPortPath(for selection: String) -> String? {
+        guard !selection.isEmpty else {
+            return nil
+        }
+        if selection.hasPrefix("/dev/") {
+            return selection
+        }
+        return "/dev/cu." + selection
+    }
+
+    private func connectIfPossible() {
+        stop()
+
+        guard let normalizedPath = Self.serialPortPath(for: portName),
+              let serialPort = ORSSerialPort(path: normalizedPath) else {
+            return
+        }
+
+        self.serialPort = serialPort
+        serialPort.baudRate = NSNumber(value: baudRate)
+        serialPort.delegate = self
+        serialPort.open()
+    }
     
     required init(from decoder: Decoder) throws {
         super.init()
+        isRestoringState = true
+        defer { isRestoringState = false }
         do {
             let values = try decoder.container(keyedBy: CodingKeys.self)
             self.portName = try values.decode(String.self, forKey: .portName)
@@ -123,9 +159,9 @@ class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate
     }
     
     public func stop() {
+        isConnected = false
         self.serialPort?.delegate = nil
         self.serialPort?.close()
         self.serialPort = nil
     }
 }
-
