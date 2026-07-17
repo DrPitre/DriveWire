@@ -57,6 +57,16 @@ public enum DriveWireProtocolError : Int {
     case E_CRC = 0xF4
 }
 
+public struct DriveWireVirtualWindow: Identifiable, Equatable {
+    public let channel: UInt8
+    public var title: String
+    public var text: String
+    public var isOpen: Bool
+
+    public var id: UInt8 { channel }
+    public var displayNumber: Int { Int(channel - 0x80) }
+}
+
 /// Manages communication with a DriveWire guest.
 ///
 /// DriveWire is a connectivity standard that defines virtual disk drive, virtual printer, and virtual serial port services. A DriveWire *host* provides these services to a *guest*. Connectivity between the host and guest occurs over a physical connection, such as a serial cable. To the guest, it appears that the host's devices are local, when they are actually virtual.
@@ -127,6 +137,7 @@ public class DriveWireHost : Codable {
     public var currentSubTransaction : UInt8 = 0
     /// An array of virtual drives.
     public var virtualDrives : [VirtualDrive] = []
+    public private(set) var virtualWindows: [DriveWireVirtualWindow] = []
     
     /// The guest's capability byte sent from ``OPDWINIT``.
     private var guestCapabilityByte : UInt8 = 0x00
@@ -790,6 +801,28 @@ public class DriveWireHost : Codable {
         rfmLSNCounter = 0x600000
         print("RFM state reset")
     }
+
+    private func resetGuestSessionState() {
+        resetState()
+        statistics = DriveWireStatistics()
+        serialBuffer.removeAll()
+        currentSubTransaction = 0
+        guestCapabilityByte = 0
+        validateWithCRC = false
+        fastwriteChannel = 0
+        openVirtualSerialChannels.removeAll()
+        virtualSerialInput.removeAll()
+        virtualSerialCommandBuffers.removeAll()
+        pendingClosedVirtualSerialChannels.removeAll()
+        clientRestartRequested = false
+        for connection in virtualSerialTCPConnections.values {
+            connection.close()
+        }
+        virtualSerialTCPConnections.removeAll()
+        virtualWindows.removeAll()
+        printBuffer.removeAll()
+        resetRFMState()
+    }
     
     private func OP_DWINIT(data : Data) -> Int {
         var result = 0
@@ -1051,10 +1084,10 @@ public class DriveWireHost : Codable {
     
     private func OP_RESET(data : Data) -> Int {
         currentTransaction = OPRESET
-        resetState()
-        resetRFMState()
+        resetGuestSessionState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        log += "OP_RESET\n"; print("OP_RESET")
+        log = "OP_RESET\n"
+        print("OP_RESET")
         return 1
     }
     
@@ -1107,6 +1140,9 @@ public class DriveWireHost : Codable {
         guard data.count >= 2 else { return 0 }
         let ch = data[1]
         openVirtualSerialChannels.insert(ch)
+        if isVirtualWindowChannel(ch) {
+            openVirtualWindow(channel: ch)
+        }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
         let msg = "OP_SERINIT(ch=\(ch))"; log += msg + "\n"; print(msg)
@@ -1118,6 +1154,9 @@ public class DriveWireHost : Codable {
         guard data.count >= 2 else { return 0 }
         let ch = data[1]
         openVirtualSerialChannels.remove(ch)
+        if isVirtualWindowChannel(ch) {
+            closeVirtualWindow(channel: ch)
+        }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
         let msg = "OP_SERTERM(ch=\(ch))"; log += msg + "\n"; print(msg)
@@ -1140,7 +1179,7 @@ public class DriveWireHost : Codable {
         guard data.count >= 3 else { return 0 }
         let ch = data[1]
         let count = Int(data[2])
-        let response = readVirtualSerial(channel: ch, count: count)
+        let response = readVirtualSerial(channel: virtualSerialInputChannel(forGuestChannel: ch), count: count)
         resetState()
         delegate?.dataAvailable(host: self, data: response)
         delegate?.transactionCompleted(opCode: currentTransaction)
@@ -1199,10 +1238,16 @@ public class DriveWireHost : Codable {
         switch code {
         case 0x29:
             openVirtualSerialChannels.insert(ch)
+            if isVirtualWindowChannel(ch) {
+                openVirtualWindow(channel: ch)
+            }
         case 0x2A:
             virtualSerialTCPConnections[ch]?.close()
             virtualSerialTCPConnections[ch] = nil
             openVirtualSerialChannels.remove(ch)
+            if isVirtualWindowChannel(ch) {
+                closeVirtualWindow(channel: ch)
+            }
         default:
             break
         }
@@ -1229,7 +1274,7 @@ public class DriveWireHost : Codable {
             isVirtualWindowChannel($0) && !(virtualSerialInput[$0]?.isEmpty ?? true)
         }) {
             let byte = readVirtualSerial(channel: channel, count: 1).first ?? 0
-            return Data([channel &+ 1, byte])
+            return Data([virtualWindowGuestChannel(forInternalChannel: channel) &+ 1, byte])
         }
 
         if let channel = virtualSerialInput.keys.sorted().first(where: {
@@ -1264,6 +1309,11 @@ public class DriveWireHost : Codable {
             return
         }
 
+        if isVirtualWindowChannel(channel) {
+            appendVirtualWindowOutput(data, channel: channel)
+            return
+        }
+
         for byte in data {
             if byte == 0x0D {
                 let command = virtualSerialCommandBuffers[channel, default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1279,6 +1329,100 @@ public class DriveWireHost : Codable {
                 virtualSerialCommandBuffers[channel, default: ""].append(Character(UnicodeScalar(byte)))
             }
         }
+    }
+
+    public func sendVirtualWindowInput(_ text: String, channel: UInt8) {
+        guard isVirtualWindowChannel(channel), !text.isEmpty else {
+            return
+        }
+        let normalized = text.replacingOccurrences(of: "\n", with: "\r")
+        let bytes = normalized.compactMap { character -> UInt8? in
+            guard let scalar = character.unicodeScalars.first else { return nil }
+            if scalar.value == 0x08 || scalar.value == 0x09 || scalar.value == 0x0D || scalar.value == 0x1B || (scalar.value >= 0x20 && scalar.value <= 0x7E) {
+                return UInt8(scalar.value)
+            }
+            return nil
+        }
+        guard !bytes.isEmpty else { return }
+        virtualSerialInput[channel, default: Data()].append(contentsOf: bytes)
+        openVirtualWindow(channel: channel)
+    }
+
+    public func clearVirtualWindow(channel: UInt8) {
+        guard let index = virtualWindowIndex(for: channel, createIfNeeded: false) else {
+            return
+        }
+        virtualWindows[index].text = ""
+    }
+
+    private func openVirtualWindow(channel: UInt8) {
+        guard let index = virtualWindowIndex(for: channel, createIfNeeded: true) else {
+            return
+        }
+        virtualWindows[index].isOpen = true
+    }
+
+    private func closeVirtualWindow(channel: UInt8) {
+        guard let index = virtualWindowIndex(for: channel, createIfNeeded: false) else {
+            return
+        }
+        virtualWindows[index].isOpen = false
+    }
+
+    private func appendVirtualWindowOutput(_ data: Data, channel: UInt8) {
+        guard let index = virtualWindowIndex(for: channel, createIfNeeded: true) else {
+            return
+        }
+        virtualWindows[index].isOpen = true
+
+        var text = virtualWindows[index].text
+        for byte in data {
+            switch byte {
+            case 0x08, 0x7F:
+                if !text.isEmpty {
+                    text.removeLast()
+                }
+            case 0x09:
+                text += "    "
+            case 0x0A:
+                continue
+            case 0x0C:
+                text = ""
+            case 0x0D:
+                text += "\n"
+            case 0x20...0x7E:
+                text.append(Character(UnicodeScalar(byte)))
+            default:
+                continue
+            }
+        }
+
+        let maximumCharacters = 12_000
+        if text.count > maximumCharacters {
+            text = String(text.suffix(maximumCharacters))
+        }
+        virtualWindows[index].text = text
+    }
+
+    private func virtualWindowIndex(for channel: UInt8, createIfNeeded: Bool) -> Int? {
+        guard isVirtualWindowChannel(channel) else {
+            return nil
+        }
+        if let index = virtualWindows.firstIndex(where: { $0.channel == channel }) {
+            return index
+        }
+        guard createIfNeeded else {
+            return nil
+        }
+        let window = DriveWireVirtualWindow(
+            channel: channel,
+            title: virtualWindowTitle(for: channel),
+            text: "",
+            isOpen: openVirtualSerialChannels.contains(channel)
+        )
+        let insertionIndex = virtualWindows.firstIndex(where: { $0.channel > channel }) ?? virtualWindows.endIndex
+        virtualWindows.insert(window, at: insertionIndex)
+        return insertionIndex
     }
 
     private func processVirtualSerialCommand(_ command: String, channel: UInt8) {
@@ -2278,7 +2422,25 @@ public class DriveWireHost : Codable {
     }
 
     private func isVirtualWindowChannel(_ channel: UInt8) -> Bool {
-        channel >= 0x80 && channel <= 0x8F
+        channel >= 0x81 && channel <= 0x8F
+    }
+
+    private func virtualWindowTitle(for channel: UInt8) -> String {
+        "/Z\(Int(channel & 0x0F))"
+    }
+
+    private func virtualWindowGuestChannel(forInternalChannel channel: UInt8) -> UInt8 {
+        0x40 | (channel & 0x0F)
+    }
+
+    private func virtualSerialInputChannel(forGuestChannel channel: UInt8) -> UInt8 {
+        if channel & 0xC0 == 0x40 {
+            let virtualWindowChannel = 0x80 | (channel & 0x0F)
+            if isVirtualWindowChannel(virtualWindowChannel), virtualSerialInput[virtualWindowChannel] != nil {
+                return virtualWindowChannel
+            }
+        }
+        return channel
     }
 
     private func OP_FASTWRITE_Serial(data : Data) -> Int {
@@ -2291,7 +2453,7 @@ public class DriveWireHost : Codable {
     
     private func OP_FASTWRITE_Screen(data : Data) -> Int {
         guard data.count >= 2 else { return 0 }
-        writeVirtualSerial(channel: 0x80 &+ fastwriteChannel, data: Data([data[1]]))
+        writeVirtualSerial(channel: 0x81 &+ fastwriteChannel, data: Data([data[1]]))
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
         return 2

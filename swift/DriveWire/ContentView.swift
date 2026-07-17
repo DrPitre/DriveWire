@@ -441,6 +441,185 @@ struct VirtualChannelsView: View {
     }
 }
 
+struct VirtualWindowPanelView: View {
+    let host: DriveWireHost
+    @State private var selectedChannel: UInt8?
+
+    private var selectedWindow: DriveWireVirtualWindow? {
+        if let selectedChannel,
+           let window = host.virtualWindows.first(where: { $0.channel == selectedChannel }) {
+            return window
+        }
+        return host.virtualWindows.first
+    }
+
+    var body: some View {
+        DashboardSection(
+            eyebrow: "Display",
+            title: "Virtual Windows",
+            detail: "Guest /Z window output from active virtual screen channels."
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 10) {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(host.virtualWindows) { window in
+                                Button {
+                                    selectedChannel = window.channel
+                                } label: {
+                                    HStack(spacing: 7) {
+                                        LEDView(isOn: window.isOpen, activeColor: DriveWirePalette.accent)
+                                            .frame(width: 8, height: 8)
+                                        Text(window.title)
+                                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(selectedWindow?.channel == window.channel ? DriveWirePalette.accentMuted : .gray)
+                            }
+                        }
+                    }
+
+                    if let window = selectedWindow {
+                        Button("Clear") {
+                            host.clearVirtualWindow(channel: window.channel)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+
+                if let window = selectedWindow {
+                    VirtualWindowTerminalView(text: window.text, channel: window.channel) { input, channel in
+                        host.sendVirtualWindowInput(input, channel: channel)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 220, maxHeight: 300)
+                    .background(Color.black.opacity(0.45))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(DriveWirePalette.border, lineWidth: 1)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+            }
+        }
+    }
+}
+
+private struct VirtualWindowTerminalView: NSViewRepresentable {
+    let text: String
+    let channel: UInt8
+    let onInput: (String, UInt8) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onInput: onInput)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let textView = VirtualWindowTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.textContainerInset = NSSize(width: 12, height: 12)
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.minSize = .zero
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+        textView.textColor = NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 1.0)
+        textView.insertionPointColor = NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 1.0)
+        textView.selectedTextAttributes = [
+            .backgroundColor: NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 0.35)
+        ]
+        textView.onInput = { input in
+            context.coordinator.onInput(input, context.coordinator.channel)
+        }
+
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.documentView = textView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        context.coordinator.channel = channel
+        guard let textView = scrollView.documentView as? VirtualWindowTextView else { return }
+        textView.onInput = { input in
+            context.coordinator.onInput(input, context.coordinator.channel)
+        }
+        textView.setTerminalText(text)
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: max(0, textView.bounds.height - scrollView.contentView.bounds.height)))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+
+        DispatchQueue.main.async {
+            if textView.window?.firstResponder !== textView {
+                textView.window?.makeFirstResponder(textView)
+            }
+        }
+    }
+
+    final class Coordinator {
+        let onInput: (String, UInt8) -> Void
+        var channel: UInt8 = 0x80
+
+        init(onInput: @escaping (String, UInt8) -> Void) {
+            self.onInput = onInput
+        }
+    }
+}
+
+private final class VirtualWindowTextView: NSTextView {
+    var onInput: ((String) -> Void)?
+    private let terminalAttributes: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .medium),
+        .foregroundColor: NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 1.0)
+    ]
+
+    override var acceptsFirstResponder: Bool { true }
+    override var canBecomeKeyView: Bool { true }
+
+    func setTerminalText(_ text: String) {
+        textStorage?.setAttributedString(NSAttributedString(string: text, attributes: terminalAttributes))
+        setSelectedRange(NSRange(location: text.count, length: 0))
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.command) {
+            super.keyDown(with: event)
+            return
+        }
+
+        switch event.keyCode {
+        case 36, 76:
+            onInput?("\r")
+        case 51:
+            onInput?("\u{08}")
+        case 48:
+            onInput?("\t")
+        case 53:
+            onInput?("\u{1B}")
+        default:
+            if let characters = event.characters, !characters.isEmpty {
+                onInput?(characters.replacingOccurrences(of: "\n", with: "\r"))
+            }
+        }
+    }
+}
+
 struct DriveRowView: View {
     let driveNumber: Int
     let imagePath: String?
@@ -1033,6 +1212,9 @@ struct ContentView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
                         StatisticsGridView(statistics: activeHost.statistics)
+                        if !activeHost.virtualWindows.isEmpty {
+                            VirtualWindowPanelView(host: activeHost)
+                        }
                         LoggingPanelView(logText: activeLogBinding, detailedOpcodeLogging: $document.detailedOpcodeLogging)
                         VirtualChannelsView()
                     }
