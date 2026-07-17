@@ -495,21 +495,32 @@ struct VirtualWindowPanelView: View {
         ) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .center, spacing: 10) {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            ForEach(host.virtualWindows) { window in
-                                Button {
-                                    selectedChannel = window.channel
-                                } label: {
-                                    HStack(spacing: 7) {
-                                        LEDView(isOn: window.isOpen, activeColor: DriveWirePalette.accent)
-                                            .frame(width: 8, height: 8)
-                                        Text(window.title)
-                                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    if host.virtualWindows.isEmpty {
+                        HStack(spacing: 7) {
+                            LEDView(isOn: false, activeColor: DriveWirePalette.accent)
+                                .frame(width: 8, height: 8)
+                            Text("No /Z windows")
+                                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                .foregroundStyle(DriveWirePalette.softText)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(host.virtualWindows) { window in
+                                    Button {
+                                        selectedChannel = window.channel
+                                    } label: {
+                                        HStack(spacing: 7) {
+                                            LEDView(isOn: window.isOpen, activeColor: DriveWirePalette.accent)
+                                                .frame(width: 8, height: 8)
+                                            Text(window.title)
+                                                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                        }
                                     }
+                                    .buttonStyle(.bordered)
+                                    .tint(selectedWindow?.channel == window.channel ? DriveWirePalette.accentMuted : .gray)
                                 }
-                                .buttonStyle(.bordered)
-                                .tint(selectedWindow?.channel == window.channel ? DriveWirePalette.accentMuted : .gray)
                             }
                         }
                     }
@@ -534,6 +545,124 @@ struct VirtualWindowPanelView: View {
                             .stroke(DriveWirePalette.border, lineWidth: 1)
                     )
                     .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                } else {
+                    ZStack(alignment: .topLeading) {
+                        Color.black.opacity(0.45)
+                        Text("No active /Z windows")
+                            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(DriveWirePalette.softText)
+                            .padding(12)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 220, maxHeight: 300)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(DriveWirePalette.border, lineWidth: 1)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+            }
+        }
+    }
+}
+
+struct MIDIView: View {
+    let host: DriveWireHost
+
+    private var status: DriveWireMIDIStatus {
+        host.midiMonitorStatus
+    }
+
+    private var stateColor: Color {
+        switch status.state {
+        case "Playing MIDI File", "Receiving MIDI File", "Raw MIDI":
+            return DriveWirePalette.accent
+        case "Error":
+            return .red
+        case "Stopped":
+            return .orange
+        default:
+            return .gray
+        }
+    }
+
+    private var metrics: [StatisticItem] {
+        [
+            StatisticItem(title: "Bytes", value: String(status.bytesReceived)),
+            StatisticItem(title: "File Bytes", value: fileByteProgress),
+            StatisticItem(title: "Tracks", value: trackProgress),
+            StatisticItem(title: "Messages", value: String(status.messagesSent)),
+            StatisticItem(title: "Available", value: status.isAvailable ? "Yes" : "No")
+        ]
+    }
+
+    private var fileByteProgress: String {
+        if let expectedFileBytes = status.expectedFileBytes {
+            return "\(status.fileBytesReceived) / \(expectedFileBytes)"
+        }
+        return status.fileBytesReceived > 0 ? "\(status.fileBytesReceived) / ?" : "0"
+    }
+
+    private var trackProgress: String {
+        if let expectedFileTracks = status.expectedFileTracks {
+            return "\(status.completedFileTracks) / \(expectedFileTracks)"
+        }
+        return "0"
+    }
+
+    var body: some View {
+        DashboardSection(eyebrow: "Audio", title: "MIDI", detail: "Live status for the /MIDI virtual channel.") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 10) {
+                    StatusPill(text: status.state, color: stateColor)
+                    Spacer(minLength: 12)
+                    Button("Stop MIDI") {
+                        host.stopMIDIPlayback()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(DriveWirePalette.accentMuted)
+                    .help("Stop MIDI playback and send all-notes-off to the selected output.")
+                }
+
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 140, maximum: 220), spacing: 10)], spacing: 10) {
+                    DashboardMetricBadge(label: "Backend", value: status.backendName)
+                    DashboardMetricBadge(label: "Output", value: status.selectedOutputName)
+                    ForEach(metrics) { item in
+                        DashboardMetricBadge(label: item.title, value: item.value)
+                    }
+                }
+
+                if let lastError = status.lastError, !lastError.isEmpty {
+                    Text(lastError)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.red.opacity(0.9))
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Color.red.opacity(0.12))
+                        )
+                }
+
+                if !status.statusLines.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(status.statusLines, id: \.self) { line in
+                            Text(line)
+                                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                                .foregroundStyle(DriveWirePalette.softText)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Color.black.opacity(0.20))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(DriveWirePalette.border, lineWidth: 1)
+                    )
                 }
             }
         }
@@ -729,7 +858,6 @@ private final class VirtualWindowTextView: NSTextView {
         let textLength = nsString.length
         let previousCharacter = nsString.character(at: textLength - 1)
         if previousCharacter == 0x0A || previousCharacter == 0x0D {
-            let lineHeight = layoutManager.defaultLineHeight(for: font ?? .monospacedSystemFont(ofSize: 13, weight: .medium))
             let glyphIndex = max(layoutManager.numberOfGlyphs - 1, 0)
             let previousRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
             return NSPoint(
@@ -1329,22 +1457,21 @@ struct ContentView: View {
                         )
 
                         DrivesPanelView(document: $document)
+                        VirtualChannelsView(host: activeHost)
                     }
                     .padding(12)
                     .frame(maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .topLeading)
                 }
                 .scrollIndicators(.hidden)
-                .frame(minWidth: 390, idealWidth: 440, maxHeight: .infinity, alignment: .topLeading)
+                .frame(minWidth: 420, idealWidth: 500, maxHeight: .infinity, alignment: .topLeading)
                 .background(Color.white.opacity(0.02))
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
                         StatisticsGridView(statistics: activeHost.statistics)
-                        if !activeHost.virtualWindows.isEmpty {
-                            VirtualWindowPanelView(host: activeHost)
-                        }
+                        MIDIView(host: activeHost)
+                        VirtualWindowPanelView(host: activeHost)
                         LoggingPanelView(logText: activeLogBinding, detailedOpcodeLogging: $document.detailedOpcodeLogging)
-                        VirtualChannelsView(host: activeHost)
                     }
                     .padding(18)
                     .frame(maxWidth: .infinity, alignment: .topLeading)
