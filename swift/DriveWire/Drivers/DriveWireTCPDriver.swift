@@ -18,6 +18,7 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
     private var outputStream: OutputStream?
     private var readBuffer = [UInt8](repeating: 0, count: 1024)
     private var streamQueue = DispatchQueue(label: "DriveWireTCP.StreamQueue")
+    private var isRestoringState = false
     @Published public var connected: Bool = false
     
     enum CodingKeys: String, CodingKey {
@@ -34,12 +35,15 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
     /// A flag that when set to `true`,  causes the driver to stop running.
     public var quit = false
     
-    /// A flag that when set to `true`,  causes serial traffic to log.
-    public var logging = true
+    /// A flag that when set to `true`, causes raw network traffic hex dumps to log.
+    public var logging = false
     
     /// The TCP/IP address associated with this driver.
     public var ipAddress: String = "" {
         didSet {
+            guard !isRestoringState else {
+                return
+            }
             if oldValue != ipAddress {
                 reconnect()
             }
@@ -49,6 +53,9 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
     /// The TCP/IP port.
     public var ipPort: UInt32 = 6809 {
         didSet {
+            guard !isRestoringState else {
+                return
+            }
             if oldValue != ipPort {
                 reconnect()
             }
@@ -144,6 +151,8 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
     
     required init(from decoder: Decoder) throws {
         super.init()
+        isRestoringState = true
+        defer { isRestoringState = false }
         do {
             let values = try decoder.container(keyedBy: CodingKeys.self)
             self.ipAddress = try values.decode(String.self, forKey: .ipAddress)

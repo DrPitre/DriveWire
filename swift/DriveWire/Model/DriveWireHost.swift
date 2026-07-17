@@ -64,7 +64,18 @@ public enum DriveWireProtocolError : Int {
 ///
 @Observable
 public class DriveWireHost : Codable {
-    var log : String = ""
+    private static let maximumLogCharacters = 24_000
+    private static let trimmedLogPrefix = "... older log entries trimmed ...\n"
+    private static let emitConsoleOutput = false
+
+    public var detailedOpcodeLogging = false
+
+    private var logStorage = ""
+
+    var log: String {
+        get { logStorage }
+        set { logStorage = Self.trimmedLog(from: newValue) }
+    }
 
     init() {
         setupTransactions()
@@ -73,6 +84,30 @@ public class DriveWireHost : Codable {
     func reloadVirtualDrives() {
         for vd in virtualDrives {
             vd.reload()
+        }
+    }
+
+    private static func trimmedLog(from value: String) -> String {
+        guard value.count > maximumLogCharacters else {
+            return value
+        }
+
+        let retainedCount = maximumLogCharacters - trimmedLogPrefix.count
+        guard retainedCount > 0 else {
+            return String(value.suffix(maximumLogCharacters))
+        }
+
+        return trimmedLogPrefix + value.suffix(retainedCount)
+    }
+
+    private func reportActivity(_ message: String, isFrequent: Bool = false, isError: Bool = false) {
+        let shouldRecord = isError || !isFrequent || detailedOpcodeLogging
+        if shouldRecord {
+            logStorage = Self.trimmedLog(from: logStorage + message + "\n")
+        }
+
+        if isError || (Self.emitConsoleOutput && shouldRecord) {
+            print(message)
         }
     }
     
@@ -104,6 +139,10 @@ public class DriveWireHost : Codable {
     private var validateWithCRC = false
     private var fastwriteChannel : UInt8 = 0
     private var processor : ((Data) -> Int)?
+    private var openVirtualSerialChannels = Set<UInt8>()
+    private var virtualSerialInput = [UInt8: Data]()
+    private var virtualSerialCommandBuffers = [UInt8: String]()
+    private var pendingClosedVirtualSerialChannels: [UInt8] = []
     
     struct RFMPathDescriptor {
         var processID = 0
@@ -701,8 +740,10 @@ public class DriveWireHost : Codable {
             // Save capabilities byte.
             guestCapabilityByte = data[1]
             
-            // Send the host capabilities byte.
-            delegate?.dataAvailable(host: self, data: Data([0x00]))
+            // Send the host capabilities byte. This must be non-zero: the
+            // NitrOS-9 driver treats zero as a DW3 server and disables DW4
+            // extensions, including the virtual serial poller.
+            delegate?.dataAvailable(host: self, data: Data([0xFF]))
             result = expectedCount
             
             // Reset the state machine.
@@ -713,6 +754,20 @@ public class DriveWireHost : Codable {
     }
     
     private var nameLength = 0
+
+    private static func decodedNameObjectPath(from data: Data, length: Int) -> String? {
+        guard length > 0, data.count >= length else {
+            return nil
+        }
+
+        let nameBytes = Array(data.prefix(length)).map { $0 & 0x7F }
+        guard nameBytes.allSatisfy({ $0 >= 0x20 && $0 != 0x7F }) else {
+            return nil
+        }
+
+        let name = String(bytes: nameBytes, encoding: .ascii) ?? ""
+        return name.isEmpty ? nil : name
+    }
     
     private func OP_NAMEOBJ_MOUNT(data : Data) -> Int {
         var result = 0
@@ -734,12 +789,12 @@ public class DriveWireHost : Codable {
             if data.count >= nameLength {
                 resetState()
                 result = nameLength;
-                let name = String(bytes: data, encoding: .ascii) ?? ""
 
                 // determine if a named object with this name already exists
-                if let vd = findVirtualDisk(name: name) {
+                if let name = Self.decodedNameObjectPath(from: data, length: nameLength),
+                   let vd = findVirtualDisk(name: name) {
                     response = UInt8(vd.driveNumber)
-                } else {
+                } else if let name = Self.decodedNameObjectPath(from: data, length: nameLength) {
                     do {
                         let nextFreeDrive = findAvailableVirtualDrive()
                         try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
@@ -761,7 +816,7 @@ public class DriveWireHost : Codable {
         var result = 0
         let expectedCount = 2
         var response : UInt8 = 0
-        currentTransaction = OPNAMEOBJMOUNT
+        currentTransaction = OPNAMEOBJCREATE
         if data.count >= expectedCount {
             nameLength = Int(data[1])
             
@@ -777,12 +832,12 @@ public class DriveWireHost : Codable {
             if data.count >= nameLength {
                 resetState()
                 result = nameLength;
-                let name = String(bytes: data, encoding: .ascii) ?? ""
 
                 // determine if a named object with this name already exists
-                if let _ = findVirtualDisk(name: name) {
+                if let name = Self.decodedNameObjectPath(from: data, length: nameLength),
+                   let _ = findVirtualDisk(name: name) {
                     response = 0
-                } else {
+                } else if let name = Self.decodedNameObjectPath(from: data, length: nameLength) {
                     let nextFreeDrive = findAvailableVirtualDrive()
                     do {
                         try insertVirtualDisk(driveNumber: nextFreeDrive, imagePath: name)
@@ -883,7 +938,7 @@ public class DriveWireHost : Codable {
             delegate?.dataAvailable(host: self, data: Data([UInt8(error)]))
             delegate?.transactionCompleted(opCode: currentTransaction)
             let msg = "OP_WRITE(drive=\(driveNumber), lsn=0x\(String(vLSN, radix: 16))) -> \(error)"
-            log += msg + "\n"; print(msg)
+            reportActivity(msg, isFrequent: true, isError: error != DriveWireProtocolError.E_NONE.rawValue)
         }
         
         return result
@@ -912,8 +967,7 @@ public class DriveWireHost : Codable {
             delegate?.transactionCompleted(opCode: currentTransaction)
         }
         
-        log += "OP_GETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastGetStat))))\n"
-        print("OP_GETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastGetStat))))")
+        reportActivity("OP_GETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastGetStat))))", isFrequent: true)
         return result
     }
     
@@ -931,8 +985,7 @@ public class DriveWireHost : Codable {
             delegate?.transactionCompleted(opCode: currentTransaction)
         }
         
-        log += "OP_SETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastSetStat))))\n"
-        print("OP_SETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastSetStat))))")
+        reportActivity("OP_SETSTAT(drive=\(statistics.lastDriveNumber), \(DriveWireHost.ssCodeName(Int(statistics.lastSetStat))))", isFrequent: true)
         return result
     }
     
@@ -993,6 +1046,7 @@ public class DriveWireHost : Codable {
         currentTransaction = OPSERINIT
         guard data.count >= 2 else { return 0 }
         let ch = data[1]
+        openVirtualSerialChannels.insert(ch)
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
         let msg = "OP_SERINIT(ch=\(ch))"; log += msg + "\n"; print(msg)
@@ -1003,6 +1057,7 @@ public class DriveWireHost : Codable {
         currentTransaction = OPSERTERM
         guard data.count >= 2 else { return 0 }
         let ch = data[1]
+        openVirtualSerialChannels.remove(ch)
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
         let msg = "OP_SERTERM(ch=\(ch))"; log += msg + "\n"; print(msg)
@@ -1011,28 +1066,33 @@ public class DriveWireHost : Codable {
 
     private func OP_SERREAD(data : Data) -> Int {
         currentTransaction = OPSERREAD
-        guard data.count >= 2 else { return 0 }
-        let ch = data[1]
+        guard data.count >= 1 else { return 0 }
         resetState()
-        delegate?.dataAvailable(host: self, data: Data([0x00, 0x00]))
-        let msg = "OP_SERREAD(ch=\(ch))"; log += msg + "\n"; print(msg)
-        return 2
+        let response = pollVirtualSerial()
+        delegate?.dataAvailable(host: self, data: response)
+        delegate?.transactionCompleted(opCode: currentTransaction)
+        reportActivity("OP_SERREAD -> \(response[0]),\(response[1])", isFrequent: true)
+        return 1
     }
 
     private func OP_SERREADM(data : Data) -> Int {
         currentTransaction = OPSERREADM
-        guard data.count >= 2 else { return 0 }
+        guard data.count >= 3 else { return 0 }
         let ch = data[1]
+        let count = Int(data[2])
+        let response = readVirtualSerial(channel: ch, count: count)
         resetState()
+        delegate?.dataAvailable(host: self, data: response)
         delegate?.transactionCompleted(opCode: currentTransaction)
-        let msg = "OP_SERREADM(ch=\(ch))"; log += msg + "\n"; print(msg)
-        return 2
+        reportActivity("OP_SERREADM(ch=\(ch), bytes=\(count))", isFrequent: true)
+        return 3
     }
 
     private func OP_SERWRITE(data : Data) -> Int {
         currentTransaction = OPSERWRITE
         guard data.count >= 3 else { return 0 }
         let ch = data[1]; let byte = data[2]
+        writeVirtualSerial(channel: ch, data: Data([byte]))
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
         let msg = "OP_SERWRITE(ch=\(ch), byte=0x\(String(byte, radix: 16)))"; log += msg + "\n"; print(msg)
@@ -1041,13 +1101,22 @@ public class DriveWireHost : Codable {
 
     private func OP_SERWRITEM(data : Data) -> Int {
         currentTransaction = OPSERWRITEM
+        guard data.count >= 2 else { return 0 }
+        let ch = data[1]
+        if !openVirtualSerialChannels.contains(ch) {
+            resetState()
+            delegate?.transactionCompleted(opCode: currentTransaction)
+            reportActivity("OP_SERWRITEM(ch=\(ch)) ignored for unopened channel", isFrequent: true)
+            return 2
+        }
         guard data.count >= 3 else { return 0 }
-        let ch = data[1]; let count = Int(data[2])
+        let count = Int(data[2])
         let total = 3 + count
         guard data.count >= total else { return 0 }
+        writeVirtualSerial(channel: ch, data: data.subdata(in: 3..<total))
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        let msg = "OP_SERWRITEM(ch=\(ch), bytes=\(count))"; log += msg + "\n"; print(msg)
+        reportActivity("OP_SERWRITEM(ch=\(ch), bytes=\(count))", isFrequent: true)
         return total
     }
 
@@ -1065,22 +1134,470 @@ public class DriveWireHost : Codable {
         currentTransaction = OPSERSETSTAT
         guard data.count >= 3 else { return 0 }
         let ch = data[1]; let code = data[2]
+        let expectedCount = code == 0x28 ? 29 : 3
+        guard data.count >= expectedCount else { return 0 }
+        switch code {
+        case 0x29:
+            openVirtualSerialChannels.insert(ch)
+        case 0x2A:
+            openVirtualSerialChannels.remove(ch)
+        default:
+            break
+        }
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
         let msg = "OP_SERSETSTAT(ch=\(ch), \(DriveWireHost.ssCodeName(Int(code))))"; log += msg + "\n"; print(msg)
-        return 3
+        return expectedCount
+    }
+
+    private func pollVirtualSerial() -> Data {
+        if let channel = pendingClosedVirtualSerialChannels.first,
+           virtualSerialInput[channel]?.isEmpty ?? true {
+            pendingClosedVirtualSerialChannels.removeFirst()
+            openVirtualSerialChannels.remove(channel)
+            return Data([16, channel])
+        }
+
+        if let channel = virtualSerialInput.keys.sorted().first(where: {
+            isVirtualWindowChannel($0) && !(virtualSerialInput[$0]?.isEmpty ?? true)
+        }) {
+            let byte = readVirtualSerial(channel: channel, count: 1).first ?? 0
+            return Data([channel &+ 1, byte])
+        }
+
+        if let channel = virtualSerialInput.keys.sorted().first(where: {
+            !isVirtualWindowChannel($0) && !(virtualSerialInput[$0]?.isEmpty ?? true)
+        }) {
+            let waiting = virtualSerialInput[channel]?.count ?? 0
+            if waiting >= 3 {
+                return Data([channel &+ 17, UInt8(min(waiting, 255))])
+            }
+            let byte = readVirtualSerial(channel: channel, count: 1).first ?? 0
+            return Data([channel &+ 1, byte])
+        }
+
+        return Data([0x00, 0x00])
+    }
+
+    private func readVirtualSerial(channel: UInt8, count: Int) -> Data {
+        guard count > 0, var queued = virtualSerialInput[channel], !queued.isEmpty else {
+            return Data()
+        }
+
+        let readCount = min(count, queued.count)
+        let response = queued.prefix(readCount)
+        queued.removeFirst(readCount)
+        virtualSerialInput[channel] = queued
+        return Data(response)
+    }
+
+    private func writeVirtualSerial(channel: UInt8, data: Data) {
+        for byte in data {
+            if byte == 0x0D {
+                let command = virtualSerialCommandBuffers[channel, default: ""].trimmingCharacters(in: .whitespacesAndNewlines)
+                virtualSerialCommandBuffers[channel] = ""
+                processVirtualSerialCommand(command, channel: channel)
+            } else if byte == 0x08 || byte == 0x7F {
+                var command = virtualSerialCommandBuffers[channel, default: ""]
+                if !command.isEmpty {
+                    command.removeLast()
+                }
+                virtualSerialCommandBuffers[channel] = command
+            } else if byte >= 0x20 {
+                virtualSerialCommandBuffers[channel, default: ""].append(Character(UnicodeScalar(byte)))
+            }
+        }
+    }
+
+    private func processVirtualSerialCommand(_ command: String, channel: UInt8) {
+        guard !command.isEmpty else {
+            return
+        }
+
+        if command.lowercased().hasPrefix("dw ") || command.lowercased() == "dw" {
+            let response = processDriveWireAPICommand(command)
+            enqueueVirtualSerialResponse(response, channel: channel)
+            if response.hasPrefix("OK ") {
+                pendingClosedVirtualSerialChannels.append(channel)
+            }
+        } else {
+            enqueueVirtualSerialResponse(driveWireAPIFailure(code: 10, text: "Unknown command '\(command)'"), channel: channel)
+        }
+        let msg = "VSerial(ch=\(channel)) command: \(command)"
+        log += msg + "\n"; print(msg)
+    }
+
+    private func enqueueVirtualSerialResponse(_ response: String, channel: UInt8) {
+        virtualSerialInput[channel, default: Data()].append(contentsOf: response.data(using: .ascii) ?? Data())
+    }
+
+    private func enqueueDriveWireUtilityResponse(_ text: String, channel: UInt8) {
+        enqueueVirtualSerialResponse(driveWireAPISuccess(text), channel: channel)
+        pendingClosedVirtualSerialChannels.append(channel)
+    }
+
+    private func driveWireAPISuccess(_ text: String) -> String {
+        "OK command successful\n\r" + text
+    }
+
+    private func driveWireAPIFailure(code: UInt8, text: String) -> String {
+        String(format: "FAIL %03d %@\r", Int(code), text)
+    }
+
+    private func processDriveWireAPICommand(_ command: String) -> String {
+        let arguments = Array(command.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init).dropFirst())
+        let result = parseDriveWireAPI(arguments)
+        switch result {
+        case .success(let text):
+            return driveWireAPISuccess(text)
+        case .failure(let code, let text):
+            return driveWireAPIFailure(code: code, text: text)
+        }
+    }
+
+    private enum DriveWireAPIResult {
+        case success(String)
+        case failure(UInt8, String)
+    }
+
+    private struct DriveWireAPICommand {
+        let name: String
+        let help: String
+    }
+
+    private enum DriveWireAPICommandMatch {
+        case success(String)
+        case failure(String)
+    }
+
+    private func parseDriveWireAPI(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "config", help: "Commands to manipulate the config"),
+                DriveWireAPICommand(name: "disk", help: "Manage disks and disksets"),
+                DriveWireAPICommand(name: "log", help: "View server logs"),
+                DriveWireAPICommand(name: "midi", help: "Manage MIDI"),
+                DriveWireAPICommand(name: "net", help: "Show network information"),
+                DriveWireAPICommand(name: "port", help: "Manage virtual serial ports"),
+                DriveWireAPICommand(name: "server", help: "Various server based tools")
+            ]))
+        }
+
+        switch match(command, in: ["config", "disk", "log", "midi", "net", "port", "server"]) {
+        case .success("config"):
+            return parseConfigCommand(Array(arguments.dropFirst()))
+        case .success("disk"):
+            return parseDiskCommand(Array(arguments.dropFirst()))
+        case .success("port"):
+            return parsePortCommand(Array(arguments.dropFirst()))
+        case .success("server"):
+            return parseServerCommand(Array(arguments.dropFirst()))
+        case .success(let name):
+            return .failure(204, "Command 'dw \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parseConfigCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "save", help: "Save current configuration"),
+                DriveWireAPICommand(name: "set", help: "Set config item"),
+                DriveWireAPICommand(name: "show", help: "Show current instance config (or item)")
+            ]))
+        }
+
+        switch match(command, in: ["save", "set", "show"]) {
+        case .success("show"):
+            return configShow(Array(arguments.dropFirst()))
+        case .success(let name):
+            return .failure(204, "Command 'dw config \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parseDiskCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "create", help: "Create disk image"),
+                DriveWireAPICommand(name: "dos", help: "Manage DOS disk images"),
+                DriveWireAPICommand(name: "eject", help: "Eject disk from drive #"),
+                DriveWireAPICommand(name: "insert", help: "Load disk into drive #"),
+                DriveWireAPICommand(name: "reload", help: "Reload disk in drive #"),
+                DriveWireAPICommand(name: "set", help: "Set disk parameter"),
+                DriveWireAPICommand(name: "show", help: "Show current disk details"),
+                DriveWireAPICommand(name: "write", help: "Write dirty sectors")
+            ]))
+        }
+
+        switch match(command, in: ["create", "dos", "eject", "insert", "reload", "set", "show", "write"]) {
+        case .success("eject"):
+            return diskEject(Array(arguments.dropFirst()))
+        case .success("insert"):
+            return diskInsert(Array(arguments.dropFirst()))
+        case .success("reload"):
+            return diskReload(Array(arguments.dropFirst()))
+        case .success("show"):
+            return diskShow(Array(arguments.dropFirst()))
+        case .success(let name):
+            return .failure(204, "Command 'dw disk \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parsePortCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "close", help: "Close port #"),
+                DriveWireAPICommand(name: "open", help: "Open port #"),
+                DriveWireAPICommand(name: "show", help: "Show port status")
+            ]))
+        }
+
+        switch match(command, in: ["close", "open", "show"]) {
+        case .success("show"):
+            return portShow()
+        case .success(let name):
+            return .failure(204, "Command 'dw port \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func parseServerCommand(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let command = arguments.first else {
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "dir", help: "List files on server"),
+                DriveWireAPICommand(name: "help", help: "Show help"),
+                DriveWireAPICommand(name: "list", help: "List contents of file on server"),
+                DriveWireAPICommand(name: "print", help: "Print file on server"),
+                DriveWireAPICommand(name: "show", help: "Show various server information"),
+                DriveWireAPICommand(name: "status", help: "Show server status information"),
+                DriveWireAPICommand(name: "turbo", help: "Show turbo status")
+            ]))
+        }
+
+        switch match(command, in: ["dir", "help", "list", "print", "show", "status", "turbo"]) {
+        case .success("status"):
+            return serverStatus()
+        case .success("show"):
+            return .success(shortHelp(for: [
+                DriveWireAPICommand(name: "handlers", help: "Show handler information"),
+                DriveWireAPICommand(name: "threads", help: "Show thread information")
+            ]))
+        case .success(let name):
+            return .failure(204, "Command 'dw server \(name)' is not implemented yet.")
+        case .failure(let message):
+            return .failure(10, message)
+        }
+    }
+
+    private func match(_ input: String, in commands: [String]) -> DriveWireAPICommandMatch {
+        let matches = commands.filter { $0.hasPrefix(input.lowercased()) }
+        if matches.count == 1 {
+            return .success(matches[0])
+        } else if matches.isEmpty {
+            return .failure("Unknown command '\(input)'")
+        } else {
+            return .failure("Ambiguous command, '\(input)' matches \(matches.joined(separator: " or "))")
+        }
+    }
+
+    private func shortHelp(for commands: [DriveWireAPICommand]) -> String {
+        let names = commands.map(\.name).sorted()
+        return "Possible commands:\r\n\r\n" + columnLayout(names) + "\r\n"
+    }
+
+    private func columnLayout(_ values: [String], columns: Int = 80) -> String {
+        guard !values.isEmpty else { return "" }
+        let width = (values.map(\.count).max() ?? 1) + 2
+        let perLine = max(1, (columns - 1) / width)
+        var lines: [String] = []
+        var current = ""
+        for (index, value) in values.enumerated() {
+            if index > 0 && index % perLine == 0 {
+                lines.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+            }
+            current += value.padding(toLength: width, withPad: " ", startingAt: 0)
+        }
+        if !current.isEmpty {
+            lines.append(current.trimmingCharacters(in: .whitespaces))
+        }
+        return lines.joined(separator: "\r\n")
+    }
+
+    private func configShow(_ arguments: [String]) -> DriveWireAPIResult {
+        let items = [
+            "CMDCols": "80",
+            "DeviceType": "swift",
+            "DetailedOpcodeLogging": detailedOpcodeLogging ? "true" : "false",
+            "HostCapabilityByte": "255",
+            "MountedDrives": "\(virtualDrives.count)",
+            "ProtectedMode": "false"
+        ]
+
+        if let key = arguments.first {
+            if let value = items.first(where: { $0.key.lowercased() == key.lowercased() }) {
+                return .success("\(value.key) = \(value.value)\r\n")
+            }
+            return .failure(142, "Key '\(key)' is not set.")
+        }
+
+        let text = items.keys.sorted()
+            .map { "\($0) = \(items[$0] ?? "")" }
+            .joined(separator: "\r\n")
+        return .success("Current protocol handler configuration:\r\n\n\(text)\r\n")
+    }
+
+    private func diskShow(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let driveArgument = arguments.first else {
+            var text = "\r\nCurrent DriveWire disks:\r\n\r\n"
+            for drive in virtualDrives.sorted(by: { $0.driveNumber < $1.driveNumber }) {
+                text += String(format: "X%-3d ", drive.driveNumber)
+                text += shortenedPath(drive.imagePath) + "\r\n"
+            }
+            return .success(text)
+        }
+
+        guard let driveNumber = parseDriveNumber(driveArgument) else {
+            return .failure(101, "Invalid drive number '\(driveArgument)'")
+        }
+        guard let drive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+
+        var text = "Details for disk in drive #\(driveNumber):\r\n\r\n"
+        text += shortenedPath(drive.imagePath) + "\r\n\r\n"
+        text += "System params:\r\n"
+        text += "path: \(drive.imagePath)\r\n"
+        text += "User params:\r\n"
+        return .success(text)
+    }
+
+    private func diskInsert(_ arguments: [String]) -> DriveWireAPIResult {
+        guard arguments.count >= 2 else {
+            return .failure(10, "Syntax error")
+        }
+        guard let driveNumber = parseDriveNumber(arguments[0]) else {
+            return .failure(101, "Invalid drive number '\(arguments[0])'")
+        }
+        let path = arguments.dropFirst().joined(separator: " ")
+        do {
+            try insertVirtualDisk(driveNumber: driveNumber, imagePath: path)
+            return .success("Disk inserted in drive \(driveNumber).\r\n")
+        } catch {
+            return .failure(216, error.localizedDescription)
+        }
+    }
+
+    private func diskEject(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let argument = arguments.first, arguments.count == 1 else {
+            return .failure(10, "Syntax error")
+        }
+        if argument.lowercased() == "all" {
+            virtualDrives.removeAll()
+            return .success("Ejected all disks.\r\n")
+        }
+        guard let driveNumber = parseDriveNumber(argument) else {
+            return .failure(101, "Invalid drive number '\(argument)'")
+        }
+        guard virtualDrives.contains(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+        ejectVirtualDisk(driveNumber: driveNumber)
+        return .success("Disk ejected from drive \(driveNumber).\r\n")
+    }
+
+    private func diskReload(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let argument = arguments.first, arguments.count == 1 else {
+            return .failure(10, "dw disk reload requires a drive # or 'all' as an argument")
+        }
+        if argument.lowercased() == "all" {
+            reloadVirtualDrives()
+            return .success("All disks reloaded.\r\n")
+        }
+        guard let driveNumber = parseDriveNumber(argument) else {
+            return .failure(10, "Syntax error: non numeric drive #")
+        }
+        guard virtualDrives.contains(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+        virtualDrives.first(where: { $0.driveNumber == driveNumber })?.reload()
+        return .success("Disk in drive #\(driveNumber) reloaded.\r\n")
+    }
+
+    private func portShow() -> DriveWireAPIResult {
+        var text = "\r\nCurrent port status:\r\n\n"
+        for port in 0..<15 {
+            let channel = UInt8(port)
+            text += "/N\(port + 1)".padding(toLength: 6, withPad: " ", startingAt: 0)
+            if openVirtualSerialChannels.contains(channel) {
+                let waiting = virtualSerialInput[channel]?.count ?? 0
+                text += " "
+                text += "open".padding(toLength: 8, withPad: " ", startingAt: 0)
+                text += " "
+                text += "buf: \(waiting)".padding(toLength: 9, withPad: " ", startingAt: 0)
+            } else {
+                text += " closed"
+            }
+            text += "\r\n"
+        }
+        return .success(text)
+    }
+
+    private func serverStatus() -> DriveWireAPIResult {
+        var text = "DriveWire Swift status:\r\n\n"
+        text += "Device:        Swift host\r\n"
+        text += "DW4 support:   enabled\r\n"
+        text += "Virtual disks: \(virtualDrives.count)\r\n"
+        text += "Open ports:    \(openVirtualSerialChannels.count)\r\n"
+        text += "Last opcode:   0x\(String(statistics.lastOpCode, radix: 16))\r\n"
+        text += "Reads:         \(statistics.readCount)\r\n"
+        text += "Writes:        \(statistics.writeCount)\r\n"
+        return .success(text)
+    }
+
+    private func parseDriveNumber(_ value: String) -> Int? {
+        let trimmed = value.uppercased().hasPrefix("X") ? String(value.dropFirst()) : value
+        guard let number = Int(trimmed), number >= 0, number <= 255 else {
+            return nil
+        }
+        return number
+    }
+
+    private func shortenedPath(_ path: String) -> String {
+        let home = NSHomeDirectory()
+        if path == home {
+            return "~"
+        }
+        if path.hasPrefix(home + "/") {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
+    }
+
+    private func isVirtualWindowChannel(_ channel: UInt8) -> Bool {
+        channel >= 0x80 && channel <= 0x8F
     }
 
     private func OP_FASTWRITE_Serial(data : Data) -> Int {
+        guard data.count >= 2 else { return 0 }
+        writeVirtualSerial(channel: fastwriteChannel, data: Data([data[1]]))
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 2
     }
     
     private func OP_FASTWRITE_Screen(data : Data) -> Int {
+        guard data.count >= 2 else { return 0 }
+        writeVirtualSerial(channel: 0x80 &+ fastwriteChannel, data: Data([data[1]]))
         resetState()
         delegate?.transactionCompleted(opCode: currentTransaction)
-        return 1
+        return 2
     }
     
     private func OP_RFM(data : Data) -> Int {
@@ -1177,7 +1694,7 @@ public class DriveWireHost : Codable {
                 rfmPaths[capturedPathNumber]?.fileContents = synthesizeDirectoryEntries(for: descriptor)
             }
             delegate?.dataAvailable(host: self, data: Data([errorCode]))
-            let dirLabel = isExec ? "execDir" : "cwd"
+            let dirLabel = isExec ? "execDir" : "dataDir"
             let dirVal = isExec
                 ? (rfmCurrentExecDir[pid] ?? rfmCurrentExecDir[ppid] ?? "none")
                 : (rfmCurrentDir[pid] ?? rfmCurrentDir[ppid] ?? "none")
@@ -1247,11 +1764,15 @@ public class DriveWireHost : Codable {
         case 0x21: return "SS.Cursr"
         case 0x22: return "SS.ScSiz"
         case 0x23: return "SS.KySns"
-        case 0x24: return "SS.ComSt"
-        case 0x25: return "SS.Open"
-        case 0x26: return "SS.Close"
-        case 0x27: return "SS.HngUp"
-        case 0x28: return "SS.FSig"
+        case 0x24: return "SS.DevNm"
+        case 0x25: return "SS.FD"
+        case 0x26: return "SS.Ticks"
+        case 0x27: return "SS.Lock"
+        case 0x28: return "SS.ComSt"
+        case 0x29: return "SS.Open"
+        case 0x2A: return "SS.Close"
+        case 0x2B: return "SS.HngUp"
+        case 0x2C: return "SS.FSig"
         default:   return "0x\(String(code, radix: 16, uppercase: false))"
         }
     }
@@ -1399,11 +1920,15 @@ public class DriveWireHost : Codable {
                         }
                     }
                     errorCode = 0
-                    let dirLabel = isExec ? "execDir" : "cwd"
-                    log += "OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), \(dirLabel)=\(relativePath)) -> 0\n"
-                    print("OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), \(dirLabel)=\(relativePath)) -> 0")
+                    let dirLabel = isExec ? "execDir" : "dataDir"
+                    let line = "OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), \(dirLabel)=\(relativePath)) -> 0\n"
+                    log += line
+                    print(line)
                 } else {
                     errorCode = 216  // E$PNNF — directory not found
+                    let line = "OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID)) -> \(errorCode)\n"
+                    log += line
+                    print(line)
                 }
             }
             delegate?.dataAvailable(host: self, data: Data([errorCode]))
@@ -1815,7 +2340,7 @@ extension DriveWireHost {
                 // Send the response code to the guest.
                 delegate?.dataAvailable(host: self, data: Data([UInt8(error)]))
                 let msg = "OP_READEX(drive=\(statistics.lastDriveNumber), lsn=0x\(String(statistics.lastLSN, radix: 16))) -> \(error)"
-                log += msg + "\n"; print(msg)
+                reportActivity(msg, isFrequent: true, isError: error != DriveWireProtocolError.E_NONE.rawValue)
                 // Reset the state machine.
                 resetState()
             }
@@ -1927,14 +2452,14 @@ extension Data {
 extension DriveWireHost {
     /// A representation of a storage device.
     public class VirtualDrive : Codable {
-        
+        enum CodingKeys: String, CodingKey {
+            case driveNumber
+            case imagePath
+            case bookmarkData
+        }
+
         func didReceive(changes: String) {
-            do {
-                let u = URL(fileURLWithPath: self.imagePath)
-                self.storageContainer = try Data(contentsOf:u)
-            } catch {
-                print(error)
-            }
+            reload()
         }
         
         /// The drive number for this drive.
@@ -1945,6 +2470,7 @@ extension DriveWireHost {
         
         private var bookmarkData = Data()
         private var storageContainer = Data()
+        private var isStorageLoaded = false
         
         /// Creates a new virtual drive.
         ///
@@ -1961,10 +2487,20 @@ extension DriveWireHost {
         public func reload() {
             do {
                 let u = URL(fileURLWithPath: self.imagePath)
-                self.storageContainer = try Data(contentsOf:u)
+                self.storageContainer = try Data(contentsOf: u)
+                self.isStorageLoaded = true
             } catch {
+                self.storageContainer = Data()
+                self.isStorageLoaded = false
                 print(error)
             }
+        }
+
+        private func ensureStorageLoaded() {
+            guard !isStorageLoaded, !imagePath.isEmpty else {
+                return
+            }
+            reload()
         }
         
         /// Reads a 256 byte sector from a virtual disk.
@@ -1975,6 +2511,8 @@ extension DriveWireHost {
         /// - Parameters:
         ///     - lsn: The logical sector number to read.
         public func readSector(lsn : Int) -> (Int, Data) {
+            ensureStorageLoaded()
+
             // Seek to the offset in the file represented by the URL.
             let offsetStart = lsn * 256
             let offsetEnd = offsetStart + 256
@@ -1999,6 +2537,8 @@ extension DriveWireHost {
         ///     - lsn: The logical sector number to write.
         ///     - sector: The 256-byte sector to write.
         public func writeSector(lsn : Int, sector : Data) -> Int {
+            ensureStorageLoaded()
+
             // Seek to the offset in the file represented by the URL.
             let offsetStart = lsn * 256
             let offsetEnd = offsetStart + 256
@@ -2011,7 +2551,24 @@ extension DriveWireHost {
                 storageContainer[range] = sector
             }
 
+            isStorageLoaded = true
             return DriveWireProtocolError.E_NONE.rawValue
+        }
+
+        public required init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            self.driveNumber = try values.decode(Int.self, forKey: .driveNumber)
+            self.imagePath = try values.decode(String.self, forKey: .imagePath)
+            self.bookmarkData = try values.decodeIfPresent(Data.self, forKey: .bookmarkData) ?? Data()
+            self.storageContainer = Data()
+            self.isStorageLoaded = false
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(driveNumber, forKey: .driveNumber)
+            try container.encode(imagePath, forKey: .imagePath)
+            try container.encode(bookmarkData, forKey: .bookmarkData)
         }
     }
 }
