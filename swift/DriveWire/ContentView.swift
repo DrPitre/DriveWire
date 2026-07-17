@@ -806,11 +806,12 @@ struct SerialCommsView: View {
 
 struct TCPCommsView: View {
     @Binding var document: DriveWireDocument
+    @ObservedObject var tcpDriver: DriveWireTCPDriver
     @Binding var ipAddress: String
     @Binding var ipPort: String
 
     private var statusText: String {
-        document.tcpDriver.connected ? "Connected to \(document.tcpDriver.ipAddress):\(document.tcpDriver.ipPort)" : "Disconnected"
+        tcpDriver.connected ? "Connected to \(tcpDriver.ipAddress):\(tcpDriver.ipPort)" : "Disconnected"
     }
 
     var body: some View {
@@ -820,14 +821,14 @@ struct TCPCommsView: View {
 
             HStack(spacing: 10) {
                 Button("Connect") {
-                    document.tcpDriver.ipAddress = ipAddress
-                    document.tcpDriver.ipPort = UInt32(ipPort) ?? document.tcpDriver.ipPort
+                    tcpDriver.connect(ipAddress: ipAddress,
+                                      ipPort: UInt32(ipPort) ?? tcpDriver.ipPort)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(DriveWirePalette.accentMuted)
 
                 Button("Disconnect") {
-                    document.tcpDriver.stop()
+                    tcpDriver.stop()
                 }
                 .buttonStyle(.bordered)
             }
@@ -842,8 +843,8 @@ struct TCPCommsView: View {
                 .stroke(DriveWirePalette.border, lineWidth: 1)
         )
         .onAppear {
-            ipAddress = document.tcpDriver.ipAddress
-            ipPort = String(document.tcpDriver.ipPort)
+            ipAddress = tcpDriver.ipAddress
+            ipPort = String(tcpDriver.ipPort)
         }
     }
 }
@@ -908,7 +909,7 @@ struct ConnectionPanelView: View {
             if document.connectionType == .serial {
                 SerialCommsView(document: $document, serialDriver: document.serialDriver, portName: $selectedPortName, baudRate: $selectedBaudRate)
             } else {
-                TCPCommsView(document: $document, ipAddress: $selectedIPAddress, ipPort: $selectedIPPort)
+                TCPCommsView(document: $document, tcpDriver: document.tcpDriver, ipAddress: $selectedIPAddress, ipPort: $selectedIPPort)
             }
         }
     }
