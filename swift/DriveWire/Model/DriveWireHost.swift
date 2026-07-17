@@ -143,6 +143,8 @@ public class DriveWireHost : Codable {
     private var virtualSerialInput = [UInt8: Data]()
     private var virtualSerialCommandBuffers = [UInt8: String]()
     private var pendingClosedVirtualSerialChannels: [UInt8] = []
+    private var driveWireAPIConfig = [String: String]()
+    private var virtualDriveParameters = [Int: [String: String]]()
     
     struct RFMPathDescriptor {
         var processID = 0
@@ -1309,6 +1311,10 @@ public class DriveWireHost : Codable {
         }
 
         switch match(command, in: ["save", "set", "show"]) {
+        case .success("save"):
+            return .success("Configuration saved.\r\n")
+        case .success("set"):
+            return configSet(Array(arguments.dropFirst()))
         case .success("show"):
             return configShow(Array(arguments.dropFirst()))
         case .success(let name):
@@ -1325,6 +1331,7 @@ public class DriveWireHost : Codable {
                 DriveWireAPICommand(name: "dos", help: "Manage DOS disk images"),
                 DriveWireAPICommand(name: "eject", help: "Eject disk from drive #"),
                 DriveWireAPICommand(name: "insert", help: "Load disk into drive #"),
+                DriveWireAPICommand(name: "dump", help: "Dump sector from disk"),
                 DriveWireAPICommand(name: "reload", help: "Reload disk in drive #"),
                 DriveWireAPICommand(name: "set", help: "Set disk parameter"),
                 DriveWireAPICommand(name: "show", help: "Show current disk details"),
@@ -1332,15 +1339,21 @@ public class DriveWireHost : Codable {
             ]))
         }
 
-        switch match(command, in: ["create", "dos", "eject", "insert", "reload", "set", "show", "write"]) {
+        switch match(command, in: ["create", "dos", "dump", "eject", "insert", "reload", "set", "show", "write"]) {
+        case .success("dump"):
+            return diskDump(Array(arguments.dropFirst()))
         case .success("eject"):
             return diskEject(Array(arguments.dropFirst()))
         case .success("insert"):
             return diskInsert(Array(arguments.dropFirst()))
         case .success("reload"):
             return diskReload(Array(arguments.dropFirst()))
+        case .success("set"):
+            return diskSet(Array(arguments.dropFirst()))
         case .success("show"):
             return diskShow(Array(arguments.dropFirst()))
+        case .success("write"):
+            return diskWrite(Array(arguments.dropFirst()))
         case .success(let name):
             return .failure(204, "Command 'dw disk \(name)' is not implemented yet.")
         case .failure(let message):
@@ -1358,6 +1371,8 @@ public class DriveWireHost : Codable {
         }
 
         switch match(command, in: ["close", "open", "show"]) {
+        case .success("close"):
+            return portClose(Array(arguments.dropFirst()))
         case .success("show"):
             return portShow()
         case .success(let name):
@@ -1381,6 +1396,12 @@ public class DriveWireHost : Codable {
         }
 
         switch match(command, in: ["dir", "help", "list", "print", "show", "status", "turbo"]) {
+        case .success("dir"):
+            return serverDir(Array(arguments.dropFirst()))
+        case .success("list"):
+            return serverList(Array(arguments.dropFirst()))
+        case .success("print"):
+            return serverPrint(Array(arguments.dropFirst()))
         case .success("status"):
             return serverStatus()
         case .success("show"):
@@ -1430,8 +1451,8 @@ public class DriveWireHost : Codable {
         return lines.joined(separator: "\r\n")
     }
 
-    private func configShow(_ arguments: [String]) -> DriveWireAPIResult {
-        let items = [
+    private func currentDriveWireAPIConfig() -> [String: String] {
+        var items = [
             "CMDCols": "80",
             "DeviceType": "swift",
             "DetailedOpcodeLogging": detailedOpcodeLogging ? "true" : "false",
@@ -1439,6 +1460,14 @@ public class DriveWireHost : Codable {
             "MountedDrives": "\(virtualDrives.count)",
             "ProtectedMode": "false"
         ]
+        for (key, value) in driveWireAPIConfig {
+            items[key] = value
+        }
+        return items
+    }
+
+    private func configShow(_ arguments: [String]) -> DriveWireAPIResult {
+        let items = currentDriveWireAPIConfig()
 
         if let key = arguments.first {
             if let value = items.first(where: { $0.key.lowercased() == key.lowercased() }) {
@@ -1451,6 +1480,21 @@ public class DriveWireHost : Codable {
             .map { "\($0) = \(items[$0] ?? "")" }
             .joined(separator: "\r\n")
         return .success("Current protocol handler configuration:\r\n\n\(text)\r\n")
+    }
+
+    private func configSet(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let item = arguments.first else {
+            return .failure(10, "Syntax error: dw config set requires an item and value as arguments")
+        }
+
+        if arguments.count == 1 {
+            driveWireAPIConfig.removeValue(forKey: item)
+            return .success("Item '\(item)' removed from config\r\n")
+        }
+
+        let value = arguments.dropFirst().joined(separator: " ")
+        driveWireAPIConfig[item] = value
+        return .success("Item '\(item)' set to '\(value)'\r\n")
     }
 
     private func diskShow(_ arguments: [String]) -> DriveWireAPIResult {
@@ -1474,6 +1518,10 @@ public class DriveWireHost : Codable {
         text += shortenedPath(drive.imagePath) + "\r\n\r\n"
         text += "System params:\r\n"
         text += "path: \(drive.imagePath)\r\n"
+        let params = virtualDriveParameters[driveNumber] ?? [:]
+        if !params.isEmpty {
+            text += columnLayout(params.keys.sorted().map { "\($0): \(params[$0] ?? "")" }) + "\r\n"
+        }
         text += "User params:\r\n"
         return .success(text)
     }
@@ -1530,6 +1578,77 @@ public class DriveWireHost : Codable {
         return .success("Disk in drive #\(driveNumber) reloaded.\r\n")
     }
 
+    private func diskDump(_ arguments: [String]) -> DriveWireAPIResult {
+        guard arguments.count >= 2 else {
+            return .failure(10, "dw disk dump requires a drive # and sector # as arguments")
+        }
+        guard let driveNumber = parseDriveNumber(arguments[0]),
+              let sectorNumber = Int(arguments[1]) else {
+            return .failure(10, "Syntax error: non numeric drive # or sector #")
+        }
+        guard let drive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+
+        let (_, sector) = drive.readSector(lsn: sectorNumber)
+        return .success(hexDump(sector, baseAddress: sectorNumber * 256))
+    }
+
+    private func diskSet(_ arguments: [String]) -> DriveWireAPIResult {
+        guard arguments.count >= 3 else {
+            return .failure(10, "dw disk set requires 3 arguments.")
+        }
+        guard let driveNumber = parseDriveNumber(arguments[0]) else {
+            return .failure(101, "Invalid drive number '\(arguments[0])'")
+        }
+        guard virtualDrives.contains(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+
+        let parameter = arguments[1]
+        let value = arguments.dropFirst(2).joined(separator: " ")
+        virtualDriveParameters[driveNumber, default: [:]][parameter] = value
+        return .success("Param '\(parameter)' set for disk \(driveNumber).\r\n")
+    }
+
+    private func diskWrite(_ arguments: [String]) -> DriveWireAPIResult {
+        guard !arguments.isEmpty else {
+            return .failure(10, "Syntax error")
+        }
+        guard let driveNumber = parseDriveNumber(arguments[0]) else {
+            return .failure(101, "Invalid drive number.")
+        }
+        guard let drive = virtualDrives.first(where: { $0.driveNumber == driveNumber }) else {
+            return .failure(102, "Drive \(driveNumber) is not loaded.")
+        }
+
+        let path = arguments.count > 1 ? arguments.dropFirst().joined(separator: " ") : nil
+        do {
+            try drive.save(to: path)
+            if let path {
+                return .success("Wrote disk #\(driveNumber) to '\(path)'\r\n")
+            }
+            return .success("Wrote disk #\(driveNumber) to source image.\r\n")
+        } catch {
+            return .failure(202, error.localizedDescription)
+        }
+    }
+
+    private func portClose(_ arguments: [String]) -> DriveWireAPIResult {
+        guard let portArgument = arguments.first else {
+            return .failure(10, "dw port close requires a port # as an argument")
+        }
+        guard arguments.count == 1, let portNumber = Int(portArgument), portNumber >= 0, portNumber < 15 else {
+            return .failure(10, "Syntax error: non numeric port #")
+        }
+
+        let channel = UInt8(portNumber)
+        openVirtualSerialChannels.remove(channel)
+        virtualSerialInput[channel]?.removeAll()
+        virtualSerialCommandBuffers[channel] = ""
+        return .success("Port #\(portNumber) closed.\r\n")
+    }
+
     private func portShow() -> DriveWireAPIResult {
         var text = "\r\nCurrent port status:\r\n\n"
         for port in 0..<15 {
@@ -1561,12 +1680,111 @@ public class DriveWireHost : Codable {
         return .success(text)
     }
 
+    private func serverDir(_ arguments: [String]) -> DriveWireAPIResult {
+        guard !arguments.isEmpty else {
+            return .failure(10, "dw server dir requires a URI or path as an argument")
+        }
+
+        let path = arguments.joined(separator: " ")
+        let url = serverFileURL(from: path)
+        do {
+            let children = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
+                .map { $0.lastPathComponent }
+                .sorted()
+            var text = "Directory of \(url.path)\r\n\n"
+            let width = (children.map(\.count).max() ?? 1) + 2
+            let perLine = max(1, 80 / max(width, 1))
+            for (index, child) in children.enumerated() {
+                text += child.padding(toLength: width, withPad: " ", startingAt: 0)
+                if (index + 1) % perLine == 0 {
+                    text += "\r\n"
+                }
+            }
+            if !text.hasSuffix("\r\n") {
+                text += "\r\n"
+            }
+            return .success(text)
+        } catch {
+            return .failure(201, error.localizedDescription)
+        }
+    }
+
+    private func serverList(_ arguments: [String]) -> DriveWireAPIResult {
+        guard !arguments.isEmpty else {
+            return .failure(10, "dw server list requires a URI or local file path as an argument")
+        }
+
+        let path = arguments.joined(separator: " ")
+        do {
+            let data = try Data(contentsOf: serverFileURL(from: path))
+            let text: String
+            if let utf8 = String(data: data, encoding: .utf8) {
+                text = utf8
+            } else if let ascii = String(data: data, encoding: .ascii) {
+                text = ascii
+            } else {
+                text = data.map { byte -> String in
+                    if byte == 0x0A {
+                        return "\r\n"
+                    }
+                    return String(UnicodeScalar(Int(byte)) ?? ".")
+                }.joined()
+            }
+            return .success(text.hasSuffix("\r") || text.hasSuffix("\n") ? text : text + "\r\n")
+        } catch {
+            return .failure(202, error.localizedDescription)
+        }
+    }
+
+    private func serverPrint(_ arguments: [String]) -> DriveWireAPIResult {
+        guard !arguments.isEmpty else {
+            return .failure(10, "dw server print requires a URI or local file path as an argument")
+        }
+
+        let path = arguments.joined(separator: " ")
+        do {
+            printBuffer.append(try Data(contentsOf: serverFileURL(from: path)))
+            return .success("Sent item to printer\r\n")
+        } catch {
+            return .failure(202, error.localizedDescription)
+        }
+    }
+
     private func parseDriveNumber(_ value: String) -> Int? {
         let trimmed = value.uppercased().hasPrefix("X") ? String(value.dropFirst()) : value
         guard let number = Int(trimmed), number >= 0, number <= 255 else {
             return nil
         }
         return number
+    }
+
+    private func serverFileURL(from path: String) -> URL {
+        let normalized = path.replacingOccurrences(of: "*", with: "!")
+        if let url = URL(string: normalized), url.isFileURL {
+            return url
+        }
+        if normalized.hasPrefix("~/") {
+            return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(String(normalized.dropFirst(2)))
+        }
+        if (normalized as NSString).isAbsolutePath {
+            return URL(fileURLWithPath: normalized)
+        }
+        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(normalized)
+    }
+
+    private func hexDump(_ data: Data, baseAddress: Int) -> String {
+        var lines: [String] = []
+        let bytes = Array(data)
+        for offset in stride(from: 0, to: bytes.count, by: 16) {
+            let chunk = bytes[offset..<min(offset + 16, bytes.count)]
+            let hex = chunk.map { String(format: "%02X", $0) }.joined(separator: " ")
+                .padding(toLength: 47, withPad: " ", startingAt: 0)
+            let ascii = chunk.map { byte -> String in
+                byte >= 0x20 && byte < 0x7F ? String(UnicodeScalar(byte)) : "."
+            }.joined()
+            lines.append(String(format: "%06X  %@  %@", baseAddress + offset, hex, ascii))
+        }
+        return lines.joined(separator: "\r\n") + "\r\n"
     }
 
     private func shortenedPath(_ path: String) -> String {
@@ -2553,6 +2771,18 @@ extension DriveWireHost {
 
             isStorageLoaded = true
             return DriveWireProtocolError.E_NONE.rawValue
+        }
+
+        public func save(to path: String? = nil) throws {
+            ensureStorageLoaded()
+            let destination = path ?? imagePath
+            guard !destination.isEmpty else {
+                throw CocoaError(.fileNoSuchFile)
+            }
+            try storageContainer.write(to: URL(fileURLWithPath: destination), options: .atomic)
+            if let path {
+                imagePath = path
+            }
         }
 
         public required init(from decoder: Decoder) throws {
