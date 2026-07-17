@@ -157,9 +157,18 @@ public class DriveWireHost : Codable {
     private var pendingClosedVirtualSerialChannels: [UInt8] = []
     private var clientRestartRequested = false
     private var virtualSerialTCPConnections = [UInt8: VirtualSerialTCPConnection]()
+    private var virtualSerialTCPListeners = [UInt16: NWListener]()
+    private var pendingVirtualSerialTCPConnections = [Int: PendingVirtualSerialTCPConnection]()
+    private var nextVirtualSerialTCPConnectionID = 1
     private var driveWireAPIConfig = [String: String]()
     private var virtualDriveParameters = [Int: [String: String]]()
     private var midiBackend: DriveWireMIDIBackend = DriveWireMIDIBackendFactory.makeDefault()
+
+    private struct PendingVirtualSerialTCPConnection {
+        let connection: NWConnection
+        let localPort: UInt16
+        let remoteAddress: String
+    }
 
     private final class VirtualSerialTCPConnection {
         private let connection: NWConnection
@@ -177,6 +186,15 @@ public class DriveWireHost : Codable {
             self.onClose = onClose
             self.queue = DispatchQueue(label: "DriveWire.VirtualSerialTCP.\(host).\(port)")
             self.connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+        }
+
+        init(connection: NWConnection, host: String, port: UInt16, onReceive: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
+            self.host = host
+            self.port = port
+            self.onReceive = onReceive
+            self.onClose = onClose
+            self.queue = DispatchQueue(label: "DriveWire.VirtualSerialTCP.Accepted.\(host).\(port)")
+            self.connection = connection
         }
 
         func start() {
@@ -819,6 +837,15 @@ public class DriveWireHost : Codable {
             connection.close()
         }
         virtualSerialTCPConnections.removeAll()
+        for listener in virtualSerialTCPListeners.values {
+            listener.cancel()
+        }
+        virtualSerialTCPListeners.removeAll()
+        for pending in pendingVirtualSerialTCPConnections.values {
+            pending.connection.cancel()
+        }
+        pendingVirtualSerialTCPConnections.removeAll()
+        nextVirtualSerialTCPConnectionID = 1
         virtualWindows.removeAll()
         printBuffer.removeAll()
         resetRFMState()
@@ -1436,6 +1463,8 @@ public class DriveWireHost : Codable {
             if response.hasPrefix("OK ") {
                 pendingClosedVirtualSerialChannels.append(channel)
             }
+        } else if command.lowercased().hasPrefix("tcp ") || command.lowercased() == "tcp" {
+            enqueueVirtualSerialResponse(processVirtualSerialTCPCommand(command, channel: channel), channel: channel)
         } else {
             enqueueVirtualSerialResponse(driveWireAPIFailure(code: 10, text: "Unknown command '\(command)'"), channel: channel)
         }
@@ -1458,6 +1487,152 @@ public class DriveWireHost : Codable {
 
     private func driveWireAPIFailure(code: UInt8, text: String) -> String {
         String(format: "FAIL %03d %@\r", Int(code), text)
+    }
+
+    private func virtualSerialTCPSuccess(_ text: String = "") -> String {
+        text.isEmpty ? "SUCCESS\n\r" : "SUCCESS\n\r" + text
+    }
+
+    private func virtualSerialTCPFailure(_ text: String = "") -> String {
+        text.isEmpty ? "FAIL\n\r" : "FAIL\n\r" + text
+    }
+
+    private func processVirtualSerialTCPCommand(_ command: String, channel: UInt8) -> String {
+        let arguments = command.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        guard arguments.count >= 2 else {
+            return "tcp commands:\n\r    connect <server> <port>\n\r    listen <port>\n\r    join <con#>\n\r    kill <con#>\n\r"
+        }
+
+        switch arguments[1].lowercased() {
+        case "connect":
+            return tcpConnect(Array(arguments.dropFirst(2)), channel: channel)
+        case "listen":
+            return tcpListen(Array(arguments.dropFirst(2)), channel: channel)
+        case "join":
+            return tcpJoin(Array(arguments.dropFirst(2)), channel: channel)
+        case "kill":
+            return tcpKill(Array(arguments.dropFirst(2)))
+        default:
+            return virtualSerialTCPFailure()
+        }
+    }
+
+    private func tcpConnect(_ arguments: [String], channel: UInt8) -> String {
+        guard arguments.count >= 2, let tcpPort = UInt16(arguments[1]), tcpPort > 0 else {
+            return virtualSerialTCPFailure()
+        }
+
+        let host = arguments[0]
+        virtualSerialTCPConnections[channel]?.close()
+        openVirtualSerialChannels.insert(channel)
+
+        let connection = makeVirtualSerialTCPConnection(channel: channel, host: host, port: tcpPort)
+        virtualSerialTCPConnections[channel] = connection
+        connection.start()
+        return virtualSerialTCPSuccess()
+    }
+
+    private func tcpListen(_ arguments: [String], channel: UInt8) -> String {
+        guard let portText = arguments.first, let tcpPort = UInt16(portText), tcpPort > 0 else {
+            return virtualSerialTCPFailure()
+        }
+
+        do {
+            virtualSerialTCPListeners[tcpPort]?.cancel()
+            let listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: tcpPort)!)
+            listener.newConnectionHandler = { [weak self] connection in
+                DispatchQueue.main.async {
+                    self?.acceptVirtualSerialTCPConnection(connection, localPort: tcpPort, announceOn: channel)
+                }
+            }
+            listener.stateUpdateHandler = { state in
+                if case .failed(let error) = state {
+                    print("Virtual serial TCP listen failed on \(tcpPort): \(error)")
+                }
+            }
+            listener.start(queue: .main)
+            virtualSerialTCPListeners[tcpPort] = listener
+            openVirtualSerialChannels.insert(channel)
+            return virtualSerialTCPSuccess()
+        } catch {
+            return virtualSerialTCPFailure()
+        }
+    }
+
+    private func tcpJoin(_ arguments: [String], channel: UInt8) -> String {
+        guard let idText = arguments.first, let connectionID = Int(idText),
+              let pending = pendingVirtualSerialTCPConnections.removeValue(forKey: connectionID) else {
+            return virtualSerialTCPFailure()
+        }
+
+        virtualSerialTCPConnections[channel]?.close()
+        openVirtualSerialChannels.insert(channel)
+        let connection = makeVirtualSerialTCPConnection(
+            channel: channel,
+            connection: pending.connection,
+            host: pending.remoteAddress,
+            port: pending.localPort
+        )
+        virtualSerialTCPConnections[channel] = connection
+        connection.start()
+        return virtualSerialTCPSuccess()
+    }
+
+    private func tcpKill(_ arguments: [String]) -> String {
+        guard let idText = arguments.first, let connectionID = Int(idText),
+              let pending = pendingVirtualSerialTCPConnections.removeValue(forKey: connectionID) else {
+            return virtualSerialTCPFailure()
+        }
+
+        pending.connection.cancel()
+        return virtualSerialTCPSuccess()
+    }
+
+    private func acceptVirtualSerialTCPConnection(_ connection: NWConnection, localPort: UInt16, announceOn channel: UInt8) {
+        let connectionID = nextVirtualSerialTCPConnectionID
+        nextVirtualSerialTCPConnectionID += 1
+        let remoteAddress = remoteAddressDescription(for: connection.endpoint)
+        pendingVirtualSerialTCPConnections[connectionID] = PendingVirtualSerialTCPConnection(
+            connection: connection,
+            localPort: localPort,
+            remoteAddress: remoteAddress
+        )
+        enqueueVirtualSerialResponse("\(connectionID) \(localPort) \(remoteAddress)\n\r", channel: channel)
+    }
+
+    private func remoteAddressDescription(for endpoint: NWEndpoint) -> String {
+        switch endpoint {
+        case .hostPort(let host, _):
+            return "\(host)"
+        default:
+            return "\(endpoint)"
+        }
+    }
+
+    private func makeVirtualSerialTCPConnection(channel: UInt8, host: String, port: UInt16) -> VirtualSerialTCPConnection {
+        VirtualSerialTCPConnection(host: host, port: port, onReceive: { [weak self] data in
+            DispatchQueue.main.async {
+                self?.virtualSerialInput[channel, default: Data()].append(data)
+            }
+        }, onClose: { [weak self] in
+            DispatchQueue.main.async {
+                self?.virtualSerialTCPConnections[channel] = nil
+                self?.openVirtualSerialChannels.remove(channel)
+            }
+        })
+    }
+
+    private func makeVirtualSerialTCPConnection(channel: UInt8, connection: NWConnection, host: String, port: UInt16) -> VirtualSerialTCPConnection {
+        VirtualSerialTCPConnection(connection: connection, host: host, port: port, onReceive: { [weak self] data in
+            DispatchQueue.main.async {
+                self?.virtualSerialInput[channel, default: Data()].append(data)
+            }
+        }, onClose: { [weak self] in
+            DispatchQueue.main.async {
+                self?.virtualSerialTCPConnections[channel] = nil
+                self?.openVirtualSerialChannels.remove(channel)
+            }
+        })
     }
 
     private func processDriveWireAPICommand(_ command: String) -> String {
@@ -2146,16 +2321,7 @@ public class DriveWireHost : Codable {
         virtualSerialTCPConnections[channel]?.close()
         openVirtualSerialChannels.insert(channel)
 
-        let connection = VirtualSerialTCPConnection(host: host, port: tcpPort, onReceive: { [weak self] data in
-            DispatchQueue.main.async {
-                self?.virtualSerialInput[channel, default: Data()].append(data)
-            }
-        }, onClose: { [weak self] in
-            DispatchQueue.main.async {
-                self?.virtualSerialTCPConnections[channel] = nil
-                self?.openVirtualSerialChannels.remove(channel)
-            }
-        })
+        let connection = makeVirtualSerialTCPConnection(channel: channel, host: host, port: tcpPort)
         virtualSerialTCPConnections[channel] = connection
         connection.start()
 

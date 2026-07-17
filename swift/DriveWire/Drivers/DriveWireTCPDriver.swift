@@ -73,7 +73,7 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
         if logging == true {
             data.dump(prefix: "<-")
         }
-        //        serialPort?.send(data)
+        send(data: data)
     }
     
     override init() {
@@ -93,8 +93,18 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
         self.ipPort = ipPort
         connect()
     }
+
+    /// Connects to the given endpoint, replacing any current connection.
+    public func connect(ipAddress: String, ipPort: UInt32) {
+        isRestoringState = true
+        self.ipAddress = ipAddress
+        self.ipPort = ipPort
+        isRestoringState = false
+        reconnect()
+    }
     
     func connect() {
+        quit = false
         var readStream: Unmanaged<CFReadStream>?
         var writeStream: Unmanaged<CFWriteStream>?
         
@@ -124,27 +134,43 @@ class DriveWireTCPDriver : NSObject, DriveWireDelegate, ObservableObject, Codabl
     }
     
     private func readLoop() {
-        while !quit, let stream = inputStream, stream.hasBytesAvailable {
-            let bytesRead = stream.read(&readBuffer, maxLength: readBuffer.count)
-            if bytesRead > 0 {
-                let data = Data(readBuffer[0..<bytesRead])
-                DispatchQueue.main.async {
-                    self.dataAvailable(host: self.host, data: data)
+        while !quit, let stream = inputStream {
+            if stream.hasBytesAvailable {
+                let bytesRead = stream.read(&readBuffer, maxLength: readBuffer.count)
+                if bytesRead > 0 {
+                    let data = Data(readBuffer[0..<bytesRead])
+                    if logging == true {
+                        data.dump(prefix: "->")
+                    }
+                    DispatchQueue.main.async {
+                        var incoming = data
+                        self.host.send(data: &incoming)
+                    }
+                } else {
+                    if bytesRead < 0 {
+                        print("Input stream error: \(stream.streamError?.localizedDescription ?? "unknown")")
+                    }
+                    break
                 }
             } else {
-                if bytesRead < 0 {
-                    print("Input stream error: \(stream.streamError?.localizedDescription ?? "unknown")")
-                }
-                break
+                Thread.sleep(forTimeInterval: 0.01)
             }
-            Thread.sleep(forTimeInterval: 0.01)
         }
     }
     
     public func send(data: Data) {
         guard let outputStream = outputStream else { return }
-        data.withUnsafeBytes {
-            _ = outputStream.write($0.bindMemory(to: UInt8.self).baseAddress!, maxLength: data.count)
+        data.withUnsafeBytes { buffer in
+            guard let bytes = buffer.bindMemory(to: UInt8.self).baseAddress else { return }
+            var written = 0
+            while written < data.count {
+                let result = outputStream.write(bytes + written, maxLength: data.count - written)
+                if result <= 0 {
+                    print("Output stream error: \(outputStream.streamError?.localizedDescription ?? "unknown")")
+                    return
+                }
+                written += result
+            }
         }
     }
     
