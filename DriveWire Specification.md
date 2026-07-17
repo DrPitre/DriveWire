@@ -579,6 +579,360 @@ Byte      | Value
 1          |  Length of name
 2-258   |  Name
 
+## Remote File Manager (RFM)
+
+**Note: RFM is an unofficial extension, currently implemented only by the Swift host. It is documented here so that other hosts and guest drivers can implement it consistently. It is not part of the DW3/DW4 baseline and guests should not assume a given server supports it.**
+
+RFM gives the CoCo direct access to files and directories on the Server's file system, rather than to fixed-size sector images. It was designed to back an OS-9 device driver, so its semantics (path descriptors, GetStat/SetStat codes, synthesized file descriptors) mirror the OS-9 RBF/SCF conventions rather than the disk-image sector model used elsewhere in this specification.
+
+All RFM transactions share the same envelope:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  RFM sub-opcode (see table below)
+
+The remaining bytes of the transaction, and the response, depend on the sub-opcode. Multiple files/directories may be open concurrently; each open is identified by a **path number** (0-255) chosen by the CoCo and passed as the first byte of every subsequent sub-opcode's payload. The Server maintains a per-path descriptor (host file handle, current position, open mode, resolved pathname) until the path is closed.
+
+The Server confines all path resolution to a configured root directory (analogous to a device's root). Any pathname that would resolve outside of that root is rejected with error code 214 (E$FNA) rather than followed.
+
+RFM error codes returned in the single-byte error responses are OS-9 style:
+
+Code (dec) | Code (hex) | Meaning
+-----------|------------|--------
+0            | $00 | Success
+211         | $D3  | E$EOF -- end of file
+214         | $D6  | E$FNA -- file/path not accessible (includes root-escape attempts, permission denied, or path is a directory when a file was expected)
+215         | $D7  | E$DNE -- directory not empty (delete of a non-empty directory)
+216         | $D8  | E$PNNF -- path not found
+
+### RFM sub-opcodes
+
+Sub-opcode | Value | Name | Direction
+-----------|-------|------|----------
+1  | $01 | OP_RFM_CREATE | bi-directional
+2  | $02 | OP_RFM_OPEN     | bi-directional
+3  | $03 | OP_RFM_MAKDIR | bi-directional
+4  | $04 | OP_RFM_CHGDIR | bi-directional
+5  | $05 | OP_RFM_DELETE | bi-directional
+6  | $06 | OP_RFM_SEEK     | bi-directional
+7  | $07 | OP_RFM_READ     | bi-directional
+8  | $08 | OP_RFM_WRITE   | uni-directional
+9  | $09 | OP_RFM_READLN | bi-directional
+10 | $0A | OP_RFM_WRITLN | uni-directional
+11 | $0B | OP_RFM_GETSTT | bi-directional
+12 | $0C | OP_RFM_SETSTT | uni-directional
+13 | $0D | OP_RFM_CLOSE   | bi-directional
+
+### Two directory contexts: data vs. execution
+
+RFM tracks **two separate current-directory values per CoCo process**: a data directory (used to resolve relative pathnames for ordinary file access) and an execution directory (used to resolve relative pathnames when loading/executing code). This mirrors OS-9's distinction between a process's data and execution search paths. Every CREATE/OPEN/MAKDIR/CHGDIR/DELETE request carries a mode byte whose bit 2 ($04) selects which of the two directory contexts applies to that request; CHGDIR updates only the selected context. Each process's current directory falls back to its parent process's current directory if it has not set its own.
+
+### OP_RFM_CREATE / OP_RFM_OPEN
+
+CREATE opens a file for writing, creating it if it does not exist. OPEN opens an existing file or directory for reading (or read/write, per the mode byte). Both share the same wire format.
+
+CoCo sends:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_CREATE ($01) or OP_RFM_OPEN ($02)
+2           |  Path number (0-255)
+3           |  Process ID
+4           |  Parent process ID
+5           |  Mode byte (bit 7 $80 = directory open; bit 2 $04 = use execution directory instead of data directory; bits 1 and 3 relate to write access)
+6-n       |  Pathname, terminated by a carriage return ($0D). High bit of each pathname byte is ignored.
+
+Server response:
+
+Byte      | Value
+-----------|----------
+0           |  Error code (0 = success)
+
+If the mode byte indicates a directory open and the open succeeds, the Server synthesizes OS-9 style directory contents (see GETSTT/SS.FD below) for subsequent reads on that path.
+
+### OP_RFM_MAKDIR
+
+Creates a directory (including intermediate directories).
+
+CoCo sends:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_MAKDIR ($03)
+2           |  Path number
+3           |  Process ID
+4           |  Parent process ID
+5           |  Mode byte (bit 2 $04 = execution directory context)
+6-n       |  Pathname, terminated by $0D
+
+Server response:
+
+Byte      | Value
+-----------|----------
+0           |  Error code (0 = success)
+
+### OP_RFM_CHGDIR
+
+Changes the CoCo process's current directory (data or execution, per the mode byte) to the given path. The pathname may use OS-9 multi-dot notation (".." = parent, "..." = grandparent, and so on -- N dots means N-1 levels up).
+
+CoCo sends:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_CHGDIR ($04)
+2           |  Path number
+3           |  Process ID
+4           |  Parent process ID
+5           |  Mode byte (bit 2 $04 = execution directory context)
+6-n       |  Pathname, terminated by $0D
+
+Server response:
+
+Byte      | Value
+-----------|----------
+0           |  Error code (0 = success, 216 = path not found)
+
+A pathname that would resolve above the Server's device root is clamped to that root rather than rejected.
+
+### OP_RFM_DELETE
+
+Deletes a file, or an empty directory.
+
+CoCo sends:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_DELETE ($05)
+2           |  Path number
+3           |  Process ID
+4           |  Parent process ID
+5           |  Mode byte (bit 2 $04 = execution directory context)
+6-n       |  Pathname, terminated by $0D
+
+Server response:
+
+Byte      | Value
+-----------|----------
+0           |  Error code (0 = success, 214 = access denied/escapes root, 215 = directory not empty, 216 = not found)
+
+### OP_RFM_SEEK
+
+Sets the current file position for an already-open path.
+
+CoCo sends:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_SEEK ($06)
+2           |  Path number
+3           |  Bits 31-24 of the new 32-bit file position
+4           |  Bits 23-16 of the new file position
+5           |  Bits 15-8 of the new file position
+6           |  Bits 7-0 of the new file position
+
+Server response:
+
+Byte      | Value
+-----------|----------
+0           |  Error code (always 0)
+
+### OP_RFM_READ
+
+Reads up to the requested number of bytes from the current file position and advances the position by the number of bytes actually returned.
+
+CoCo sends:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_READ ($07)
+2           |  Path number
+3           |  Bits 15-8 of the maximum number of bytes requested
+4           |  Bits 7-0 of the maximum number of bytes requested
+
+Server response:
+
+Byte      | Value
+-----------|----------
+0           |  Bits 15-8 of the number of bytes returned (0 if at end of file or the path is unknown)
+1           |  Bits 7-0 of the number of bytes returned
+2-n       |  That many bytes of file data (omitted if the count is 0)
+
+A returned count of 0 indicates end of file; the CoCo should treat this as E$EOF. The Server waits briefly (on the order of 2 milliseconds) after sending the byte count and before sending the data payload, to give a software (bit-banger) serial driver on the CoCo time to prepare its receive buffer.
+
+### OP_RFM_WRITE
+
+Writes bytes to the current file position and advances the position. This is a uni-directional transaction; the Server does not acknowledge it.
+
+CoCo sends:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_WRITE ($08)
+2           |  Path number
+3           |  Bits 15-8 of the byte count
+4           |  Bits 7-0 of the byte count
+5-n       |  Data bytes to write
+
+### OP_RFM_READLN
+
+Identical to OP_RFM_READ, except that the Server stops at the first line feed byte in the file (which it translates to a carriage return, $0D, in the returned data) or at the requested maximum, whichever comes first.
+
+CoCo sends:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_READLN ($09)
+2           |  Path number
+3           |  Bits 15-8 of the maximum number of bytes requested
+4           |  Bits 7-0 of the maximum number of bytes requested
+
+Server response:
+
+Byte      | Value
+-----------|----------
+0           |  Bits 15-8 of the number of bytes returned (0 if at end of file or the path is unknown)
+1           |  Bits 7-0 of the number of bytes returned
+2-n       |  Line data, including the trailing $0D if a line end was found (omitted if the count is 0)
+
+### OP_RFM_WRITLN
+
+Writes a single line to the current file position. This is a uni-directional transaction; the Server does not acknowledge it. The Server writes bytes up to (but not including) the first carriage return ($0D) or $FF byte in the supplied data, translating a terminating $0D to a line feed ($0A) on disk; any bytes after the terminator are considered stale buffer contents and discarded.
+
+CoCo sends:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_WRITLN ($0A)
+2           |  Path number
+3           |  Bits 15-8 of the byte count
+4           |  Bits 7-0 of the byte count
+5-n       |  Data bytes, normally terminated by $0D
+
+### OP_RFM_GETSTT
+
+Retrieves status information about an open path. The request carries a GetStat code using the same SS.* code space as OP_GETSTAT/OP_SETSTAT elsewhere in this specification.
+
+CoCo sends:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_GETSTT ($0B)
+2           |  Path number
+3           |  GetStat code
+
+Currently supported GetStat codes:
+
+**SS.Size ($02)** -- returns the file's size as a 4-byte big-endian value. No further bytes are sent by the CoCo.
+
+Byte      | Value
+-----------|----------
+0-3       |  File size, 32-bit big-endian
+
+**SS.Pos ($05)** -- returns the file's current position as a 4-byte big-endian value. No further bytes are sent by the CoCo.
+
+Byte      | Value
+-----------|----------
+0-3       |  Current file position, 32-bit big-endian
+
+**SS.EOF ($06)** -- returns whether the path is at end of file. No further bytes are sent by the CoCo.
+
+Byte      | Value
+-----------|----------
+0           |  0 (not at EOF) or 211/E$EOF (at EOF)
+
+**SS.FD ($0F)** -- returns a synthesized OS-9 file descriptor for the path (see "Synthesized file descriptors" below). After the initial 4-byte GETSTT request, the CoCo sends 2 more bytes and the Server replies with the requested number of descriptor bytes (capped at 256):
+
+Byte      | Value
+-----------|----------
+0           |  Bits 15-8 of the number of bytes requested
+1           |  Bits 7-0 of the number of bytes requested
+
+Server response:
+
+Byte      | Value
+-----------|----------
+0-n       |  Up to 256 bytes of synthesized file descriptor data
+
+**SS.FDInf ($20)** -- returns a synthesized OS-9 file descriptor for a directory entry previously returned by SS.FD, identified by its LSN rather than by an open path. After the initial 4-byte GETSTT request, the CoCo sends 4 more bytes:
+
+Byte      | Value
+-----------|----------
+0           |  Bits 23-16 of the LSN
+1           |  Unused
+2           |  Bits 15-8 of the LSN
+3           |  Bits 7-0 of the LSN
+
+Server response:
+
+Byte      | Value
+-----------|----------
+0-255   |  256 bytes of synthesized file descriptor data
+
+Any other GetStat code is accepted but produces no response payload.
+
+### OP_RFM_SETSTT
+
+Currently a no-op: the Server consumes only the 2-byte OP_RFM/sub-opcode header and sends no response and expects no further bytes from the CoCo.
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_SETSTT ($0C)
+
+### OP_RFM_CLOSE
+
+Closes a path and releases its descriptor.
+
+CoCo sends:
+
+Byte      | Value
+-----------|----------
+0           |  OP_RFM ($D6)
+1           |  OP_RFM_CLOSE ($0D)
+2           |  Path number
+
+Server response:
+
+Byte      | Value
+-----------|----------
+0           |  Error code (always 0)
+
+### Synthesized directory listings
+
+When a path is opened as a directory (mode bit $80 set on OPEN), the Server synthesizes its contents as a sequence of 32-byte OS-9 style directory entries readable via OP_RFM_READ:
+
+Byte      | Value
+-----------|----------
+0-28     |  Entry name, up to 29 characters, with the high bit of the last character set to mark the end of the name
+29-31   |  A 24-bit LSN identifying this entry, for use with GETSTT/SS.FDInf
+
+The first two entries are always "." (the directory itself) and ".." (its parent); at the Server's device root, ".." refers back to the root itself. The LSNs used here are Server-assigned identifiers for host paths and bear no relation to physical sector numbers; they exist only so that SS.FDInf can be used to retrieve a file descriptor for a directory entry without opening it as a path.
+
+### Synthesized file descriptors
+
+GETSTT/SS.FD and GETSTT/SS.FDInf both return a file descriptor sector synthesized from the underlying host file's attributes, in OS-9 FD format:
+
+Byte      | Value
+-----------|----------
+0           |  FD.ATT: attribute byte. Bit 7 ($80) set if a directory. Bits 0-5 are owner read/write/execute and public read/write/execute, derived from the host file's POSIX permissions.
+1-2       |  FD.OWN: owner ID (always 0)
+3-7       |  FD.DAT: last modification date/time (year-1900, month, day, hour, minute)
+8           |  FD.LNK: link count (always 1)
+9-12     |  FD.SIZ: file size, 32-bit big-endian
+13-15   |  FD.Creat: creation date (year-1900, month, day)
+16-n     |  FD.SEG: segment list; always zero, since RFM files have no physical sector allocation
+
 ## WireBug Mode
 
 **Note that WireBug is not yet implemented. Looking for a cool project??**
@@ -1373,7 +1727,7 @@ OP_SERWRITE              |  195  (0xC3)  | C+128 | DW 4.0.0 |
 OP_SERSETSTAT         |  196  (0xC4)  | D+128 | DW 4.0.0 |
 OP_SERTERM              | 197   (0xC5)  | E+128 | DW 4.0.5 |
 OP_READEX                | 210   (0xD2)  | R+128  | DW 3 |
-OP_RFM                       | 214   (0xD6)  |  V+128 | N/A |
+OP_RFM                       | 214   (0xD6)  |  V+128 | Unofficial | See "Remote File Manager (RFM)" section |
 OP_230K230K               | 230   (0xE6)  |            |  DW 4.0.0  | For 230k mode
 OP_REREADEX            | 242   (0xF2)  | r+128   | DW 3 |
 OP_RESET3                 | 248   (0xF8)  |            | DW 4.0.0 |
