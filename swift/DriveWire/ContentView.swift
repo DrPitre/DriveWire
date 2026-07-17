@@ -8,6 +8,7 @@
 import SwiftUI
 import ORSSerial
 import AppKit
+import UniformTypeIdentifiers
 
 private enum DriveWirePalette {
     static let canvasTop = Color(red: 0.08, green: 0.11, blue: 0.12)
@@ -514,6 +515,7 @@ struct DriveRowView: View {
                     .tint(DriveWirePalette.accentMuted)
                 Button("Eject", role: .destructive, action: onEject)
                     .buttonStyle(.bordered)
+                    .tint(imagePath == nil ? DriveWirePalette.softText : Color(red: 0.95, green: 0.42, blue: 0.42))
                     .disabled(imagePath == nil)
             }
             .controlSize(.small)
@@ -575,6 +577,10 @@ struct DrivesPanelView: View {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: "dsk"),
+            UTType(filenameExtension: "img")
+        ].compactMap { $0 }
 
         guard panel.runModal() == .OK, let path = panel.url?.path(percentEncoded: false) else {
             return
@@ -630,6 +636,7 @@ struct SerialPortSelector: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
+                .tint(.white)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -643,6 +650,7 @@ struct SerialPortSelector: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
+                .tint(.white)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(width: 160, alignment: .topLeading)
@@ -830,6 +838,7 @@ struct TCPCommsView: View {
                     document.tcpDriver.stop()
                 }
                 .buttonStyle(.bordered)
+                .tint(.white)
             }
         }
         .padding(16)
@@ -934,6 +943,7 @@ struct LoggingPanelView: View {
                     NSPasteboard.general.setString(logText, forType: .string)
                 }
                 .buttonStyle(.bordered)
+                .tint(.white)
 
                 Toggle("Detailed opcodes", isOn: $detailedOpcodeLogging)
                     .toggleStyle(.switch)
