@@ -52,7 +52,7 @@ class DriveWireTCPServerDriver : NSObject, DriveWireDelegate, ObservableObject {
         self.bridgedChannelCount = bridgedChannelCount
         super.init()
         host = DriveWireHost(delegate: self)
-        host.bridgedChannels = Set((0..<bridgedChannelCount).map { UInt8($0) })
+        host.bridgeChannels(Set((0..<bridgedChannelCount).map { UInt8($0) }))
     }
 
     /// Starts the becker listener and one bridge listener per channel.

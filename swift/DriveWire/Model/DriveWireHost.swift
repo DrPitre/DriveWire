@@ -157,8 +157,9 @@ public class DriveWireHost : Codable {
     private var processor : ((Data) -> Int)?
     /// Channels whose raw guest bytes flow to the delegate's
     /// ``DriveWireDelegate/channelDataAvailable(host:channel:data:)`` instead
-    /// of the built-in dw command processor.
-    public var bridgedChannels = Set<UInt8>()
+    /// of the built-in dw command processor. Register channels with
+    /// ``bridgeChannels(_:)``.
+    public private(set) var bridgedChannels = Set<UInt8>()
     private var openVirtualSerialChannels = Set<UInt8>()
     private var virtualSerialInput = [UInt8: Data]()
     private var virtualSerialCommandBuffers = [UInt8: String]()
@@ -1213,8 +1214,26 @@ public class DriveWireHost : Codable {
         return Data(response)
     }
 
+    /// Registers the channels whose raw guest bytes bypass the built-in dw
+    /// command processor and flow to the delegate's
+    /// ``DriveWireDelegate/channelDataAvailable(host:channel:data:)``.
+    ///
+    /// The host performs no internal synchronization: call this from the same
+    /// queue that delivers guest traffic to ``send(data:)``, ideally before
+    /// any traffic arrives. Channels not registered here keep the default
+    /// behavior of feeding the dw command processor.
+    ///
+    /// - Parameter channels: The virtual serial channels to bridge.
+    public func bridgeChannels(_ channels : Set<UInt8>) {
+        bridgedChannels = channels
+    }
+
     /// Queues host-side data for the guest to fetch from a virtual serial
     /// channel via its OP_SERREAD polls.
+    ///
+    /// Bytes queue even when the channel is not yet open, so input sent while
+    /// the guest is still booting is delivered once the channel's polls
+    /// begin. This is deliberate type-ahead; nothing is dropped on this path.
     ///
     /// - Parameters:
     ///     - data: The bytes to deliver to the guest.
@@ -1233,10 +1252,15 @@ public class DriveWireHost : Codable {
     /// Closes a virtual serial channel from the host side.
     ///
     /// The close is reported to the guest in an OP_SERREAD poll once any
-    /// queued channel input has drained.
+    /// queued channel input has drained. Ignored when the channel is not
+    /// open or a close is already pending.
     ///
     /// - Parameter channel: The virtual serial channel to close.
     public func closeChannel(_ channel : UInt8) {
+        guard openVirtualSerialChannels.contains(channel),
+              !pendingClosedVirtualSerialChannels.contains(channel) else {
+            return
+        }
         pendingClosedVirtualSerialChannels.append(channel)
     }
 

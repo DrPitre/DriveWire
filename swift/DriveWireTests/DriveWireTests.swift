@@ -17,7 +17,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
     override func setUpWithError() throws {
         // Put setup code here. This method is called before the invocation of each test method in the class.
         host = DriveWireHost(delegate: self)
-        host?.bridgedChannels = Set(0...15)
+        host?.bridgeChannels(Set(0...15))
     }
 
     override func tearDownWithError() throws {
@@ -273,6 +273,24 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         // Byte 1 = 16 (status), byte 2 high nibble 0 = closed, low nibble = channel.
         XCTAssertEqual(read(bytes: 2), Data([16, 4]))
         XCTAssertFalse(host!.isChannelOpen(4))
+    }
+
+    func testWriteToChannelBeforeOpenIsBuffered() throws {
+        // Host-side input is deliberate type-ahead: bytes queued before the
+        // guest opens the channel are delivered once its polls begin.
+        host!.writeToChannel(Data([0x55]), channel: 1)
+        var open = Data([host!.OPSERINIT, 1])
+        host!.send(data: &open)
+        var poll = Data([host!.OPSERREAD])
+        host!.send(data: &poll)
+        XCTAssertEqual(read(bytes: 2), Data([2, 0x55]))
+    }
+
+    func testHostCloseOfUnopenedChannelIsIgnored() throws {
+        host!.closeChannel(9)
+        var poll = Data([host!.OPSERREAD])
+        host!.send(data: &poll)
+        XCTAssertEqual(read(bytes: 2), Data([0, 0]))
     }
 
     func testSerialReadRoundRobinFairness() throws {
