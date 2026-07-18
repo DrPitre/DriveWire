@@ -202,6 +202,7 @@ extension DriveWireHost {
                     statistics.lastDriveNumber = driveNumber
                     statistics.writeCount = statistics.writeCount + 1
                     statistics.percentWritesOK = (1 - statistics.reWriteCount / statistics.writeCount) * 100
+                    markDriveActivity(driveNumber: Int(driveNumber), isReading: false, isWriting: true)
                     error = virtualDrive.writeSector(lsn: vLSN, sector: sectorBuffer)
                 } else {
                     error = DriveWireProtocolError.E_CRC.rawValue
@@ -257,6 +258,7 @@ extension DriveWireHost {
                 statistics.lastDriveNumber = driveNumber
                 statistics.readCount = statistics.readCount + 1
                 statistics.percentReadsOK = (1 - statistics.reReadCount / statistics.readCount) * 100
+                markDriveActivity(driveNumber: Int(driveNumber), isReading: true, isWriting: false)
                 (error, sectorBuffer) = virtualDrive.readSector(lsn: vLSN)
             } else {
                 // It doesn't exist. Set the error code.
@@ -330,6 +332,7 @@ extension DriveWireHost {
                 statistics.lastDriveNumber = driveNumber
                 statistics.readCount = statistics.readCount + 1
                 statistics.percentReadsOK = (1 - statistics.reReadCount / statistics.readCount) * 100
+                markDriveActivity(driveNumber: Int(driveNumber), isReading: true, isWriting: false)
                 (error, sectorBuffer) = virtualDrive.readSector(lsn: vLSN)
             } else {
                 // It doesn't exist. Set the error code.

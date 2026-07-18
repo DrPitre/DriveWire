@@ -79,6 +79,14 @@ public struct DriveWireVirtualChannelStatus: Identifiable, Equatable {
     public var id: UInt8 { channel }
 }
 
+public struct DriveWireDriveActivity: Identifiable, Equatable {
+    public let driveNumber: Int
+    public var isReading: Bool
+    public var isWriting: Bool
+
+    public var id: Int { driveNumber }
+}
+
 /// Manages communication with a DriveWire guest.
 ///
 /// DriveWire is a connectivity standard that defines virtual disk drive, virtual printer, and virtual serial port services. A DriveWire *host* provides these services to a *guest*. Connectivity between the host and guest occurs over a physical connection, such as a serial cable. To the guest, it appears that the host's devices are local, when they are actually virtual.
@@ -113,6 +121,45 @@ public class DriveWireHost : Codable {
         }
     }
 
+    func markDriveActivity(driveNumber: Int, isReading: Bool, isWriting: Bool) {
+        guard driveActivities.indices.contains(driveNumber) else {
+            return
+        }
+
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.markDriveActivity(driveNumber: driveNumber, isReading: isReading, isWriting: isWriting)
+            }
+            return
+        }
+
+        if isReading {
+            driveActivities[driveNumber].isReading = true
+            let token = nextDrivePulseToken
+            nextDrivePulseToken += 1
+            driveReadPulseTokens[driveNumber] = token
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+                guard let self, self.driveReadPulseTokens[driveNumber] == token else {
+                    return
+                }
+                self.driveActivities[driveNumber].isReading = false
+            }
+        }
+
+        if isWriting {
+            driveActivities[driveNumber].isWriting = true
+            let token = nextDrivePulseToken
+            nextDrivePulseToken += 1
+            driveWritePulseTokens[driveNumber] = token
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+                guard let self, self.driveWritePulseTokens[driveNumber] == token else {
+                    return
+                }
+                self.driveActivities[driveNumber].isWriting = false
+            }
+        }
+    }
+
     enum CodingKeys: String, CodingKey {
         case virtualDrives
     }
@@ -139,6 +186,9 @@ public class DriveWireHost : Codable {
             pendingBytes: 0,
             isTCPBacked: false
         )
+    }
+    public internal(set) var driveActivities: [DriveWireDriveActivity] = (0..<4).map {
+        DriveWireDriveActivity(driveNumber: $0, isReading: false, isWriting: false)
     }
     public internal(set) var midiMonitorStatus = DriveWireMIDIStatus()
     public internal(set) var printerStatus = DriveWirePrinterStatus()
@@ -167,6 +217,9 @@ public class DriveWireHost : Codable {
     var virtualSerialIncomingPulseTokens = [UInt8: UInt64]()
     var virtualSerialOutgoingPulseTokens = [UInt8: UInt64]()
     var nextVirtualSerialPulseToken: UInt64 = 1
+    var driveReadPulseTokens = [Int: UInt64]()
+    var driveWritePulseTokens = [Int: UInt64]()
+    var nextDrivePulseToken: UInt64 = 1
     var driveWireAPIConfig = [String: String]()
     var virtualDriveParameters = [Int: [String: String]]()
     var nameLength = 0
@@ -601,6 +654,9 @@ public class DriveWireHost : Codable {
         nextVirtualSerialTCPConnectionID = 1
         virtualWindows.removeAll()
         refreshVirtualSerialChannelStatuses()
+        driveActivities = (0..<4).map { DriveWireDriveActivity(driveNumber: $0, isReading: false, isWriting: false) }
+        driveReadPulseTokens.removeAll()
+        driveWritePulseTokens.removeAll()
         resetPrinterState()
         resetRFMState()
     }

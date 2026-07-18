@@ -849,6 +849,7 @@ private final class VirtualWindowTextView: NSTextView {
 struct DriveRowView: View {
     let driveNumber: Int
     let imagePath: String?
+    let activity: DriveWireDriveActivity
     let onChoose: () -> Void
     let onEject: () -> Void
 
@@ -881,6 +882,26 @@ struct DriveRowView: View {
         imagePath == nil ? "Ready" : "Mounted"
     }
 
+    private var activityColor: Color {
+        if activity.isWriting {
+            return .red
+        }
+        if activity.isReading {
+            return DriveWirePalette.accent
+        }
+        return .gray
+    }
+
+    private var activityLabel: String {
+        if activity.isWriting {
+            return "Drive \(driveNumber) writing"
+        }
+        if activity.isReading {
+            return "Drive \(driveNumber) reading"
+        }
+        return "Drive \(driveNumber) idle"
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
@@ -893,7 +914,10 @@ struct DriveRowView: View {
                 )
 
             VStack(alignment: .leading, spacing: 5) {
-                HStack(alignment: .center) {
+                HStack(alignment: .center, spacing: 8) {
+                    LEDView(isOn: activity.isReading || activity.isWriting, activeColor: activityColor)
+                        .frame(width: 10, height: 10)
+                        .accessibilityLabel(activityLabel)
                     Text("Drive \(driveNumber)")
                         .font(.system(size: 15, weight: .bold, design: .rounded))
                         .foregroundStyle(.white)
@@ -960,6 +984,7 @@ struct DrivesPanelView: View {
                     DriveRowView(
                         driveNumber: slot.driveNumber,
                         imagePath: imagePath(for: slot.driveNumber),
+                        activity: activity(for: slot.driveNumber),
                         onChoose: { chooseDisk(for: slot.driveNumber) },
                         onEject: { ejectDisk(slot.driveNumber) }
                     )
@@ -972,6 +997,10 @@ struct DrivesPanelView: View {
 
     private func imagePath(for driveNumber: Int) -> String? {
         activeHost.virtualDrives.first(where: { $0.driveNumber == driveNumber })?.imagePath
+    }
+
+    private func activity(for driveNumber: Int) -> DriveWireDriveActivity {
+        activeHost.driveActivities.first(where: { $0.driveNumber == driveNumber }) ?? DriveWireDriveActivity(driveNumber: driveNumber, isReading: false, isWriting: false)
     }
 
     private func chooseDisk(for driveNumber: Int) {
