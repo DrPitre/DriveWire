@@ -911,7 +911,7 @@ extension DriveWireHost {
 
         let path = arguments.joined(separator: " ")
         do {
-            printBuffer.append(try Data(contentsOf: serverFileURL(from: path)))
+            writePrinterData(try Data(contentsOf: serverFileURL(from: path)))
             return .success("Sent item to printer\r\n")
         } catch {
             return .failure(202, error.localizedDescription)

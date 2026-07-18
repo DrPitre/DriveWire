@@ -33,8 +33,7 @@ private func serialPortDisplayName(_ path: String) -> String {
     return lastComponent
 }
 
-private struct WindowFramePersistenceAccessor: NSViewControllerRepresentable {
-    let fileURL: URL?
+private struct WindowLifecycleAccessor: NSViewControllerRepresentable {
     let onWindowWillClose: () -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -44,155 +43,43 @@ private struct WindowFramePersistenceAccessor: NSViewControllerRepresentable {
     func makeNSViewController(context: Context) -> TrackingViewController {
         let controller = TrackingViewController()
         controller.onWindowChange = { window in
-            context.coordinator.attach(to: window, fileURL: fileURL, onWindowWillClose: onWindowWillClose)
+            context.coordinator.attach(to: window, onWindowWillClose: onWindowWillClose)
         }
         return controller
     }
 
     func updateNSViewController(_ controller: TrackingViewController, context: Context) {
         controller.onWindowChange = { window in
-            context.coordinator.attach(to: window, fileURL: fileURL, onWindowWillClose: onWindowWillClose)
+            context.coordinator.attach(to: window, onWindowWillClose: onWindowWillClose)
         }
         controller.reportCurrentWindow()
     }
 
     final class Coordinator {
         private weak var window: NSWindow?
-        private var observers: [NSObjectProtocol] = []
-        private var frameKey: String?
-        private var hasRestoredFrame = false
+        private var observer: NSObjectProtocol?
 
         deinit {
-            removeObservers()
+            if let observer {
+                NotificationCenter.default.removeObserver(observer)
+            }
         }
 
-        func attach(to window: NSWindow?, fileURL: URL?, onWindowWillClose: @escaping () -> Void) {
-            guard let window else {
+        func attach(to window: NSWindow?, onWindowWillClose: @escaping () -> Void) {
+            guard let window, self.window !== window else {
                 return
             }
 
-            if fileURL == nil {
-                let needsReattach = self.window !== window || self.frameKey != nil
-                if needsReattach {
-                    removeObservers()
-                    self.window = window
-                    self.frameKey = nil
-                    hasRestoredFrame = false
-                }
-                forceWindowFrame(window)
-                return
+            if let observer {
+                NotificationCenter.default.removeObserver(observer)
             }
 
-            let frameKey = Self.frameKey(for: fileURL)
-            let needsReattach = self.window !== window || self.frameKey != frameKey
-            guard needsReattach else {
-                if !hasRestoredFrame {
-                    restoreFrameIfNeeded(for: window, key: frameKey)
-                }
-                return
-            }
-
-            removeObservers()
             self.window = window
-            self.frameKey = frameKey
-            hasRestoredFrame = false
-
-            restoreFrameIfNeeded(for: window, key: frameKey)
-
-            let center = NotificationCenter.default
-            observers = [
-                center.addObserver(forName: NSWindow.didMoveNotification, object: window, queue: .main) { [weak self] _ in
-                    self?.saveFrame()
-                },
-                center.addObserver(forName: NSWindow.didEndLiveResizeNotification, object: window, queue: .main) { [weak self] _ in
-                    self?.saveFrame()
-                },
-                center.addObserver(forName: NSWindow.didDeminiaturizeNotification, object: window, queue: .main) { [weak self] _ in
-                    self?.saveFrame()
-                },
-                center.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
-                    self?.saveFrame()
-                    onWindowWillClose()
-                }
-            ]
-        }
-
-        private func restoreFrameIfNeeded(for window: NSWindow, key: String?) {
-            guard !hasRestoredFrame else {
-                return
+            window.styleMask.remove(.fullSizeContentView)
+            window.titlebarAppearsTransparent = false
+            observer = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { _ in
+                onWindowWillClose()
             }
-            hasRestoredFrame = true
-
-            let minimumAcceptedSize = NSSize(width: 1360, height: 1180)
-
-            if let key, let frameString = UserDefaults.standard.string(forKey: key) {
-                let frame = NSRectFromString(frameString)
-                let isLargeEnough = frame.width >= minimumAcceptedSize.width && frame.height >= minimumAcceptedSize.height
-                if isLargeEnough {
-                    DispatchQueue.main.async {
-                        window.setFrame(frame, display: true)
-                    }
-                    return
-                }
-                UserDefaults.standard.removeObject(forKey: key)
-            }
-
-            forceWindowFrame(window)
-        }
-
-        private func forceWindowFrame(_ window: NSWindow) {
-            let minimumSize = NSSize(width: 1240, height: 1180)
-            let targetSize = NSSize(width: 1480, height: 1260)
-
-            DispatchQueue.main.async {
-                window.minSize = minimumSize
-                window.contentMinSize = minimumSize
-                window.setContentSize(targetSize)
-
-                let visibleFrame = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
-                let origin: NSPoint
-                if visibleFrame == .zero {
-                    origin = window.frame.origin
-                } else {
-                    origin = NSPoint(
-                        x: visibleFrame.midX - (targetSize.width / 2),
-                        y: visibleFrame.midY - (targetSize.height / 2)
-                    )
-                }
-
-                let frame = NSRect(origin: origin, size: targetSize)
-                window.setFrame(frame, display: true, animate: false)
-            }
-        }
-
-        private func saveFrame() {
-            guard let window, let frameKey else {
-                return
-            }
-
-            let frameString = NSStringFromRect(window.frame)
-            UserDefaults.standard.set(frameString, forKey: frameKey)
-        }
-
-        private func removeObservers() {
-            let center = NotificationCenter.default
-            for observer in observers {
-                center.removeObserver(observer)
-            }
-            observers.removeAll()
-        }
-
-        private static func frameKey(for fileURL: URL?) -> String? {
-            guard let fileURL else {
-                return nil
-            }
-
-            let encodedPath = Data(fileURL.standardizedFileURL.path.utf8).base64EncodedString()
-            let sanitized = encodedPath
-                .replacingOccurrences(of: "/", with: "_")
-                .replacingOccurrences(of: "=", with: "")
-                .replacingOccurrences(of: "+", with: "-")
-            return "DriveWireDocumentFrame-\(sanitized)"
         }
     }
 
@@ -203,14 +90,9 @@ private struct WindowFramePersistenceAccessor: NSViewControllerRepresentable {
             view = NSView(frame: .zero)
         }
 
-        override func viewWillAppear() {
-            super.viewWillAppear()
-            reportCurrentWindow()
-        }
-
         override func viewDidAppear() {
             super.viewDidAppear()
-            reportCurrentWindow()
+            onWindowChange?(view.window)
         }
 
         func reportCurrentWindow() {
@@ -272,7 +154,7 @@ struct DashboardSection<Content: View>: View {
 
             content
         }
-        .padding(15)
+        .padding(13)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -333,10 +215,10 @@ struct DashboardMetricBadge: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
         }
-        .padding(10)
+        .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(DriveWirePalette.panelMuted.opacity(0.95))
         )
     }
@@ -364,8 +246,8 @@ struct MetricTile: View {
                 .font(.system(size: 11, weight: .medium, design: .rounded))
                 .foregroundStyle(DriveWirePalette.softText)
         }
-        .padding(10)
-        .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
+        .padding(8)
+        .frame(maxWidth: .infinity, minHeight: 62, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(DriveWirePalette.panelMuted)
@@ -413,8 +295,8 @@ struct VirtualChannelView: View {
                 .font(.system(size: 11, weight: .medium, design: .rounded))
                 .foregroundStyle(DriveWirePalette.softText)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(DriveWirePalette.panelMuted)
@@ -538,7 +420,7 @@ struct VirtualWindowPanelView: View {
                     VirtualWindowTerminalView(text: window.text, channel: window.channel) { input, channel in
                         host.sendVirtualWindowInput(input, channel: channel)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 220, maxHeight: 300)
+                    .frame(maxWidth: .infinity, minHeight: 150, idealHeight: 150, maxHeight: 150)
                     .background(Color.black.opacity(0.45))
                     .overlay(
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -553,7 +435,7 @@ struct VirtualWindowPanelView: View {
                             .foregroundStyle(DriveWirePalette.softText)
                             .padding(12)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 220, maxHeight: 300)
+                    .frame(maxWidth: .infinity, minHeight: 150, idealHeight: 150, maxHeight: 150)
                     .overlay(
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
                             .stroke(DriveWirePalette.border, lineWidth: 1)
@@ -664,6 +546,94 @@ struct MIDIView: View {
                             .stroke(DriveWirePalette.border, lineWidth: 1)
                     )
                 }
+            }
+        }
+    }
+}
+
+struct PrinterView: View {
+    let host: DriveWireHost
+
+    private var status: DriveWirePrinterStatus {
+        host.printerStatus
+    }
+
+    private var stateColor: Color {
+        switch status.state {
+        case "Receiving":
+            return DriveWirePalette.accent
+        case "Error":
+            return .red
+        default:
+            return .gray
+        }
+    }
+
+    private var lastFlushText: String {
+        guard let date = status.lastFlushedAt else {
+            return "Never"
+        }
+
+        return Self.dateFormatter.string(from: date)
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        return formatter
+    }()
+
+    var body: some View {
+        DashboardSection(eyebrow: "Output", title: "Printer", detail: "Live status for DriveWire printer output.") {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 10) {
+                    StatusPill(text: status.state, color: stateColor)
+                    Spacer(minLength: 12)
+                    Button("Clear") {
+                        host.resetPrinterState()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(DriveWirePalette.accentMuted)
+                    .help("Clear buffered printer output and reset printer counters.")
+                }
+
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 140, maximum: 220), spacing: 10)], spacing: 10) {
+                    DashboardMetricBadge(label: "Backend", value: status.backendName)
+                    DashboardMetricBadge(label: "Bytes", value: String(status.bytesReceived))
+                    DashboardMetricBadge(label: "Pending", value: String(status.pendingBytes))
+                    DashboardMetricBadge(label: "Flushes", value: String(status.flushedJobs))
+                    DashboardMetricBadge(label: "Last Flush", value: lastFlushText)
+                }
+
+                if let lastError = status.lastError, !lastError.isEmpty {
+                    Text(lastError)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.red.opacity(0.9))
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Color.red.opacity(0.12))
+                        )
+                }
+
+                ZStack(alignment: .topLeading) {
+                    Color.black.opacity(0.20)
+                    Text(status.previewText.isEmpty ? "No printer output" : status.previewText)
+                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .foregroundStyle(status.previewText.isEmpty ? DriveWirePalette.softText : .white.opacity(0.86))
+                        .textSelection(.enabled)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+                .frame(maxWidth: .infinity, minHeight: 92, idealHeight: 92, maxHeight: 92)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(DriveWirePalette.border, lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
         }
     }
@@ -953,10 +923,10 @@ struct DriveRowView: View {
             }
             .controlSize(.small)
         }
-        .padding(13)
+        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(DriveWirePalette.panelMuted)
         )
         .overlay(
@@ -994,12 +964,10 @@ struct DrivesPanelView: View {
                         onEject: { ejectDisk(slot.driveNumber) }
                     )
                 }
-
-                Spacer(minLength: 0)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .frame(maxWidth: .infinity, alignment: .top)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     private func imagePath(for driveNumber: Int) -> String? {
@@ -1403,7 +1371,7 @@ struct LoggingPanelView: View {
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
                         .stroke(DriveWirePalette.border, lineWidth: 1)
                 )
-                .frame(maxWidth: .infinity, minHeight: 160, maxHeight: 220)
+                .frame(maxWidth: .infinity, minHeight: 128, idealHeight: 128, maxHeight: 128)
                 .onAppear {
                     proxy.scrollTo(logBottomID, anchor: .bottom)
                 }
@@ -1436,65 +1404,59 @@ struct ContentView: View {
     }
 
     var body: some View {
-        ZStack {
+        HStack(alignment: .top, spacing: 0) {
+            VStack(alignment: .leading, spacing: 14) {
+                ConnectionPanelView(
+                    document: $document,
+                    serialDriver: document.serialDriver,
+                    selectedPortName: $selectedPortName,
+                    selectedBaudRate: $selectedBaudRate,
+                    selectedIPAddress: $selectedIPAddress,
+                    selectedIPPort: $selectedIPPort
+                )
+
+                DrivesPanelView(document: $document)
+                VirtualChannelsView(host: activeHost)
+                VirtualWindowPanelView(host: activeHost)
+            }
+            .padding(18)
+            .frame(width: 720, alignment: .topLeading)
+
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(width: 1)
+
+            VStack(alignment: .leading, spacing: 14) {
+                StatisticsGridView(statistics: activeHost.statistics)
+                MIDIView(host: activeHost)
+                PrinterView(host: activeHost)
+                LoggingPanelView(logText: activeLogBinding, detailedOpcodeLogging: $document.detailedOpcodeLogging)
+            }
+            .padding(18)
+            .frame(width: DriveWireWindowMetrics.contentWidth - 721, alignment: .topLeading)
+        }
+        .frame(width: DriveWireWindowMetrics.contentWidth, alignment: .topLeading)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(
             LinearGradient(
                 colors: [DriveWirePalette.canvasTop, DriveWirePalette.canvasBottom],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
             .ignoresSafeArea()
-
-            HSplitView {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        ConnectionPanelView(
-                            document: $document,
-                            serialDriver: document.serialDriver,
-                            selectedPortName: $selectedPortName,
-                            selectedBaudRate: $selectedBaudRate,
-                            selectedIPAddress: $selectedIPAddress,
-                            selectedIPPort: $selectedIPPort
-                        )
-
-                        DrivesPanelView(document: $document)
-                        VirtualChannelsView(host: activeHost)
-                    }
-                    .padding(12)
-                    .frame(maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .topLeading)
-                }
-                .scrollIndicators(.hidden)
-                .frame(minWidth: 420, idealWidth: 500, maxHeight: .infinity, alignment: .topLeading)
-                .background(Color.white.opacity(0.02))
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        StatisticsGridView(statistics: activeHost.statistics)
-                        MIDIView(host: activeHost)
-                        VirtualWindowPanelView(host: activeHost)
-                        LoggingPanelView(logText: activeLogBinding, detailedOpcodeLogging: $document.detailedOpcodeLogging)
-                    }
-                    .padding(18)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                }
-                .scrollIndicators(.hidden)
-                .frame(minWidth: 460, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                .background(Color.black.opacity(0.1))
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .background {
+            WindowLifecycleAccessor {
+                document.persistCurrentState(to: fileURL)
+                document.serialDriver.stop()
+                document.tcpDriver.stop()
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 28, style: .continuous)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
-            )
-            .background {
-                WindowFramePersistenceAccessor(fileURL: fileURL) {
-                    document.persistCurrentState(to: fileURL)
-                    document.serialDriver.stop()
-                    document.tcpDriver.stop()
-                }
-                .frame(width: 0, height: 0)
-            }
-            .padding(18)
+            .frame(width: 0, height: 0)
         }
         .navigationTitle("DriveWire Host")
     }

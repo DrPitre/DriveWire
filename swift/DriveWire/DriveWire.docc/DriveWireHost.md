@@ -19,6 +19,15 @@ availability, received byte counts, Standard MIDI File byte and track progress,
 message count, and the most recent error. Calling ``stopMIDIPlayback()`` stops
 scheduled playback and resets the MIDI output.
 
+## Printer output
+
+Printer bytes received through ``OPPRINT`` are routed through the host's printer
+backend. The initial backend keeps raw printer bytes in memory, exposes a preview
+for the macOS app, and clears pending bytes when ``OPPRINTFLUSH`` is received.
+The published printer status reports backend name, state, bytes received,
+pending bytes, flush count, last flush time, preview text, and the most recent
+error.
+
 ## Topics
 
 ### Creating the host
@@ -77,6 +86,7 @@ scheduled playback and resets the MIDI output.
 
 - ``OPPRINT``
 - ``OPPRINTFLUSH``
+- ``printerStatus``
 
 ### Reading and writing virtual serial ports
 

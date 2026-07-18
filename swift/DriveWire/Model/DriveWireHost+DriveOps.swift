@@ -415,34 +415,6 @@ extension DriveWireHost {
         return result
     }
 
-    /// The print buffer.
-    func OP_PRINT(data : Data) -> Int {
-        var result = 0
-        let expectedCount = 2
-        currentTransaction = OPPRINT
-
-        if data.count >= expectedCount {
-            resetState()
-            result = expectedCount
-            let printerByte = data[1]
-            printBuffer.append(printerByte)
-            delegate?.transactionCompleted(opCode: currentTransaction)
-        }
-
-        return result
-    }
-
-    func OP_PRINTFLUSH(data : Data) -> Int {
-        currentTransaction = OPPRINTFLUSH
-        resetState()
-
-        // For now, just clear the print buffer
-        printBuffer.removeAll()
-        delegate?.transactionCompleted(opCode: currentTransaction)
-
-        return 1
-    }
-
     func OP_OPCODE(data: Data) -> Int {
         var result = 1
 

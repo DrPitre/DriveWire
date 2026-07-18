@@ -12,6 +12,10 @@ private enum DriveWireWindowID {
     static let newDocumentChooser = "new-document-chooser"
 }
 
+enum DriveWireWindowMetrics {
+    static let contentWidth: CGFloat = 1520
+}
+
 private struct NewDocumentChooserView: View {
     @Environment(\.newDocument) private var newDocument
     @Environment(\.dismiss) private var dismiss
@@ -99,17 +103,8 @@ struct DriveWireApp: App {
     var body: some Scene {
         DocumentGroup(newDocument: DriveWireDocument()) { configuration in
             ContentView(document: configuration.$document, fileURL: configuration.fileURL)
-                .frame(
-                    minWidth: 1240,
-                    idealWidth: 1520,
-                    maxWidth: .infinity,
-                    minHeight: 1180,
-                    idealHeight: 1260,
-                    maxHeight: .infinity
-                )
         }
         .windowResizability(.contentSize)
-        .defaultSize(width: 1520, height: 1260)
         .commands {
             DriveWireCommands()
         }

@@ -141,6 +141,7 @@ public class DriveWireHost : Codable {
         )
     }
     public internal(set) var midiMonitorStatus = DriveWireMIDIStatus()
+    public internal(set) var printerStatus = DriveWirePrinterStatus()
 
     /// The guest's capability byte sent from ``OPDWINIT``.
     var guestCapabilityByte : UInt8 = 0x00
@@ -178,6 +179,7 @@ public class DriveWireHost : Codable {
     var midiStreamMode = MIDIStreamMode.undetermined
     var midiBufferedData = Data()
     var standardMIDIPlayback: StandardMIDIFileStreamPlayback?
+    var printerBackend: DriveWirePrinterBackend = RawDriveWirePrinterBackend()
 
     enum MIDIStreamMode {
         case undetermined
@@ -599,11 +601,9 @@ public class DriveWireHost : Codable {
         nextVirtualSerialTCPConnectionID = 1
         virtualWindows.removeAll()
         refreshVirtualSerialChannelStatuses()
-        printBuffer.removeAll()
+        resetPrinterState()
         resetRFMState()
     }
-
-    var printBuffer = Data()
 
     func OP_FASTWRITE_Serial(data : Data) -> Int {
         guard data.count >= 2 else { return 0 }
