@@ -21,6 +21,7 @@
 		688B098E300A61B9002F6FA5 /* DriveWireTCPServerDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 688B098C300A61B9002F6FA5 /* DriveWireTCPServerDriver.swift */; };
 		688B0990300A65CA002F6FA5 /* DriveWireMIDIBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 688B098F300A65CA002F6FA5 /* DriveWireMIDIBackend.swift */; };
 		688B0991300A65CA002F6FA5 /* DriveWireMIDIBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 688B098F300A65CA002F6FA5 /* DriveWireMIDIBackend.swift */; };
+		68C0DE012E22100100C0DE01 /* DriveWireMIDIBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 688B098F300A65CA002F6FA5 /* DriveWireMIDIBackend.swift */; };
 		688B0993300AF451002F6FA5 /* DriveWireHost+MIDI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 688B0992300AF451002F6FA5 /* DriveWireHost+MIDI.swift */; };
 		688B0994300AF451002F6FA5 /* DriveWireHost+MIDI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 688B0992300AF451002F6FA5 /* DriveWireHost+MIDI.swift */; };
 		688B0995300AF451002F6FA5 /* DriveWireHost+MIDI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 688B0992300AF451002F6FA5 /* DriveWireHost+MIDI.swift */; };
@@ -412,6 +413,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				68C0DE012E22100100C0DE01 /* DriveWireMIDIBackend.swift in Sources */,
 				688B0997300AF501002F6FA5 /* DriveWireHost+VirtualDrive.swift in Sources */,
 				688B09A8300AF5EF002F6FA5 /* DriveWireHost+RFM.swift in Sources */,
 				688B09B1300AF5F0002F6FA5 /* FileMonitor.swift in Sources */,

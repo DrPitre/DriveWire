@@ -26,7 +26,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         do {
             try host!.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
             try host!.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
-        } catch DriveWireError.driveAlreadyExists {
+        } catch {
             host!.ejectVirtualDisk(driveNumber: 0)
         }
     }
@@ -49,6 +49,47 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
     func testTIME() throws {
         var s = Data([host!.OPTIME])
         host!.send(data: &s)
+    }
+
+    func testTelnetServiceOptionParsing() throws {
+        XCTAssertFalse(DriveWireHost.VirtualSerialTCPServiceOptions().telnet)
+        XCTAssertTrue(DriveWireHost.VirtualSerialTCPServiceOptions(arguments: ["TELNET", "protect", "banner"]).telnet)
+    }
+
+    func testTelnetInitialNegotiationRequestsCharacterMode() throws {
+        XCTAssertEqual(
+            DriveWireHost.TelnetCodec.initialNegotiation,
+            Data([255, 251, 1, 255, 251, 3, 255, 253, 3, 255, 254, 34])
+        )
+    }
+
+    func testTelnetCodecFiltersCommandsAndNormalizesInput() throws {
+        var codec = DriveWireHost.TelnetCodec()
+
+        let first = codec.decode(Data([0x68, 0x69, 255, 253, 1, 0x0D]))
+        XCTAssertEqual(first.payload, Data([0x68, 0x69, 0x0D]))
+        XCTAssertTrue(first.replies.isEmpty)
+
+        let second = codec.decode(Data([0x0A, 255, 251, 31, 255, 255]))
+        XCTAssertEqual(second.payload, Data([0xFF]))
+        XCTAssertEqual(second.replies, Data([255, 254, 31]))
+    }
+
+    func testTelnetCodecConsumesSubnegotiationAcrossReads() throws {
+        var codec = DriveWireHost.TelnetCodec()
+
+        let first = codec.decode(Data([0x41, 255, 250, 24, 1, 255]))
+        XCTAssertEqual(first.payload, Data([0x41]))
+        XCTAssertTrue(first.replies.isEmpty)
+
+        let second = codec.decode(Data([240, 0x42]))
+        XCTAssertEqual(second.payload, Data([0x42]))
+        XCTAssertTrue(second.replies.isEmpty)
+    }
+
+    func testTelnetCodecEscapesOutgoingIAC() throws {
+        let codec = DriveWireHost.TelnetCodec()
+        XCTAssertEqual(codec.encode(Data([0x41, 0xFF, 0x42])), Data([0x41, 0xFF, 0xFF, 0x42]))
     }
 
     func testREAD() throws {

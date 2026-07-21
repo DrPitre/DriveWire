@@ -7,10 +7,154 @@ import Foundation
 import Network
 
 extension DriveWireHost {
+    struct VirtualSerialTCPServiceOptions {
+        let telnet: Bool
+
+        init(arguments: [String] = []) {
+            let options = Set(arguments.map { $0.lowercased() })
+            telnet = options.contains("telnet")
+        }
+    }
+
     struct PendingVirtualSerialTCPConnection {
         let connection: NWConnection
         let localPort: UInt16
         let remoteAddress: String
+        let serviceOptions: VirtualSerialTCPServiceOptions
+    }
+
+    struct TelnetCodec {
+        static let initialNegotiation = Data([
+            255, 251, 1,   // IAC WILL ECHO
+            255, 251, 3,   // IAC WILL SUPPRESS-GO-AHEAD
+            255, 253, 3,   // IAC DO SUPPRESS-GO-AHEAD
+            255, 254, 34   // IAC DONT LINEMODE
+        ])
+
+        private enum ReceiveState {
+            case data
+            case iac
+            case option(UInt8)
+            case subnegotiation
+            case subnegotiationIAC
+        }
+
+        private static let se: UInt8 = 240
+        private static let sb: UInt8 = 250
+        private static let will: UInt8 = 251
+        private static let wont: UInt8 = 252
+        private static let `do`: UInt8 = 253
+        private static let dont: UInt8 = 254
+        private static let iac: UInt8 = 255
+        private static let echo: UInt8 = 1
+        private static let suppressGoAhead: UInt8 = 3
+
+        private var receiveState = ReceiveState.data
+        private var discardLineEndingByteAfterCarriageReturn = false
+        private var refusedWillOptions = Set<UInt8>()
+        private var refusedDoOptions = Set<UInt8>()
+
+        mutating func decode(_ data: Data) -> (payload: Data, replies: Data) {
+            var payload = Data()
+            var replies = Data()
+
+            for byte in data {
+                switch receiveState {
+                case .data:
+                    if byte == Self.iac {
+                        receiveState = .iac
+                    } else {
+                        appendDataByte(byte, to: &payload)
+                    }
+
+                case .iac:
+                    switch byte {
+                    case Self.iac:
+                        appendDataByte(byte, to: &payload)
+                        receiveState = .data
+                    case Self.sb:
+                        receiveState = .subnegotiation
+                    case Self.will, Self.wont, Self.do, Self.dont:
+                        receiveState = .option(byte)
+                    default:
+                        // Ignore single-byte Telnet commands such as NOP, GA, and AYT.
+                        receiveState = .data
+                    }
+
+                case .option(let command):
+                    handleOption(command: command, option: byte, replies: &replies)
+                    receiveState = .data
+
+                case .subnegotiation:
+                    if byte == Self.iac {
+                        receiveState = .subnegotiationIAC
+                    }
+
+                case .subnegotiationIAC:
+                    if byte == Self.se {
+                        receiveState = .data
+                    } else {
+                        // IAC IAC represents data within the subnegotiation; all
+                        // subnegotiation content is intentionally discarded.
+                        receiveState = .subnegotiation
+                    }
+                }
+            }
+
+            return (payload, replies)
+        }
+
+        func encode(_ data: Data) -> Data {
+            var encoded = Data()
+            encoded.reserveCapacity(data.count)
+            for byte in data {
+                encoded.append(byte)
+                if byte == Self.iac {
+                    encoded.append(byte)
+                }
+            }
+            return encoded
+        }
+
+        private mutating func appendDataByte(_ byte: UInt8, to payload: inout Data) {
+            if discardLineEndingByteAfterCarriageReturn {
+                discardLineEndingByteAfterCarriageReturn = false
+                if byte == 0x00 || byte == 0x0A {
+                    return
+                }
+            }
+
+            payload.append(byte)
+            if byte == 0x0D {
+                discardLineEndingByteAfterCarriageReturn = true
+            }
+        }
+
+        private mutating func handleOption(command: UInt8, option: UInt8, replies: inout Data) {
+            switch command {
+            case Self.do:
+                if option == Self.echo || option == Self.suppressGoAhead {
+                    return
+                }
+                if refusedDoOptions.insert(option).inserted {
+                    replies.append(contentsOf: [Self.iac, Self.wont, option])
+                }
+
+            case Self.will:
+                if option == Self.suppressGoAhead {
+                    return
+                }
+                if refusedWillOptions.insert(option).inserted {
+                    replies.append(contentsOf: [Self.iac, Self.dont, option])
+                }
+
+            case Self.wont, Self.dont:
+                return
+
+            default:
+                return
+            }
+        }
     }
 
     final class VirtualSerialTCPConnection {
@@ -18,6 +162,9 @@ extension DriveWireHost {
         private let queue: DispatchQueue
         private let onReceive: (Data) -> Void
         private let onClose: () -> Void
+        private let telnetMode: Bool
+        private var telnetCodec = TelnetCodec()
+        private var sentInitialTelnetNegotiation = false
 
         let host: String
         let port: UInt16
@@ -27,15 +174,17 @@ extension DriveWireHost {
             self.port = port
             self.onReceive = onReceive
             self.onClose = onClose
+            self.telnetMode = false
             self.queue = DispatchQueue(label: "DriveWire.VirtualSerialTCP.\(host).\(port)")
             self.connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
         }
 
-        init(connection: NWConnection, host: String, port: UInt16, onReceive: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
+        init(connection: NWConnection, host: String, port: UInt16, telnetMode: Bool, onReceive: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
             self.host = host
             self.port = port
             self.onReceive = onReceive
             self.onClose = onClose
+            self.telnetMode = telnetMode
             self.queue = DispatchQueue(label: "DriveWire.VirtualSerialTCP.Accepted.\(host).\(port)")
             self.connection = connection
         }
@@ -48,13 +197,15 @@ extension DriveWireHost {
                     self?.onClose()
                 }
             }
-            receiveNext()
             connection.start(queue: queue)
+            sendInitialTelnetNegotiationIfNeeded()
+            receiveNext()
         }
 
         func send(_ data: Data) {
             guard !data.isEmpty else { return }
-            connection.send(content: data, completion: .contentProcessed { _ in })
+            let content = telnetMode ? telnetCodec.encode(data) : data
+            connection.send(content: content, completion: .contentProcessed { _ in })
         }
 
         func close() {
@@ -65,7 +216,17 @@ extension DriveWireHost {
             connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] data, _, isComplete, error in
                 guard let self else { return }
                 if let data, !data.isEmpty {
-                    self.onReceive(data)
+                    if self.telnetMode {
+                        let decoded = self.telnetCodec.decode(data)
+                        if !decoded.replies.isEmpty {
+                            self.connection.send(content: decoded.replies, completion: .contentProcessed { _ in })
+                        }
+                        if !decoded.payload.isEmpty {
+                            self.onReceive(decoded.payload)
+                        }
+                    } else {
+                        self.onReceive(data)
+                    }
                 }
                 if isComplete || error != nil {
                     self.onClose()
@@ -74,6 +235,13 @@ extension DriveWireHost {
                 }
             }
         }
+
+        private func sendInitialTelnetNegotiationIfNeeded() {
+            guard telnetMode, !sentInitialTelnetNegotiation else { return }
+            sentInitialTelnetNegotiation = true
+            connection.send(content: TelnetCodec.initialNegotiation, completion: .contentProcessed { _ in })
+        }
+
     }
 
     func OP_SERINIT(data : Data) -> Int {
@@ -527,13 +695,19 @@ extension DriveWireHost {
         guard let portText = arguments.first, let tcpPort = UInt16(portText), tcpPort > 0 else {
             return virtualSerialTCPFailure()
         }
+        let serviceOptions = VirtualSerialTCPServiceOptions(arguments: Array(arguments.dropFirst()))
 
         do {
             virtualSerialTCPListeners[tcpPort]?.cancel()
             let listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: tcpPort)!)
             listener.newConnectionHandler = { [weak self] connection in
                 DispatchQueue.main.async {
-                    self?.acceptVirtualSerialTCPConnection(connection, localPort: tcpPort, announceOn: channel)
+                    self?.acceptVirtualSerialTCPConnection(
+                        connection,
+                        localPort: tcpPort,
+                        serviceOptions: serviceOptions,
+                        announceOn: channel
+                    )
                 }
             }
             listener.stateUpdateHandler = { state in
@@ -563,7 +737,8 @@ extension DriveWireHost {
             channel: channel,
             connection: pending.connection,
             host: pending.remoteAddress,
-            port: pending.localPort
+            port: pending.localPort,
+            serviceOptions: pending.serviceOptions
         )
         virtualSerialTCPConnections[channel] = connection
         refreshVirtualSerialChannelStatuses()
@@ -581,14 +756,15 @@ extension DriveWireHost {
         return virtualSerialTCPSuccess()
     }
 
-    func acceptVirtualSerialTCPConnection(_ connection: NWConnection, localPort: UInt16, announceOn channel: UInt8) {
+    func acceptVirtualSerialTCPConnection(_ connection: NWConnection, localPort: UInt16, serviceOptions: VirtualSerialTCPServiceOptions, announceOn channel: UInt8) {
         let connectionID = nextVirtualSerialTCPConnectionID
         nextVirtualSerialTCPConnectionID += 1
         let remoteAddress = remoteAddressDescription(for: connection.endpoint)
         pendingVirtualSerialTCPConnections[connectionID] = PendingVirtualSerialTCPConnection(
             connection: connection,
             localPort: localPort,
-            remoteAddress: remoteAddress
+            remoteAddress: remoteAddress,
+            serviceOptions: serviceOptions
         )
         enqueueVirtualSerialResponse("\(connectionID) \(localPort) \(remoteAddress)\n\r", channel: channel)
     }
@@ -617,8 +793,8 @@ extension DriveWireHost {
         })
     }
 
-    func makeVirtualSerialTCPConnection(channel: UInt8, connection: NWConnection, host: String, port: UInt16) -> VirtualSerialTCPConnection {
-        VirtualSerialTCPConnection(connection: connection, host: host, port: port, onReceive: { [weak self] data in
+    func makeVirtualSerialTCPConnection(channel: UInt8, connection: NWConnection, host: String, port: UInt16, serviceOptions: VirtualSerialTCPServiceOptions) -> VirtualSerialTCPConnection {
+        VirtualSerialTCPConnection(connection: connection, host: host, port: port, telnetMode: serviceOptions.telnet, onReceive: { [weak self] data in
             DispatchQueue.main.async {
                 self?.virtualSerialInput[channel, default: Data()].append(data)
                 self?.refreshVirtualSerialChannelStatuses()
