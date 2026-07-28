@@ -851,6 +851,7 @@ struct DriveRowView: View {
     let imagePath: String?
     let activity: DriveWireDriveActivity
     let onChoose: () -> Void
+    let onRefresh: () -> Void
     let onEject: () -> Void
 
     private var displayName: String {
@@ -941,6 +942,10 @@ struct DriveRowView: View {
                 Button(imagePath == nil ? "Mount" : "Replace", action: onChoose)
                     .buttonStyle(.borderedProminent)
                     .tint(DriveWirePalette.accentMuted)
+                Button("Refresh", action: onRefresh)
+                    .buttonStyle(.bordered)
+                    .disabled(imagePath == nil)
+                    .help("Reload this disk image from its current file path.")
                 Button("Eject", role: .destructive, action: onEject)
                     .buttonStyle(.bordered)
                     .disabled(imagePath == nil)
@@ -986,6 +991,7 @@ struct DrivesPanelView: View {
                         imagePath: imagePath(for: slot.driveNumber),
                         activity: activity(for: slot.driveNumber),
                         onChoose: { chooseDisk(for: slot.driveNumber) },
+                        onRefresh: { refreshDisk(slot.driveNumber) },
                         onEject: { ejectDisk(slot.driveNumber) }
                     )
                 }
@@ -1017,6 +1023,15 @@ struct DrivesPanelView: View {
         } catch {
             activeHost.log += "Failed to mount drive \(driveNumber): \(error.localizedDescription)\n"
         }
+    }
+
+    private func refreshDisk(_ driveNumber: Int) {
+        guard let drive = activeHost.virtualDrives.first(where: { $0.driveNumber == driveNumber }) else {
+            return
+        }
+
+        drive.reload()
+        activeHost.log += "Reloaded disk in drive \(driveNumber): \(URL(fileURLWithPath: drive.imagePath).lastPathComponent)\n"
     }
 
     private func ejectDisk(_ driveNumber: Int) {
@@ -1288,6 +1303,10 @@ struct ConnectionPanelView: View {
     @Binding var selectedIPAddress: String
     @Binding var selectedIPPort: String
 
+    private var activeHost: DriveWireHost {
+        document.connectionType == .serial ? document.serialDriver.host : document.tcpDriver.host
+    }
+
     private var isConnected: Bool {
         switch document.connectionType {
         case .serial:
@@ -1335,6 +1354,17 @@ struct ConnectionPanelView: View {
                 }
 
                 Spacer(minLength: 0)
+
+                Button {
+                    activeHost.requestCoCoReset()
+                } label: {
+                    Label("Reset CoCo", systemImage: "power")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(.red.opacity(0.75))
+                .disabled(!isConnected)
+                .help("Send the reset byte to the CoCo, then reset the DriveWire server session.")
             }
 
             if document.connectionType == .serial {

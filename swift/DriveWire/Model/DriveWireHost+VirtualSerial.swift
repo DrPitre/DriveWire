@@ -278,6 +278,10 @@ extension DriveWireHost {
         delegate?.dataAvailable(host: self, data: response)
         delegate?.transactionCompleted(opCode: currentTransaction)
         reportActivity("OP_SERREAD -> \(response[0]),\(response[1])", isFrequent: true)
+        if response == Data([16, 255]) {
+            resetGuestSessionState()
+            reportActivity("CoCo reset requested; DriveWire server reset")
+        }
         return 1
     }
 
@@ -365,6 +369,11 @@ extension DriveWireHost {
         delegate?.transactionCompleted(opCode: currentTransaction)
         let msg = "OP_SERSETSTAT(ch=\(ch), \(DriveWireHost.ssCodeName(Int(code))))"; log += msg + "\n"; print(msg)
         return expectedCount
+    }
+
+    func requestCoCoReset() {
+        clientRestartRequested = true
+        reportActivity("CoCo reset requested")
     }
 
     func pollVirtualSerial() -> Data {
