@@ -191,6 +191,11 @@ class DriveWireSerialDriver : NSObject, DriveWireDelegate, ORSSerialPortDelegate
 
         self.serialPort = serialPort
         serialPort.baudRate = NSNumber(value: baudRate)
+        // ORSSerialPort drops DTR and RTS on open by default, but USB CDC devices
+        // such as the Pico-Thing treat DTR as "host present" and RTS as "host
+        // ready", and send nothing without them
+        serialPort.dtr = true
+        serialPort.rts = true
         serialPort.delegate = self
         serialPort.open()
     }
