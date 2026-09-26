@@ -1206,12 +1206,31 @@ struct SerialCommsView: View {
         if serialDriver.isConnected {
             return "Connected to \(serialPortDisplayName(serialDriver.portName))"
         }
-        return "Select a device to connect, or choose No device to disconnect"
+        if serialDriver.isWaitingForPort {
+            return "Waiting for \(serialPortDisplayName(serialDriver.portName)) to reconnect"
+        }
+        return "Disconnected"
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
+            LabelValueRow(title: "Status", value: statusText)
             SerialPortSelector(selectedPortName: $portName, selectedBaudRate: $baudRate)
+
+            HStack(spacing: 10) {
+                Button("Connect") {
+                    serialDriver.connect()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(DriveWirePalette.accentMuted)
+                .disabled(portName == "NONE" || serialDriver.isConnected || serialDriver.isWaitingForPort)
+
+                Button("Disconnect") {
+                    serialDriver.stop()
+                }
+                .buttonStyle(.bordered)
+                .disabled(!serialDriver.isConnected && !serialDriver.isWaitingForPort)
+            }
         }
         .padding(16)
         .background(
@@ -1322,6 +1341,9 @@ struct ConnectionPanelView: View {
             let selectedPort = selectedPortName == "NONE" ? "" : selectedPortName
             if serialDriver.isConnected {
                 return "Serial on \(serialPortDisplayName(serialDriver.portName))"
+            }
+            if serialDriver.isWaitingForPort {
+                return "Serial waiting for \(serialPortDisplayName(serialDriver.portName))"
             }
             if selectedPort.isEmpty {
                 return "Serial Idle"
