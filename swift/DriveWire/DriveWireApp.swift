@@ -87,6 +87,7 @@ private struct NewDocumentChooserView: View {
 
 private struct DriveWireCommands: Commands {
     @Environment(\.openWindow) private var openWindow
+    @AppStorage(DriveWireTextScale.storageKey) private var textScale = DriveWireTextScale.defaultValue
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -94,6 +95,28 @@ private struct DriveWireCommands: Commands {
                 openWindow(id: DriveWireWindowID.newDocumentChooser)
             }
             .keyboardShortcut("n")
+        }
+
+        CommandGroup(before: .toolbar) {
+            Button("Bigger Text") {
+                textScale = DriveWireTextScale.larger(than: textScale)
+            }
+            .keyboardShortcut("+")
+            .disabled(DriveWireTextScale.clamped(textScale) >= DriveWireTextScale.steps.last!)
+
+            Button("Smaller Text") {
+                textScale = DriveWireTextScale.smaller(than: textScale)
+            }
+            .keyboardShortcut("-")
+            .disabled(DriveWireTextScale.clamped(textScale) <= DriveWireTextScale.steps.first!)
+
+            Button("Actual Size") {
+                textScale = DriveWireTextScale.defaultValue
+            }
+            .keyboardShortcut("0")
+            .disabled(DriveWireTextScale.clamped(textScale) == DriveWireTextScale.defaultValue)
+
+            Divider()
         }
     }
 }
