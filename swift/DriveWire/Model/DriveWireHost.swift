@@ -233,6 +233,10 @@ public class DriveWireHost : Codable {
     var midiBufferedData = Data()
     var standardMIDIPlayback: StandardMIDIFileStreamPlayback?
     var printerBackend: DriveWirePrinterBackend = RawDriveWirePrinterBackend()
+    @ObservationIgnored var printerOutputSettingsProvider: () -> DriveWirePrinterOutputSettings = DriveWirePrinterOutputSettings.current
+    var printerOutputPath: String?
+    var printerOutputError: String?
+    var printerLastPrintedTo: String?
 
     enum MIDIStreamMode {
         case undetermined

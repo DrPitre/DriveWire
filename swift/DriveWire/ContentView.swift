@@ -712,6 +712,13 @@ struct PrinterView: View {
     @Environment(\.driveWireTextScale) private var textScale
     let host: DriveWireHost
 
+    private typealias OutputKeys = DriveWirePrinterOutputSettings.Keys
+    @AppStorage(OutputKeys.saveToFolder) private var saveToFolder = false
+    @AppStorage(OutputKeys.folderPath) private var folderPath = DriveWirePrinterOutputSettings.defaultFolderPath
+    @AppStorage(OutputKeys.sendToPrinter) private var sendToPrinter = false
+    @AppStorage(OutputKeys.printerName) private var printerName = ""
+    @AppStorage(OutputKeys.format) private var format = DriveWirePrinterOutputSettings.Format.text
+    @State private var availablePrinters: [String] = []
 
     private var status: DriveWirePrinterStatus {
         host.printerStatus
@@ -743,6 +750,121 @@ struct PrinterView: View {
         return formatter
     }()
 
+    private var outputSettings: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Toggle("Save jobs to", isOn: $saveToFolder)
+                    .help("Write each job to a new file in this folder when the guest closes the printer.")
+                Text((folderPath as NSString).abbreviatingWithTildeInPath)
+                    .foregroundStyle(saveToFolder ? .white : DriveWirePalette.softText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(folderPath)
+                Spacer(minLength: 8)
+                Button("Choose…", action: chooseFolder)
+                    .controlSize(.small)
+                Button("Show") {
+                    showFolder()
+                }
+                .controlSize(.small)
+                .help("Show the folder, or the last saved job, in Finder.")
+            }
+
+            HStack(spacing: 10) {
+                Toggle("Print jobs on", isOn: $sendToPrinter)
+                    .help("Send each job to a macOS printer when the guest closes the printer.")
+                DriveWireMenuPicker(
+                    title: "Printer",
+                    selection: $printerName,
+                    options: [.init(value: "", label: "Default printer")] + printerChoices.map {
+                        .init(value: $0, label: $0.replacingOccurrences(of: "_", with: " "))
+                    }
+                )
+                .frame(maxWidth: 260 * textScale)
+                Spacer(minLength: 8)
+                HStack(spacing: 4) {
+                    ForEach(DriveWirePrinterOutputSettings.Format.allCases) { choice in
+                        Button(choice == .text ? "Text" : "Raw") {
+                            format = choice
+                        }
+                        .buttonStyle(DriveWireButtonStyle(fill: format == choice ? DriveWirePalette.accentMuted : nil))
+                    }
+                }
+                .help("Text: line endings converted and control codes dropped, laid out by macOS. Raw: the guest's bytes unchanged, for a printer that understands its codes.")
+            }
+
+            if let destination = lastDestinationText {
+                Text(destination)
+                    .dwFont(11, weight: .medium, design: .rounded)
+                    .foregroundStyle(DriveWirePalette.softText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            }
+        }
+        .toggleStyle(.checkbox)
+        .foregroundStyle(.white)
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(DriveWirePalette.panelMuted)
+        )
+        .task {
+            await loadPrinters()
+        }
+    }
+
+    /// The installed printers, plus the saved choice if it is not installed now.
+    private var printerChoices: [String] {
+        if printerName.isEmpty || availablePrinters.contains(printerName) {
+            return availablePrinters
+        }
+        return availablePrinters + [printerName]
+    }
+
+    private var lastDestinationText: String? {
+        var parts: [String] = []
+        if let path = status.lastOutputPath {
+            parts.append("Last saved: \((path as NSString).abbreviatingWithTildeInPath)")
+        }
+        if let printer = status.lastPrintedTo {
+            parts.append("Last printed on \(printer.replacingOccurrences(of: "_", with: " "))")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "  •  ")
+    }
+
+    private func loadPrinters() async {
+        let printers = await Task.detached(priority: .utility) {
+            DriveWireSystemPrinter.availablePrinters()
+        }.value
+        availablePrinters = printers
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.directoryURL = URL(fileURLWithPath: folderPath)
+
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return
+        }
+        folderPath = url.path(percentEncoded: false)
+        saveToFolder = true
+    }
+
+    private func showFolder() {
+        if let path = status.lastOutputPath, FileManager.default.fileExists(atPath: path) {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            return
+        }
+        try? FileManager.default.createDirectory(atPath: folderPath, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(URL(fileURLWithPath: folderPath, isDirectory: true))
+    }
+
     var body: some View {
         DashboardSection(eyebrow: "Output", title: "Printer", detail: "Live status for DriveWire printer output.") {
             VStack(alignment: .leading, spacing: 12) {
@@ -758,12 +880,13 @@ struct PrinterView: View {
                 }
 
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 92 * textScale, maximum: 220 * textScale), spacing: 10)], spacing: 10) {
-                    DashboardMetricBadge(label: "Backend", value: status.backendName)
                     DashboardMetricBadge(label: "Bytes", value: String(status.bytesReceived))
                     DashboardMetricBadge(label: "Pending", value: String(status.pendingBytes))
                     DashboardMetricBadge(label: "Flushes", value: String(status.flushedJobs))
                     DashboardMetricBadge(label: "Last Flush", value: lastFlushText)
                 }
+
+                outputSettings
 
                 if let lastError = status.lastError, !lastError.isEmpty {
                     Text(lastError)
