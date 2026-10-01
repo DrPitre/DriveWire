@@ -1637,6 +1637,8 @@ struct ContentView: View {
     @State private var selectedBaudRate = "57600"
     @State private var selectedIPAddress = "127.0.0.1"
     @State private var selectedIPPort = "6809"
+    @AppStorage("columnSplitFraction") private var splitFraction = DriveWireWindowMetrics.defaultSplitFraction
+    @State private var dividerDragStartWidth: CGFloat?
 
     private var activeHost: DriveWireHost {
         document.connectionType == .serial ? document.serialDriver.host : document.tcpDriver.host
@@ -1649,40 +1651,101 @@ struct ContentView: View {
         )
     }
 
-    var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            VStack(alignment: .leading, spacing: 14) {
-                ConnectionPanelView(
-                    document: $document,
-                    serialDriver: document.serialDriver,
-                    selectedPortName: $selectedPortName,
-                    selectedBaudRate: $selectedBaudRate,
-                    selectedIPAddress: $selectedIPAddress,
-                    selectedIPPort: $selectedIPPort
-                )
+    private var leftColumn: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ConnectionPanelView(
+                document: $document,
+                serialDriver: document.serialDriver,
+                selectedPortName: $selectedPortName,
+                selectedBaudRate: $selectedBaudRate,
+                selectedIPAddress: $selectedIPAddress,
+                selectedIPPort: $selectedIPPort
+            )
 
-                DrivesPanelView(document: $document)
-                VirtualChannelsView(host: activeHost)
-                VirtualWindowPanelView(host: activeHost)
-            }
-            .padding(18)
-            .frame(width: 720, alignment: .topLeading)
-
-            Rectangle()
-                .fill(Color.white.opacity(0.08))
-                .frame(width: 1)
-
-            VStack(alignment: .leading, spacing: 14) {
-                StatisticsGridView(statistics: activeHost.statistics)
-                MIDIView(host: activeHost)
-                PrinterView(host: activeHost)
-                LoggingPanelView(logText: activeLogBinding, detailedOpcodeLogging: $document.detailedOpcodeLogging)
-            }
-            .padding(18)
-            .frame(width: DriveWireWindowMetrics.contentWidth - 721, alignment: .topLeading)
+            DrivesPanelView(document: $document)
+            VirtualChannelsView(host: activeHost)
+            VirtualWindowPanelView(host: activeHost)
         }
-        .frame(width: DriveWireWindowMetrics.contentWidth, alignment: .topLeading)
-        .fixedSize(horizontal: false, vertical: true)
+        .padding(18)
+    }
+
+    private var rightColumn: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            StatisticsGridView(statistics: activeHost.statistics)
+            MIDIView(host: activeHost)
+            PrinterView(host: activeHost)
+            LoggingPanelView(logText: activeLogBinding, detailedOpcodeLogging: $document.detailedOpcodeLogging)
+        }
+        .padding(18)
+    }
+
+    /// The narrowest a column may be, which grows at half the rate of the text.
+    private var minimumColumnWidth: CGFloat {
+        let scale = CGFloat(DriveWireTextScale.clamped(textScale))
+        return (DriveWireWindowMetrics.minimumColumnWidth * (1 + (scale - 1) / 2)).rounded()
+    }
+
+    /// Limits a left column width so both columns stay above their minimum.
+    private func clampedLeftWidth(_ proposed: CGFloat, in totalWidth: CGFloat) -> CGFloat {
+        let maximum = max(minimumColumnWidth, totalWidth - DriveWireWindowMetrics.dividerWidth - minimumColumnWidth)
+        return min(max(proposed.rounded(), minimumColumnWidth), maximum)
+    }
+
+    private func leftColumnWidth(in totalWidth: CGFloat) -> CGFloat {
+        clampedLeftWidth(totalWidth * splitFraction, in: totalWidth)
+    }
+
+    private func columnDivider(totalWidth: CGFloat) -> some View {
+        Rectangle()
+            .fill(Color.white.opacity(isDraggingDivider ? 0.28 : 0.08))
+            .frame(width: DriveWireWindowMetrics.dividerWidth)
+            .overlay {
+                // A wider, invisible grab area centred on the line
+                Color.clear
+                    .frame(width: 9)
+                    .contentShape(Rectangle())
+                    .pointerStyle(.columnResize)
+                    .gesture(
+                        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                            .onChanged { value in
+                                let startWidth = dividerDragStartWidth ?? leftColumnWidth(in: totalWidth)
+                                dividerDragStartWidth = startWidth
+                                let width = clampedLeftWidth(startWidth + value.translation.width, in: totalWidth)
+                                splitFraction = Double(width / totalWidth)
+                            }
+                            .onEnded { _ in
+                                dividerDragStartWidth = nil
+                            }
+                    )
+                    .onTapGesture(count: 2) {
+                        splitFraction = DriveWireWindowMetrics.defaultSplitFraction
+                    }
+                    .help("Drag to resize the columns. Double-click to restore the default split.")
+            }
+    }
+
+    private var isDraggingDivider: Bool {
+        dividerDragStartWidth != nil
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let totalWidth = geometry.size.width
+            let leftWidth = leftColumnWidth(in: totalWidth)
+
+            ScrollView(.vertical) {
+                HStack(alignment: .top, spacing: 0) {
+                    leftColumn
+                        .frame(width: leftWidth, alignment: .topLeading)
+
+                    columnDivider(totalWidth: totalWidth)
+
+                    rightColumn
+                        .frame(width: max(0, totalWidth - leftWidth - DriveWireWindowMetrics.dividerWidth), alignment: .topLeading)
+                }
+            }
+        }
+        .frame(minWidth: minimumColumnWidth * 2 + DriveWireWindowMetrics.dividerWidth, minHeight: DriveWireWindowMetrics.minimumHeight, alignment: .topLeading)
         .background(
             LinearGradient(
                 colors: [DriveWirePalette.canvasTop, DriveWirePalette.canvasBottom],
