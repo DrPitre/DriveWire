@@ -1536,7 +1536,7 @@ struct ConnectionPanelView: View {
                     LEDView(isOn: isConnected, activeColor: DriveWirePalette.accent)
                         .frame(width: 14, height: 14)
                     Text(statusLabel)
-                        .dwFont(22, weight: .bold, design: .rounded)
+                        .dwFont(15, weight: .bold, design: .rounded)
                         .foregroundStyle(.white)
                         .lineLimit(2)
                 }
