@@ -13,7 +13,17 @@ private enum DriveWireWindowID {
 }
 
 enum DriveWireWindowMetrics {
-    static let contentWidth: CGFloat = 1520
+    /// The window's initial size; it can be resized from there.
+    static let defaultWidth: CGFloat = 1520
+    static let defaultHeight: CGFloat = 1420
+    /// The draggable divider keeps each column at least this wide at the
+    /// normal text size.
+    static let minimumColumnWidth: CGFloat = 560
+    static let dividerWidth: CGFloat = 1
+    /// The left column's share of the window width until the divider is moved.
+    static let defaultSplitFraction = 0.47
+    /// Below the full layout height the window scrolls.
+    static let minimumHeight: CGFloat = 600
 }
 
 private struct NewDocumentChooserView: View {
@@ -87,6 +97,7 @@ private struct NewDocumentChooserView: View {
 
 private struct DriveWireCommands: Commands {
     @Environment(\.openWindow) private var openWindow
+    @AppStorage(DriveWireTextScale.storageKey) private var textScale = DriveWireTextScale.defaultValue
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -94,6 +105,28 @@ private struct DriveWireCommands: Commands {
                 openWindow(id: DriveWireWindowID.newDocumentChooser)
             }
             .keyboardShortcut("n")
+        }
+
+        CommandGroup(before: .toolbar) {
+            Button("Bigger Text") {
+                textScale = DriveWireTextScale.larger(than: textScale)
+            }
+            .keyboardShortcut("+")
+            .disabled(DriveWireTextScale.clamped(textScale) >= DriveWireTextScale.steps.last!)
+
+            Button("Smaller Text") {
+                textScale = DriveWireTextScale.smaller(than: textScale)
+            }
+            .keyboardShortcut("-")
+            .disabled(DriveWireTextScale.clamped(textScale) <= DriveWireTextScale.steps.first!)
+
+            Button("Actual Size") {
+                textScale = DriveWireTextScale.defaultValue
+            }
+            .keyboardShortcut("0")
+            .disabled(DriveWireTextScale.clamped(textScale) == DriveWireTextScale.defaultValue)
+
+            Divider()
         }
     }
 }
@@ -104,7 +137,8 @@ struct DriveWireApp: App {
         DocumentGroup(newDocument: DriveWireDocument()) { configuration in
             ContentView(document: configuration.$document, fileURL: configuration.fileURL)
         }
-        .windowResizability(.contentSize)
+        .defaultSize(width: DriveWireWindowMetrics.defaultWidth, height: DriveWireWindowMetrics.defaultHeight)
+        .windowResizability(.contentMinSize)
         .commands {
             DriveWireCommands()
         }

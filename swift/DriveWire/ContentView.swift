@@ -21,6 +21,155 @@ private enum DriveWirePalette {
     static let softText = Color.white.opacity(0.64)
 }
 
+/// The user's text size, as a multiple of the designed point sizes.
+enum DriveWireTextScale {
+    static let storageKey = "uiTextScale"
+    static let steps: [Double] = [1.0, 1.15, 1.3, 1.45, 1.6, 1.8]
+    static let defaultValue = 1.0
+
+    static func clamped(_ value: Double) -> Double {
+        steps.min(by: { abs($0 - value) < abs($1 - value) }) ?? defaultValue
+    }
+
+    static func larger(than value: Double) -> Double {
+        steps.first(where: { $0 > clamped(value) }) ?? steps.last!
+    }
+
+    static func smaller(than value: Double) -> Double {
+        steps.last(where: { $0 < clamped(value) }) ?? steps.first!
+    }
+}
+
+private struct DriveWireTextScaleKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 1
+}
+
+extension EnvironmentValues {
+    var driveWireTextScale: CGFloat {
+        get { self[DriveWireTextScaleKey.self] }
+        set { self[DriveWireTextScaleKey.self] = newValue }
+    }
+}
+
+/// Sets a system font whose point size follows the user's text size.
+private struct ScaledSystemFont: ViewModifier {
+    @Environment(\.driveWireTextScale) private var scale
+    let size: CGFloat
+    let weight: Font.Weight
+    let design: Font.Design
+
+    func body(content: Content) -> some View {
+        content.font(.system(size: (size * scale).rounded(), weight: weight, design: design))
+    }
+}
+
+/// Steps a control size up as the text grows, so buttons and menus keep pace with their labels.
+private struct ScaledControlSize: ViewModifier {
+    @Environment(\.driveWireTextScale) private var scale
+    let base: ControlSize
+
+    func body(content: Content) -> some View {
+        let sizes: [ControlSize] = [.mini, .small, .regular, .large, .extraLarge]
+        let steps = scale >= 1.6 ? 2 : (scale >= 1.3 ? 1 : 0)
+        let index = min((sizes.firstIndex(of: base) ?? 2) + steps, sizes.count - 1)
+        return content.controlSize(sizes[index])
+    }
+}
+
+/// A button whose label follows the user's text size. macOS draws the
+/// standard bordered styles with AppKit, which ignores SwiftUI fonts.
+struct DriveWireButtonStyle: ButtonStyle {
+    /// The background colour, or `nil` for a neutral button.
+    var fill: Color?
+
+    init(fill: Color? = nil) {
+        self.fill = fill
+    }
+
+    func makeBody(configuration: Configuration) -> some View {
+        DriveWireButtonBody(configuration: configuration, fill: fill)
+    }
+}
+
+private struct DriveWireButtonBody: View {
+    let configuration: ButtonStyleConfiguration
+    let fill: Color?
+    @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.controlSize) private var controlSize
+    @Environment(\.driveWireTextScale) private var scale
+
+    var body: some View {
+        let isSmall = controlSize == .small || controlSize == .mini
+        let shape = RoundedRectangle(cornerRadius: isSmall ? 5 : 6, style: .continuous)
+        configuration.label
+            .font(.system(size: ((isSmall ? 11 : 13) * scale).rounded(), weight: .medium))
+            .foregroundStyle(configuration.role == .destructive ? Color(red: 1.0, green: 0.55, blue: 0.5) : .white)
+            .lineLimit(1)
+            .padding(.horizontal, isSmall ? 7 : 10)
+            .padding(.vertical, isSmall ? 2 : 4)
+            .background(shape.fill(fill ?? Color.white.opacity(0.12)))
+            .overlay(shape.stroke(Color.white.opacity(0.10), lineWidth: 1))
+            .overlay(shape.fill(Color.black.opacity(configuration.isPressed ? 0.18 : 0)))
+            .opacity(isEnabled ? 1 : 0.4)
+            .contentShape(shape)
+    }
+}
+
+/// A pop-up menu whose label follows the user's text size, unlike the AppKit-drawn menu picker.
+struct DriveWireMenuPicker<Value: Hashable>: View {
+    struct Option: Hashable {
+        let value: Value
+        let label: String
+    }
+
+    let title: String
+    @Binding var selection: Value
+    let options: [Option]
+    /// The label to show when the selection is not one of the options.
+    var missingLabel: (Value) -> String = { _ in "None" }
+
+    private var currentLabel: String {
+        options.first(where: { $0.value == selection })?.label ?? missingLabel(selection)
+    }
+
+    var body: some View {
+        Menu {
+            ForEach(options, id: \.self) { option in
+                Button {
+                    selection = option.value
+                } label: {
+                    if option.value == selection {
+                        Label(option.label, systemImage: "checkmark")
+                    } else {
+                        Text(option.label)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Text(currentLabel)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.up.chevron.down")
+                    .imageScale(.small)
+            }
+        }
+        .menuStyle(.button)
+        .menuIndicator(.hidden)
+        .accessibilityLabel(title)
+    }
+}
+
+extension View {
+    func dwControlSize(_ base: ControlSize) -> some View {
+        modifier(ScaledControlSize(base: base))
+    }
+
+    func dwFont(_ size: CGFloat, weight: Font.Weight = .regular, design: Font.Design = .default) -> some View {
+        modifier(ScaledSystemFont(size: size, weight: weight, design: design))
+    }
+}
+
 private func serialPortDisplayName(_ path: String) -> String {
     guard !path.isEmpty, path != "NONE" else {
         return "No serial device selected"
@@ -139,15 +288,15 @@ struct DashboardSection<Content: View>: View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(eyebrow.uppercased())
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .dwFont(10, weight: .semibold, design: .rounded)
                     .foregroundStyle(DriveWirePalette.accent)
                     .tracking(1.2)
                 Text(title)
-                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                    .dwFont(20, weight: .bold, design: .rounded)
                     .foregroundStyle(.white)
                 if let detail, !detail.isEmpty {
                     Text(detail)
-                        .font(.callout)
+                        .dwFont(12)
                         .foregroundStyle(DriveWirePalette.softText)
                 }
             }
@@ -183,7 +332,7 @@ struct StatusPill: View {
                 .fill(color)
                 .frame(width: 8, height: 8)
             Text(text)
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .dwFont(12, weight: .semibold, design: .rounded)
                 .foregroundStyle(.white)
         }
         .padding(.horizontal, 12)
@@ -206,11 +355,13 @@ struct DashboardMetricBadge: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label.uppercased())
-                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .dwFont(10, weight: .medium, design: .rounded)
                 .foregroundStyle(DriveWirePalette.softText)
                 .tracking(0.8)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
             Text(value)
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .dwFont(15, weight: .semibold, design: .rounded)
                 .foregroundStyle(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
@@ -240,10 +391,12 @@ struct MetricTile: View {
                 )
 
             Text(value)
-                .font(.system(size: 19, weight: .bold, design: .rounded))
+                .dwFont(19, weight: .bold, design: .rounded)
                 .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
             Text(title)
-                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .dwFont(11, weight: .medium, design: .rounded)
                 .foregroundStyle(DriveWirePalette.softText)
         }
         .padding(8)
@@ -272,7 +425,7 @@ struct LabelValueRow: View {
                 .foregroundStyle(.white)
                 .multilineTextAlignment(.trailing)
         }
-        .font(.system(size: 12, weight: .medium, design: .rounded))
+        .dwFont(12, weight: .medium, design: .rounded)
     }
 }
 
@@ -286,13 +439,16 @@ struct VirtualChannelView: View {
                 TrafficLED(label: "IN", isOn: status.incomingActive, color: Color(red: 0.96, green: 0.68, blue: 0.28))
                 TrafficLED(label: "OUT", isOn: status.outgoingActive, color: DriveWirePalette.accent)
             }
-            Text("Channel \(status.number)")
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                .foregroundStyle(.white)
-                .lineLimit(1)
+            ViewThatFits(in: .horizontal) {
+                Text("Channel \(status.number)")
+                Text("Ch \(status.number)")
+            }
+            .dwFont(13, weight: .semibold, design: .rounded)
+            .foregroundStyle(.white)
+            .lineLimit(1)
             Spacer(minLength: 8)
             Text(statusText)
-                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .dwFont(11, weight: .medium, design: .rounded)
                 .foregroundStyle(DriveWirePalette.softText)
         }
         .padding(.horizontal, 10)
@@ -319,6 +475,7 @@ struct VirtualChannelView: View {
 }
 
 private struct TrafficLED: View {
+    @Environment(\.driveWireTextScale) private var textScale
     let label: String
     let isOn: Bool
     let color: Color
@@ -328,11 +485,11 @@ private struct TrafficLED: View {
             LEDView(isOn: isOn, activeColor: color)
                 .frame(width: 7, height: 7)
             Text(label)
-                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .dwFont(9, weight: .bold, design: .rounded)
                 .foregroundStyle(isOn ? .white : DriveWirePalette.softText.opacity(0.65))
                 .monospacedDigit()
         }
-        .frame(width: 32, alignment: .leading)
+        .frame(width: 12 + 20 * textScale, alignment: .leading)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(label) \(isOn ? "active" : "idle")")
     }
@@ -358,6 +515,7 @@ struct VirtualChannelsView: View {
 }
 
 struct VirtualWindowPanelView: View {
+    @Environment(\.driveWireTextScale) private var textScale
     let host: DriveWireHost
     @State private var selectedChannel: UInt8?
 
@@ -382,7 +540,7 @@ struct VirtualWindowPanelView: View {
                             LEDView(isOn: false, activeColor: DriveWirePalette.accent)
                                 .frame(width: 8, height: 8)
                             Text("No /Z windows")
-                                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                .dwFont(12, weight: .semibold, design: .rounded)
                                 .foregroundStyle(DriveWirePalette.softText)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -397,11 +555,10 @@ struct VirtualWindowPanelView: View {
                                             LEDView(isOn: window.isOpen, activeColor: DriveWirePalette.accent)
                                                 .frame(width: 8, height: 8)
                                             Text(window.title)
-                                                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                                .dwFont(12, weight: .semibold, design: .rounded)
                                         }
                                     }
-                                    .buttonStyle(.bordered)
-                                    .tint(selectedWindow?.channel == window.channel ? DriveWirePalette.accentMuted : .gray)
+                                    .buttonStyle(DriveWireButtonStyle(fill: selectedWindow?.channel == window.channel ? DriveWirePalette.accentMuted : nil))
                                 }
                             }
                         }
@@ -411,13 +568,13 @@ struct VirtualWindowPanelView: View {
                         Button("Clear") {
                             host.clearVirtualWindow(channel: window.channel)
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(DriveWireButtonStyle())
                         .controlSize(.small)
                     }
                 }
 
                 if let window = selectedWindow {
-                    VirtualWindowTerminalView(text: window.text, channel: window.channel) { input, channel in
+                    VirtualWindowTerminalView(text: window.text, channel: window.channel, fontSize: 13 * textScale) { input, channel in
                         host.sendVirtualWindowInput(input, channel: channel)
                     }
                     .frame(maxWidth: .infinity, minHeight: 150, idealHeight: 150, maxHeight: 150)
@@ -431,7 +588,7 @@ struct VirtualWindowPanelView: View {
                     ZStack(alignment: .topLeading) {
                         Color.black.opacity(0.45)
                         Text("No active /Z windows")
-                            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            .dwFont(13, weight: .semibold, design: .monospaced)
                             .foregroundStyle(DriveWirePalette.softText)
                             .padding(12)
                     }
@@ -448,6 +605,7 @@ struct VirtualWindowPanelView: View {
 }
 
 struct MIDIView: View {
+    @Environment(\.driveWireTextScale) private var textScale
     let host: DriveWireHost
 
     private var status: DriveWireMIDIStatus {
@@ -500,13 +658,12 @@ struct MIDIView: View {
                     Button("Stop MIDI") {
                         host.stopMIDIPlayback()
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(DriveWireButtonStyle(fill: DriveWirePalette.accentMuted))
                     .controlSize(.small)
-                    .tint(DriveWirePalette.accentMuted)
                     .help("Stop MIDI playback and send all-notes-off to the selected output.")
                 }
 
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 140, maximum: 220), spacing: 10)], spacing: 10) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 92 * textScale, maximum: 220 * textScale), spacing: 10)], spacing: 10) {
                     DashboardMetricBadge(label: "Backend", value: status.backendName)
                     DashboardMetricBadge(label: "Output", value: status.selectedOutputName)
                     ForEach(metrics) { item in
@@ -516,7 +673,7 @@ struct MIDIView: View {
 
                 if let lastError = status.lastError, !lastError.isEmpty {
                     Text(lastError)
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .dwFont(12, weight: .semibold, design: .rounded)
                         .foregroundStyle(.red.opacity(0.9))
                         .padding(10)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -530,7 +687,7 @@ struct MIDIView: View {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(status.statusLines, id: \.self) { line in
                             Text(line)
-                                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                                .dwFont(12, weight: .medium, design: .monospaced)
                                 .foregroundStyle(DriveWirePalette.softText)
                                 .textSelection(.enabled)
                         }
@@ -552,7 +709,9 @@ struct MIDIView: View {
 }
 
 struct PrinterView: View {
+    @Environment(\.driveWireTextScale) private var textScale
     let host: DriveWireHost
+
 
     private var status: DriveWirePrinterStatus {
         host.printerStatus
@@ -593,13 +752,12 @@ struct PrinterView: View {
                     Button("Clear") {
                         host.resetPrinterState()
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(DriveWireButtonStyle(fill: DriveWirePalette.accentMuted))
                     .controlSize(.small)
-                    .tint(DriveWirePalette.accentMuted)
                     .help("Clear buffered printer output and reset printer counters.")
                 }
 
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 140, maximum: 220), spacing: 10)], spacing: 10) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 92 * textScale, maximum: 220 * textScale), spacing: 10)], spacing: 10) {
                     DashboardMetricBadge(label: "Backend", value: status.backendName)
                     DashboardMetricBadge(label: "Bytes", value: String(status.bytesReceived))
                     DashboardMetricBadge(label: "Pending", value: String(status.pendingBytes))
@@ -609,7 +767,7 @@ struct PrinterView: View {
 
                 if let lastError = status.lastError, !lastError.isEmpty {
                     Text(lastError)
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .dwFont(12, weight: .semibold, design: .rounded)
                         .foregroundStyle(.red.opacity(0.9))
                         .padding(10)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -622,7 +780,7 @@ struct PrinterView: View {
                 ZStack(alignment: .topLeading) {
                     Color.black.opacity(0.20)
                     Text(status.previewText.isEmpty ? "No printer output" : status.previewText)
-                        .font(.system(size: 12, weight: .medium, design: .monospaced))
+                        .dwFont(12, weight: .medium, design: .monospaced)
                         .foregroundStyle(status.previewText.isEmpty ? DriveWirePalette.softText : .white.opacity(0.86))
                         .textSelection(.enabled)
                         .padding(10)
@@ -642,6 +800,7 @@ struct PrinterView: View {
 private struct VirtualWindowTerminalView: NSViewRepresentable {
     let text: String
     let channel: UInt8
+    let fontSize: CGFloat
     let onInput: (String, UInt8) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -664,7 +823,8 @@ private struct VirtualWindowTerminalView: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
-        textView.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+        textView.font = .monospacedSystemFont(ofSize: fontSize, weight: .medium)
+        textView.terminalFontSize = fontSize
         textView.textColor = NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 1.0)
         textView.insertionPointColor = .clear
         textView.selectedTextAttributes = [
@@ -689,6 +849,7 @@ private struct VirtualWindowTerminalView: NSViewRepresentable {
         textView.onInput = { input in
             context.coordinator.onInput(input, context.coordinator.channel)
         }
+        textView.terminalFontSize = fontSize
         textView.setTerminalText(text)
 
         DispatchQueue.main.async {
@@ -713,10 +874,20 @@ private final class VirtualWindowTextView: NSTextView {
     var onInput: ((String) -> Void)?
     private var cursorTimer: Timer?
     private var isCursorVisible = true
-    private let terminalAttributes: [NSAttributedString.Key: Any] = [
-        .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .medium),
-        .foregroundColor: NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 1.0)
-    ]
+
+    var terminalFontSize: CGFloat = 13 {
+        didSet {
+            guard terminalFontSize != oldValue else { return }
+            font = .monospacedSystemFont(ofSize: terminalFontSize, weight: .medium)
+        }
+    }
+
+    private var terminalAttributes: [NSAttributedString.Key: Any] {
+        [
+            .font: NSFont.monospacedSystemFont(ofSize: terminalFontSize, weight: .medium),
+            .foregroundColor: NSColor(red: 0.75, green: 1.0, blue: 0.78, alpha: 1.0)
+        ]
+    }
 
     override var acceptsFirstResponder: Bool { true }
     override var canBecomeKeyView: Bool { true }
@@ -795,7 +966,7 @@ private final class VirtualWindowTextView: NSTextView {
         let textLength = string.count
         setSelectedRange(NSRange(location: textLength, length: 0))
 
-        let font = font ?? .monospacedSystemFont(ofSize: 13, weight: .medium)
+        let font = font ?? .monospacedSystemFont(ofSize: terminalFontSize, weight: .medium)
         let characterWidth = max(8, (" " as NSString).size(withAttributes: [.font: font]).width)
         let cursorHeight = font.ascender - font.descender
         let cursorOrigin = terminalCursorOrigin(characterWidth: characterWidth, cursorHeight: cursorHeight)
@@ -920,17 +1091,17 @@ struct DriveRowView: View {
                         .frame(width: 10, height: 10)
                         .accessibilityLabel(activityLabel)
                     Text("Drive \(driveNumber)")
-                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                        .dwFont(15, weight: .bold, design: .rounded)
                         .foregroundStyle(.white)
                     Spacer(minLength: 12)
                     StatusPill(text: statusText, color: imagePath == nil ? .gray : DriveWirePalette.accent)
                 }
 
                 Text(displayName)
-                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .dwFont(14, weight: .semibold, design: .rounded)
                     .foregroundStyle(.white)
                 Text(detailText)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .dwFont(12, weight: .medium, design: .rounded)
                     .foregroundStyle(DriveWirePalette.softText)
                     .textSelection(.enabled)
                     .lineLimit(2)
@@ -940,14 +1111,13 @@ struct DriveRowView: View {
 
             VStack(spacing: 8) {
                 Button(imagePath == nil ? "Mount" : "Replace", action: onChoose)
-                    .buttonStyle(.borderedProminent)
-                    .tint(DriveWirePalette.accentMuted)
+                    .buttonStyle(DriveWireButtonStyle(fill: DriveWirePalette.accentMuted))
                 Button("Refresh", action: onRefresh)
-                    .buttonStyle(.bordered)
+                    .buttonStyle(DriveWireButtonStyle())
                     .disabled(imagePath == nil)
                     .help("Reload this disk image from its current file path.")
                 Button("Eject", role: .destructive, action: onEject)
-                    .buttonStyle(.bordered)
+                    .buttonStyle(DriveWireButtonStyle())
                     .disabled(imagePath == nil)
             }
             .controlSize(.small)
@@ -1051,7 +1221,7 @@ struct InspectorField<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(label.uppercased())
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .dwFont(11, weight: .semibold, design: .rounded)
                 .foregroundStyle(DriveWirePalette.softText)
                 .tracking(0.8)
             content
@@ -1060,6 +1230,7 @@ struct InspectorField<Content: View>: View {
 }
 
 struct SerialPortSelector: View {
+    @Environment(\.driveWireTextScale) private var textScale
     @Binding var selectedPortName: String
     @Binding var selectedBaudRate: String
     @StateObject private var portManager = ObservableSerialPortManager()
@@ -1067,32 +1238,28 @@ struct SerialPortSelector: View {
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
             InspectorField("Serial Port") {
-                Picker("Serial Port", selection: $selectedPortName) {
-                    Text("No device")
-                        .tag("NONE")
-                    ForEach(portManager.availablePorts, id: \.self) { port in
-                        Text(port.name)
-                            .tag(port.path)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
+                DriveWireMenuPicker(
+                    title: "Serial Port",
+                    selection: $selectedPortName,
+                    options: [.init(value: "NONE", label: "No device")] + portManager.availablePorts.map {
+                        .init(value: $0.path, label: $0.name)
+                    },
+                    missingLabel: { "\(serialPortDisplayName($0)) (not present)" }
+                )
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
 
             InspectorField("Baud Rate") {
-                Picker("Baud Rate", selection: $selectedBaudRate) {
-                    ForEach(["57600", "115200", "230400"], id: \.self) { baud in
-                        Text(baud)
-                            .tag(baud)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
+                DriveWireMenuPicker(
+                    title: "Baud Rate",
+                    selection: $selectedBaudRate,
+                    options: ["57600", "115200", "230400"].map { .init(value: $0, label: $0) },
+                    missingLabel: { $0 }
+                )
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(width: 160, alignment: .topLeading)
+            .frame(width: 160 * textScale, alignment: .topLeading)
         }
     }
 }
@@ -1116,6 +1283,7 @@ struct IPAddressSelector: View {
 }
 
 struct StatisticsGridView: View {
+    @Environment(\.driveWireTextScale) private var textScale
     let statistics: DriveWireStatistics
 
     private var tiles: [StatTile] {
@@ -1141,13 +1309,13 @@ struct StatisticsGridView: View {
         ]
     }
 
-    private let primaryColumns = [
-        GridItem(.adaptive(minimum: 150, maximum: 220), spacing: 10, alignment: .top)
-    ]
+    private var primaryColumns: [GridItem] {
+        [GridItem(.adaptive(minimum: 112 * textScale, maximum: 220 * textScale), spacing: 10, alignment: .top)]
+    }
 
-    private let secondaryColumns = [
-        GridItem(.adaptive(minimum: 140, maximum: 220), spacing: 10, alignment: .top)
-    ]
+    private var secondaryColumns: [GridItem] {
+        [GridItem(.adaptive(minimum: 92 * textScale, maximum: 220 * textScale), spacing: 10, alignment: .top)]
+    }
 
     var body: some View {
         DashboardSection(eyebrow: "Telemetry", title: "Runtime Snapshot", detail: "Live protocol and disk activity from the active host.") {
@@ -1221,14 +1389,13 @@ struct SerialCommsView: View {
                 Button("Connect") {
                     serialDriver.connect()
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(DriveWirePalette.accentMuted)
+                .buttonStyle(DriveWireButtonStyle(fill: DriveWirePalette.accentMuted))
                 .disabled(portName == "NONE" || serialDriver.isConnected || serialDriver.isWaitingForPort)
 
                 Button("Disconnect") {
                     serialDriver.stop()
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(DriveWireButtonStyle())
                 .disabled(!serialDriver.isConnected && !serialDriver.isWaitingForPort)
             }
         }
@@ -1289,13 +1456,12 @@ struct TCPCommsView: View {
                 Button("Connect") {
                     tcpDriver.connect(ipAddress: ipAddress, ipPort: UInt32(ipPort) ?? tcpDriver.ipPort)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(DriveWirePalette.accentMuted)
+                .buttonStyle(DriveWireButtonStyle(fill: DriveWirePalette.accentMuted))
 
                 Button("Disconnect") {
                     tcpDriver.stop()
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(DriveWireButtonStyle())
             }
         }
         .padding(16)
@@ -1370,7 +1536,7 @@ struct ConnectionPanelView: View {
                     LEDView(isOn: isConnected, activeColor: DriveWirePalette.accent)
                         .frame(width: 14, height: 14)
                     Text(statusLabel)
-                        .font(.system(size: 22, weight: .bold, design: .rounded))
+                        .dwFont(22, weight: .bold, design: .rounded)
                         .foregroundStyle(.white)
                         .lineLimit(2)
                 }
@@ -1382,9 +1548,8 @@ struct ConnectionPanelView: View {
                 } label: {
                     Label("Reset CoCo", systemImage: "power")
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(DriveWireButtonStyle(fill: .red.opacity(0.75)))
                 .controlSize(.small)
-                .tint(.red.opacity(0.75))
                 .disabled(!isConnected)
                 .help("Send the reset byte to the CoCo, then reset the DriveWire server session.")
             }
@@ -1410,23 +1575,22 @@ struct LoggingPanelView: View {
                 Button("Clear") {
                     logText = ""
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(DriveWirePalette.accentMuted)
+                .buttonStyle(DriveWireButtonStyle(fill: DriveWirePalette.accentMuted))
 
                 Button("Copy") {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(logText, forType: .string)
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(DriveWireButtonStyle())
 
                 Toggle("Detailed opcodes", isOn: $detailedOpcodeLogging)
                     .toggleStyle(.switch)
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .dwFont(12, weight: .semibold, design: .rounded)
                     .foregroundStyle(.white)
                     .help("Includes frequent READ, WRITE, GETSTAT, and SETSTAT traffic in the activity log. Leave this off for normal performance.")
 
                 Text("\(logText.split(separator: "\n").count) lines")
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .dwFont(12, weight: .medium, design: .rounded)
                     .foregroundStyle(DriveWirePalette.softText)
             }
 
@@ -1434,7 +1598,7 @@ struct LoggingPanelView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
                         Text(logText.isEmpty ? " " : logText)
-                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .dwFont(12, weight: .medium, design: .monospaced)
                             .foregroundStyle(.white)
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                             .textSelection(.enabled)
@@ -1468,10 +1632,13 @@ struct LoggingPanelView: View {
 struct ContentView: View {
     @Binding var document: DriveWireDocument
     let fileURL: URL?
+    @AppStorage(DriveWireTextScale.storageKey) private var textScale = DriveWireTextScale.defaultValue
     @State private var selectedPortName = "NONE"
     @State private var selectedBaudRate = "57600"
     @State private var selectedIPAddress = "127.0.0.1"
     @State private var selectedIPPort = "6809"
+    @AppStorage("columnSplitFraction") private var splitFraction = DriveWireWindowMetrics.defaultSplitFraction
+    @State private var dividerDragStartWidth: CGFloat?
 
     private var activeHost: DriveWireHost {
         document.connectionType == .serial ? document.serialDriver.host : document.tcpDriver.host
@@ -1484,40 +1651,101 @@ struct ContentView: View {
         )
     }
 
-    var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            VStack(alignment: .leading, spacing: 14) {
-                ConnectionPanelView(
-                    document: $document,
-                    serialDriver: document.serialDriver,
-                    selectedPortName: $selectedPortName,
-                    selectedBaudRate: $selectedBaudRate,
-                    selectedIPAddress: $selectedIPAddress,
-                    selectedIPPort: $selectedIPPort
-                )
+    private var leftColumn: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ConnectionPanelView(
+                document: $document,
+                serialDriver: document.serialDriver,
+                selectedPortName: $selectedPortName,
+                selectedBaudRate: $selectedBaudRate,
+                selectedIPAddress: $selectedIPAddress,
+                selectedIPPort: $selectedIPPort
+            )
 
-                DrivesPanelView(document: $document)
-                VirtualChannelsView(host: activeHost)
-                VirtualWindowPanelView(host: activeHost)
-            }
-            .padding(18)
-            .frame(width: 720, alignment: .topLeading)
-
-            Rectangle()
-                .fill(Color.white.opacity(0.08))
-                .frame(width: 1)
-
-            VStack(alignment: .leading, spacing: 14) {
-                StatisticsGridView(statistics: activeHost.statistics)
-                MIDIView(host: activeHost)
-                PrinterView(host: activeHost)
-                LoggingPanelView(logText: activeLogBinding, detailedOpcodeLogging: $document.detailedOpcodeLogging)
-            }
-            .padding(18)
-            .frame(width: DriveWireWindowMetrics.contentWidth - 721, alignment: .topLeading)
+            DrivesPanelView(document: $document)
+            VirtualChannelsView(host: activeHost)
+            VirtualWindowPanelView(host: activeHost)
         }
-        .frame(width: DriveWireWindowMetrics.contentWidth, alignment: .topLeading)
-        .fixedSize(horizontal: false, vertical: true)
+        .padding(18)
+    }
+
+    private var rightColumn: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            StatisticsGridView(statistics: activeHost.statistics)
+            MIDIView(host: activeHost)
+            PrinterView(host: activeHost)
+            LoggingPanelView(logText: activeLogBinding, detailedOpcodeLogging: $document.detailedOpcodeLogging)
+        }
+        .padding(18)
+    }
+
+    /// The narrowest a column may be, which grows at half the rate of the text.
+    private var minimumColumnWidth: CGFloat {
+        let scale = CGFloat(DriveWireTextScale.clamped(textScale))
+        return (DriveWireWindowMetrics.minimumColumnWidth * (1 + (scale - 1) / 2)).rounded()
+    }
+
+    /// Limits a left column width so both columns stay above their minimum.
+    private func clampedLeftWidth(_ proposed: CGFloat, in totalWidth: CGFloat) -> CGFloat {
+        let maximum = max(minimumColumnWidth, totalWidth - DriveWireWindowMetrics.dividerWidth - minimumColumnWidth)
+        return min(max(proposed.rounded(), minimumColumnWidth), maximum)
+    }
+
+    private func leftColumnWidth(in totalWidth: CGFloat) -> CGFloat {
+        clampedLeftWidth(totalWidth * splitFraction, in: totalWidth)
+    }
+
+    private func columnDivider(totalWidth: CGFloat) -> some View {
+        Rectangle()
+            .fill(Color.white.opacity(isDraggingDivider ? 0.28 : 0.08))
+            .frame(width: DriveWireWindowMetrics.dividerWidth)
+            .overlay {
+                // A wider, invisible grab area centred on the line
+                Color.clear
+                    .frame(width: 9)
+                    .contentShape(Rectangle())
+                    .pointerStyle(.columnResize)
+                    .gesture(
+                        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                            .onChanged { value in
+                                let startWidth = dividerDragStartWidth ?? leftColumnWidth(in: totalWidth)
+                                dividerDragStartWidth = startWidth
+                                let width = clampedLeftWidth(startWidth + value.translation.width, in: totalWidth)
+                                splitFraction = Double(width / totalWidth)
+                            }
+                            .onEnded { _ in
+                                dividerDragStartWidth = nil
+                            }
+                    )
+                    .onTapGesture(count: 2) {
+                        splitFraction = DriveWireWindowMetrics.defaultSplitFraction
+                    }
+                    .help("Drag to resize the columns. Double-click to restore the default split.")
+            }
+    }
+
+    private var isDraggingDivider: Bool {
+        dividerDragStartWidth != nil
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let totalWidth = geometry.size.width
+            let leftWidth = leftColumnWidth(in: totalWidth)
+
+            ScrollView(.vertical) {
+                HStack(alignment: .top, spacing: 0) {
+                    leftColumn
+                        .frame(width: leftWidth, alignment: .topLeading)
+
+                    columnDivider(totalWidth: totalWidth)
+
+                    rightColumn
+                        .frame(width: max(0, totalWidth - leftWidth - DriveWireWindowMetrics.dividerWidth), alignment: .topLeading)
+                }
+            }
+        }
+        .frame(minWidth: minimumColumnWidth * 2 + DriveWireWindowMetrics.dividerWidth, minHeight: DriveWireWindowMetrics.minimumHeight, alignment: .topLeading)
         .background(
             LinearGradient(
                 colors: [DriveWirePalette.canvasTop, DriveWirePalette.canvasBottom],
@@ -1539,6 +1767,10 @@ struct ContentView: View {
             }
             .frame(width: 0, height: 0)
         }
+        .dwFont(13)
+        .dwControlSize(.regular)
+        .buttonStyle(DriveWireButtonStyle())
+        .environment(\.driveWireTextScale, CGFloat(DriveWireTextScale.clamped(textScale)))
         .navigationTitle("DriveWire Host")
     }
 }
