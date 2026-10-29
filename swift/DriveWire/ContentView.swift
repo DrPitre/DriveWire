@@ -1546,12 +1546,12 @@ struct ConnectionPanelView: View {
                 Button {
                     activeHost.requestCoCoReset()
                 } label: {
-                    Label("Reset CoCo", systemImage: "power")
+                    Label("Reset Guest", systemImage: "power")
                 }
                 .buttonStyle(DriveWireButtonStyle(fill: .red.opacity(0.75)))
                 .controlSize(.small)
                 .disabled(!isConnected)
-                .help("Send the reset byte to the CoCo, then reset the DriveWire server session.")
+                .help("Send the reset byte to the guest, then reset the DriveWire server session.")
             }
 
             if document.connectionType == .serial {
