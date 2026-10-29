@@ -191,6 +191,88 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         }
     }
 
+    func testPrinterPlainTextConvertsLineEndingsAndDropsControlCodes() throws {
+        let job = Data([0x41, 0x0D, 0x42, 0x0D, 0x0A, 0x43, 0x0A, 0x09, 0x1B, 0x45, 0x0C, 0x44, 0x80, 0x0D])
+        XCTAssertEqual(DriveWirePrintJob.plainText(from: job), Data("A\nB\nC\n\tE\u{0C}D\n".utf8))
+    }
+
+    func testPrinterSaveUsesUniqueTimestampedNames() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+        defer { try? FileManager.default.removeItem(atPath: folder) }
+        let date = Date(timeIntervalSince1970: 0)
+
+        let first = try DriveWirePrintJob.save(Data("one".utf8), toFolder: folder, format: .text, date: date)
+        let second = try DriveWirePrintJob.save(Data("two".utf8), toFolder: folder, format: .text, date: date)
+        let raw = try DriveWirePrintJob.save(Data([0x1B]), toFolder: folder, format: .raw, date: date)
+
+        XCTAssertTrue(first.lastPathComponent.hasPrefix("DriveWire-print-"))
+        XCTAssertEqual(first.pathExtension, "txt")
+        XCTAssertEqual(second.lastPathComponent, first.deletingPathExtension().lastPathComponent + "-2.txt")
+        XCTAssertEqual(raw.pathExtension, "prn")
+        XCTAssertEqual(try Data(contentsOf: first), Data("one".utf8))
+        XCTAssertEqual(try Data(contentsOf: second), Data("two".utf8))
+    }
+
+    func testPrinterLPArguments() throws {
+        XCTAssertEqual(
+            DriveWireSystemPrinter.lpArguments(printerName: "", format: .text),
+            ["-t", "DriveWire", "-o", "document-format=text/plain"]
+        )
+        XCTAssertEqual(
+            DriveWireSystemPrinter.lpArguments(printerName: "Epson_FX", format: .raw),
+            ["-d", "Epson_FX", "-t", "DriveWire", "-o", "raw"]
+        )
+    }
+
+    func testPrinterSubmitReportsUnknownPrinter() throws {
+        let done = XCTestExpectation(description: "lp finished")
+        var outcome: Result<String, Error>?
+        DriveWireSystemPrinter.submit(Data("x".utf8), printerName: "DriveWire_No_Such_Printer", format: .text) { result in
+            outcome = result
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 10)
+
+        guard case .failure(let error) = try XCTUnwrap(outcome) else {
+            return XCTFail("lp accepted a job for a printer that does not exist")
+        }
+        XCTAssertFalse(error.localizedDescription.isEmpty)
+    }
+
+    func testPrinterFlushSavesJobToFolder() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+        defer { try? FileManager.default.removeItem(atPath: folder) }
+        var settings = DriveWirePrinterOutputSettings()
+        settings.saveToFolder = true
+        settings.folderPath = folder
+        host!.printerOutputSettingsProvider = { settings }
+
+        for byte in Array("HI\r".utf8) {
+            var s = Data([host!.OPPRINT, byte])
+            host!.send(data: &s)
+        }
+        var flush = Data([host!.OPPRINTFLUSH])
+        host!.send(data: &flush)
+
+        let path = try XCTUnwrap(host!.printerStatus.lastOutputPath)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), Data("HI\n".utf8))
+        XCTAssertEqual(host!.printerStatus.flushedJobs, 1)
+        XCTAssertEqual(host!.printerStatus.pendingBytes, 0)
+        XCTAssertEqual(host!.printerStatus.previewText, "HI\r")
+    }
+
+    func testPrinterFlushWithoutOutputSettingsSavesNothing() throws {
+        host!.printerOutputSettingsProvider = { DriveWirePrinterOutputSettings() }
+
+        var s = Data([host!.OPPRINT, 0x41])
+        host!.send(data: &s)
+        var flush = Data([host!.OPPRINTFLUSH])
+        host!.send(data: &flush)
+
+        XCTAssertNil(host!.printerStatus.lastOutputPath)
+        XCTAssertEqual(host!.printerStatus.flushedJobs, 1)
+    }
+
     func testPerformanceExample() throws {
         // This is an example of a performance test case.
         measure {
