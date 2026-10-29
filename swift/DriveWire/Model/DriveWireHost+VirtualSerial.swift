@@ -280,7 +280,7 @@ extension DriveWireHost {
         reportActivity("OP_SERREAD -> \(response[0]),\(response[1])", isFrequent: true)
         if response == Data([16, 255]) {
             resetGuestSessionState()
-            reportActivity("CoCo reset requested; DriveWire server reset")
+            reportActivity("Guest reset requested; DriveWire server reset")
         }
         return 1
     }
@@ -373,7 +373,7 @@ extension DriveWireHost {
 
     func requestCoCoReset() {
         clientRestartRequested = true
-        reportActivity("CoCo reset requested")
+        reportActivity("Guest reset requested")
     }
 
     func pollVirtualSerial() -> Data {
