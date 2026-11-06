@@ -47,7 +47,8 @@ def check(binary, isolate_runtime):
         system = env['SystemRoot']
         env['PATH'] = os.pathsep.join([str(binary.parent), system + '\\System32', system])
     with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
+        root = Path(directory)/'host files'
+        root.mkdir()
         (root/'DD/CMDS').mkdir(parents=True)
         (root/'DD/child').mkdir()
         (root/'DD/marker').write_bytes(b'ROOT')
@@ -69,7 +70,7 @@ def check(binary, isolate_runtime):
                         break
                     except OSError:
                         if server.poll() is not None or time.monotonic() >= deadline:
-                            raise AssertionError((root/'server.log').read_text(errors='replace'))
+                            raise AssertionError(f'server exited with {server.poll()}: ' + (root/'server.log').read_text(errors='replace'))
                         time.sleep(.05)
                 with peer:
                     peer.settimeout(5)

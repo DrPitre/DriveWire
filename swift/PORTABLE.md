@@ -84,3 +84,7 @@ make check DRIVEWIRE_CLI=/absolute/path/to/drivewire-server
 That boots from a local kernel track with no local OS9Boot and no RBF modules,
 loads the remaining system through RFM, and verifies the live module directory,
 a remote directory listing and a completion marker.
+
+The portable release executable has also completed the CoCo 3 MAME RFM-root
+boot check on macOS: remote OS9Boot, GrfDrv, SysGo and Shell loads, no RBF
+modules or server-mounted virtual disks, and all guest output checks passed.
