@@ -127,5 +127,12 @@ public final class DriveWireServer: DriveWireDelegate {
         serial?.send(data)
     }
 
+    public func dataAvailableAfterReceiveBoundary(host: DriveWireHost, data: Data) {
+        bytesSent += UInt64(data.count)
+        if logging { print("<- \(data.map { String(format: "%02x", $0) }.joined())") }
+        connection?.send(data)
+        serial?.send(data, afterReceiveBoundary: true)
+    }
+
     public func transactionCompleted(opCode: UInt8) { transactions += 1 }
 }

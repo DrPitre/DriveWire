@@ -62,6 +62,10 @@ static int transfer(dw_serial *port, void *buffer, int count, int writing, char 
 }
 int dw_serial_read(dw_serial *port,uint8_t *data,int count,char *error,size_t cap) { return transfer(port,data,count,0,error,cap); }
 int dw_serial_write(dw_serial *port,const uint8_t *data,int count,char *error,size_t cap) { return transfer(port,(void *)data,count,1,error,cap); }
+int dw_serial_drain(dw_serial *port, char *error, size_t cap) {
+    if (!FlushFileBuffers(port->handle)) { problem(error,cap,"Drain serial output");return -1; }
+    return 0;
+}
 void dw_serial_cancel(dw_serial *port) { CancelIoEx(port->handle,NULL); }
 void dw_serial_close(dw_serial *port) { CloseHandle(port->handle);free(port); }
 int dw_serial_ports(char *out,size_t cap,char *error,size_t error_cap) {
@@ -179,6 +183,12 @@ int dw_serial_write(dw_serial *port,const uint8_t *data,int count,char *error,si
     if (sent<0 && (errno==EAGAIN||errno==EINTR)) return 0;
     if (sent<0) { problem(error,cap,"Write serial port");return -1; }
     return (int)sent;
+}
+int dw_serial_drain(dw_serial *port, char *error, size_t cap) {
+    int result;
+    do { result=tcdrain(port->fd); } while (result<0 && errno==EINTR);
+    if (result<0) { problem(error,cap,"Drain serial output");return -1; }
+    return 0;
 }
 void dw_serial_cancel(dw_serial *port) { (void)port; }
 void dw_serial_close(dw_serial *port) {

@@ -682,11 +682,11 @@ extension DriveWireHost {
                     print(line)
                 }
             }
-            var reply = Data([errorCode])
+            delegate?.dataAvailable(host: self, data: Data([errorCode]))
             if contextReply && errorCode == 0 {
-                reply.append(contentsOf: [UInt8((cookie >> 16) & 255), UInt8((cookie >> 8) & 255), UInt8(cookie & 255)])
+                delegate?.dataAvailableAfterReceiveBoundary(host: self, data: Data([
+                    UInt8((cookie >> 16) & 255), UInt8((cookie >> 8) & 255), UInt8(cookie & 255)]))
             }
-            delegate?.dataAvailable(host: self, data: reply)
             resetState()
             return crOffset - data.startIndex + 1
         }
@@ -798,7 +798,7 @@ extension DriveWireHost {
                     delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
                     if !lineData.isEmpty {
                         Thread.sleep(forTimeInterval: 0.002)
-                        delegate?.dataAvailable(host: self, data: lineData)
+                        delegate?.dataAvailableAfterReceiveBoundary(host: self, data: lineData)
                     }
                 }
             } else {
@@ -859,7 +859,7 @@ extension DriveWireHost {
                     delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
                     if !lineData.isEmpty {
                         Thread.sleep(forTimeInterval: 0.002)
-                        delegate?.dataAvailable(host: self, data: lineData)
+                        delegate?.dataAvailableAfterReceiveBoundary(host: self, data: lineData)
                     }
                 }
             } else {

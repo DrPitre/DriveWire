@@ -66,7 +66,9 @@ public final class SerialConnection: @unchecked Sendable {
 
     deinit { session?.cancel() }
 
-    public func send(_ data: Data) { session?.write(data) }
+    public func send(_ data: Data, afterReceiveBoundary: Bool = false) {
+        session?.write(data, afterReceiveBoundary: afterReceiveBoundary)
+    }
     public func cancel() { finish(nil) }
     private func finish(_ error: Error?) {
         guard !closed else { return }
@@ -109,7 +111,7 @@ public final class SerialConnection: @unchecked Sendable {
                 }
             }
         }
-        func write(_ data: Data) {
+        func write(_ data: Data, afterReceiveBoundary: Bool) {
             guard !data.isEmpty else { return }
             lock.lock()
             if cancelled { lock.unlock(); return }
@@ -119,6 +121,16 @@ public final class SerialConnection: @unchecked Sendable {
                 defer { self.lock.lock(); self.queuedBytes -= data.count; self.lock.unlock() }
                 var offset = 0
                 var error = [CChar](repeating: 0, count: 512)
+                if afterReceiveBoundary {
+                    // Finish the status/count on the wire before the gap. Sleeping
+                    // after write() alone could let a USB adapter coalesce both parts.
+                    guard !self.stopped else { return }
+                    guard dw_serial_drain(self.handle, &error, error.count) == 0 else {
+                        if !self.stopped { self.fail(String(cString: error)) }
+                        return
+                    }
+                    Thread.sleep(forTimeInterval: 0.002)
+                }
                 while offset < data.count && !self.stopped {
                     let sent = data.withUnsafeBytes { bytes in
                         dw_serial_write(self.handle, bytes.baseAddress!.assumingMemoryBound(to: UInt8.self).advanced(by: offset), Int32(data.count - offset), &error, error.count)
