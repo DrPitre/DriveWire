@@ -11,7 +11,6 @@
 #include <wx/socket.h>
 #include <wx/aboutdlg.h>
 #include <wx/cmdline.h>
-#include <fstream>
 #include <functional>
 #include <map>
 #include <array>
@@ -27,7 +26,8 @@ static std::string stringValue(const json& j, const char* key, const std::string
 }
 
 class Desktop final : public wxFrame {
-    wxTextCtrl *address_, *log_, *stats_, *printer_, *windowText_, *windowInput_;
+    wxTextCtrl *address_, *log_, *printer_, *windowText_, *windowInput_;
+    wxStaticText* stats_;
     wxSpinCtrl* port_;
     wxDirPickerCtrl* root_;
     wxCheckBox* verbose_;
@@ -68,7 +68,7 @@ class Desktop final : public wxFrame {
         appendLog("Error: " + message);
         SetStatusText(message, 0);
         if (smoke_) { failSmoke(utf8(message)); return; }
-        wxMessageBox(message, "DriveWire", wxOK | wxICON_ERROR, this);
+        CallAfter([this, message] { if (!closing_) wxMessageBox(message, "DriveWire", wxOK | wxICON_ERROR, this); });
     }
     wxString defaultServer() {
         wxFileName binary(wxStandardPaths::Get().GetExecutablePath());
@@ -130,7 +130,7 @@ class Desktop final : public wxFrame {
     }
     void launch() {
         if (process_) return;
-        ready_ = false; closing_ = false; launched_ = std::chrono::steady_clock::now();
+        ready_ = false; closing_ = false; starting_ = false; launched_ = std::chrono::steady_clock::now();
         wxString path = executable_.empty() ? defaultServer() : executable_;
         if (!wxFileExists(path)) {
             if (smoke_) { failSmoke("Server executable not found: " + utf8(path)); return; }
@@ -180,21 +180,25 @@ class Desktop final : public wxFrame {
             });
         });
     }
-    void preserve(int number, std::function<void()> continuation) {
-        if (!dirty(number)) { continuation(); return; }
-        auto answer = wxMessageBox("This disk has guest changes. Save them before continuing?", "Unsaved disk changes",
-                                   wxYES_NO | wxCANCEL | wxICON_QUESTION, this);
-        if (answer == wxCANCEL) return;
-        if (answer == wxYES) send({{"command", "save"}, {"drive", number}}, [continuation](const json& r) { if (r.value("ok", false)) continuation(); });
-        else continuation();
+    void preserve(int number, std::function<void(bool, bool)> continuation) {
+        send({{"command", "status"}}, [this, number, continuation](const json& reply) {
+            if (!reply.value("ok", false)) return;
+            if (!dirty(number)) { continuation(false, false); return; }
+            auto answer = wxMessageBox("This disk has guest changes. Save them before continuing?", "Unsaved disk changes",
+                                       wxYES_NO | wxCANCEL | wxICON_QUESTION, this);
+            if (answer == wxCANCEL) return;
+            // Saving and replacing happen in one backend command, so guest
+            // writes cannot slip between Save and Eject/Mount.
+            continuation(answer == wxYES, answer == wxNO);
+        });
     }
     void mount(int number) {
         wxFileDialog choose(this, wxString::Format("Mount image in drive %d", number), "", "",
                             "Disk images (*.dsk;*.vhd;*.os9)|*.dsk;*.vhd;*.os9|All files|*", wxFD_OPEN | wxFD_FILE_MUST_EXIST);
         if (choose.ShowModal() != wxID_OK) return;
         auto path = utf8(choose.GetPath());
-        preserve(number, [this, number, path] {
-            send({{"command", "mount"}, {"drive", number}, {"path", path}, {"discard", true}},
+        preserve(number, [this, number, path](bool save, bool discard) {
+            send({{"command", "mount"}, {"drive", number}, {"path", path}, {"saveBefore", save}, {"discard", discard}},
                  [this](const json& r) { if (r.value("ok", false)) remember(); });
         });
     }
@@ -255,7 +259,7 @@ class Desktop final : public wxFrame {
         start_->Enable(ready_ && !active && !starting_); stop_->Enable(active); disconnect_->Enable(active && connected);
         SetStatusText(!active ? wxS("Stopped") : connected ? wxS("Guest connected") : wxS("Listening — waiting for guest"), 0);
         SetStatusText(active ? text(stringValue(state_,"bind")) + wxString::Format(":%d",state_.value("port",0)) : "", 1);
-        stats_->ChangeValue(wxString::Format("Received: %llu bytes     Sent: %llu bytes     Transactions: %llu",
+        stats_->SetLabel(wxString::Format("Received: %llu bytes     Sent: %llu bytes     Transactions: %llu",
             static_cast<unsigned long long>(state_.value("received", 0ULL)),
             static_cast<unsigned long long>(state_.value("sent", 0ULL)),
             static_cast<unsigned long long>(state_.value("transactions", 0ULL))));
@@ -304,20 +308,22 @@ class Desktop final : public wxFrame {
     void close() {
         if (closing_) return;
         if (!process_ || !ready_) { Destroy(); return; }
-        if (dirty()) {
-            auto answer = wxMessageBox("Save all guest disk changes before quitting?", "Quit DriveWire", wxYES_NO | wxCANCEL | wxICON_QUESTION,this);
-            if (answer == wxCANCEL) return;
-            if (answer == wxYES) {
-                send({{"command","saveAll"}}, [this](const json& reply) { if (reply.value("ok",false)) shutdown(); });
-                return;
-            }
-        }
-        shutdown();
+        send({{"command", "status"}}, [this](const json& reply) {
+            if (!reply.value("ok", false)) return;
+            if (dirty()) {
+                auto answer = wxMessageBox("Save all guest disk changes before quitting?", "Quit DriveWire", wxYES_NO | wxCANCEL | wxICON_QUESTION,this);
+                if (answer == wxCANCEL) return;
+                shutdown(answer == wxYES, answer == wxNO);
+            } else shutdown();
+        });
     }
-    void shutdown() {
+    void shutdown(bool save = false, bool discard = false) {
         closing_ = true;
         remember();
-        send({{"command","shutdown"},{"discard",true}}, [this](const json&) { if (process_) process_->CloseOutput(); });
+        send({{"command","shutdown"},{"saveBefore",save},{"discard",discard}}, [this](const json& reply) {
+            if (reply.value("ok",false)) { if (process_) process_->CloseOutput(); }
+            else closing_ = false;
+        });
         SetStatusText(wxS("Closing server…"),0);
     }
     void onTimer(wxTimerEvent&) {
@@ -344,7 +350,7 @@ class Desktop final : public wxFrame {
             drain(process_->GetInputStream(),stdoutBuffer_,true); drain(process_->GetErrorStream(),stderrBuffer_,false);
             delete process_; process_=nullptr;
         }
-        pid_=0; ready_=false; pending_.clear(); statusPending_=false;
+        pid_=0; ready_=false; starting_=false; pending_.clear(); statusPending_=false;
         if (closing_) { Destroy(); return; }
         start_->Disable(); stop_->Disable(); disconnect_->Disable();
         SetStatusText(wxString::Format("Backend stopped (exit %d)",event.GetExitCode()),0);
@@ -354,7 +360,7 @@ class Desktop final : public wxFrame {
     void failSmoke(const std::string& message) {
         if (exitCode_ != 0) return;
         exitCode_=1;
-        std::ofstream out(utf8(smokeRoot_ + "/ui-result.json")); out << json({{"ok",false},{"error",message},{"step",smokeStep_},{"log",utf8(log_->GetValue())}}).dump(2);
+        wxFileOutputStream out(smokeRoot_ + "/ui-result.json"); auto result = json({{"ok",false},{"error",message},{"step",smokeStep_},{"log",utf8(log_->GetValue())}}).dump(2); out.Write(result.data(), result.size());
         closing_=true;
         if (process_) { process_->CloseOutput(); wxProcess::Kill(static_cast<int>(pid_),wxSIGKILL,wxKILL_CHILDREN); }
         CallAfter([this] { Destroy(); });
@@ -388,7 +394,7 @@ public:
         start_=new wxButton(panel,wxID_ANY,"Start server"); stop_=new wxButton(panel,wxID_ANY,"Stop server"); disconnect_=new wxButton(panel,wxID_ANY,"Disconnect guest");
         actions->Add(start_,0,wxRIGHT,8); actions->Add(stop_,0,wxRIGHT,8); actions->Add(disconnect_,0);
         start_->Disable();stop_->Disable();disconnect_->Disable(); connection->Add(actions,0,wxLEFT|wxRIGHT|wxBOTTOM,10);
-        stats_=new wxTextCtrl(panel,wxID_ANY,"No traffic",wxDefaultPosition,wxDefaultSize,wxTE_READONLY|wxBORDER_NONE); connection->Add(stats_,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,10);
+        stats_=new wxStaticText(panel,wxID_ANY,"No traffic"); connection->Add(stats_,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,10);
         layout->Add(connection,0,wxEXPAND|wxLEFT|wxRIGHT,18);
         auto* notebook = new wxNotebook(panel,wxID_ANY); layout->Add(notebook,1,wxEXPAND|wxALL,18);
         auto* disks = new wxPanel(notebook); auto* diskLayout = new wxBoxSizer(wxVERTICAL);
@@ -404,7 +410,7 @@ public:
             drive.saveAs->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){saveDisk(i,true);});
             drive.save->Bind(wxEVT_CONTEXT_MENU,[this,i](wxContextMenuEvent&){saveDisk(i,true);});
             drive.save->SetToolTip("Save guest changes. Right-click to Save As.");
-            drive.eject->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){preserve(i,[this,i]{send({{"command","eject"},{"drive",i},{"discard",true}},[this](const json& r){if(r.value("ok",false))remember();});});});
+            drive.eject->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){preserve(i,[this,i](bool save,bool discard){send({{"command","eject"},{"drive",i},{"saveBefore",save},{"discard",discard}},[this](const json& r){if(r.value("ok",false))remember();});});});
             diskLayout->Add(box,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,12);
         }
         disks->SetSizer(diskLayout);notebook->AddPage(disks,"Disks");

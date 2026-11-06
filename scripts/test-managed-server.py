@@ -53,6 +53,17 @@ with tempfile.TemporaryDirectory(prefix='DriveWire control ') as folder:
             command('shutdown',ok=False)
             state=command('save',drive=0);assert not state['disks'][0]['dirty']
             assert image.read_bytes()[:256]==b'A'*256
+            disconnected=command('disconnect')
+            assert disconnected['running'] and disconnected['port']==state['port']
+            assert guest.recv(1)==b''
+            with socket.create_connection(('127.0.0.1',disconnected['port']),timeout=5) as next_guest:
+                next_guest.sendall(bytes([0x57,0,0,0,0])+b'B'*256+bytes([0x42,0]))
+                assert next_guest.recv(1)==b'\0'
+                # Save and replace occur in one command, preserving writes
+                # that arrived after the frontend's previous status snapshot.
+                replaced=command('mount',drive=0,path=str(image),saveBefore=True)
+                assert not replaced['disks'][0]['dirty']
+                assert image.read_bytes()[:256]==b'B'*256
             command('stop')
         assert command('start')['running']
         command('stop')

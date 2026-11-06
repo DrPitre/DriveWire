@@ -44,12 +44,7 @@ public final class DriveWireControl {
                     server = next
                 }
             case "stop": server?.stop()
-            case "disconnect":
-                server?.stop()
-                let next = DriveWireServer(address: address, port: port, host: host)
-                next.logging = verbose
-                try next.start()
-                server = next
+            case "disconnect": server?.disconnect()
             case "mount", "eject", "save":
                 guard let number = request["drive"] as? Int, (0...3).contains(number) else { try fail("Drive must be 0 through 3") }
                 let disk = host.virtualDrives.first { $0.driveNumber == number }
@@ -57,6 +52,7 @@ public final class DriveWireControl {
                     guard let disk else { try fail("No disk in drive \(number)") }
                     try disk.save(to: request["path"] as? String)
                 } else {
+                    if request["saveBefore"] as? Bool == true, let disk, disk.isDirty { try disk.save() }
                     guard disk?.isDirty != true || request["discard"] as? Bool == true else {
                         try fail("Drive \(number) has unsaved changes; save it or explicitly discard them")
                     }
@@ -75,6 +71,9 @@ public final class DriveWireControl {
                 guard let channel = request["channel"] as? Int, (128...143).contains(channel) else { try fail("Invalid window") }
                 host.clearVirtualWindow(channel: UInt8(channel))
             case "shutdown":
+                if request["saveBefore"] as? Bool == true {
+                    for disk in host.virtualDrives where disk.isDirty { try disk.save() }
+                }
                 guard !host.virtualDrives.contains(where: { $0.isDirty }) || request["discard"] as? Bool == true else {
                     try fail("There are unsaved disk changes")
                 }

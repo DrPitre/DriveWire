@@ -30,13 +30,18 @@ public final class DriveWireServer: DriveWireDelegate {
         host.delegate = self
     }
 
-    public func stop() {
-        running = false
+    public func disconnect() {
         connection?.onClose = nil
         connection?.cancel()
         connection = nil
-        listener.cancel()
         host.disconnectGuest()
+        onConnectionChange?(false)
+    }
+
+    public func stop() {
+        running = false
+        disconnect()
+        listener.cancel()
         host.delegate = nil
     }
 
