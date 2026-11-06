@@ -39,7 +39,7 @@ public final class TCPConnection: @unchecked Sendable {
         } else if let (host, port) = endpoint {
             ClientBootstrap(group: NetworkRuntime.group)
                 .channelOption(ChannelOptions.autoRead, value: false)
-                .channelOption(ChannelOptions.socketOption(.tcp_nodelay), value: 1)
+                .channelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
                 .connect(host: host, port: Int(port)).whenComplete { result in
                     DispatchQueue.main.async {
                         switch result {
@@ -60,8 +60,13 @@ public final class TCPConnection: @unchecked Sendable {
                 switch result {
                 case .success:
                     self.onReady?()
-                    channel.setOption(ChannelOptions.autoRead, value: true).whenFailure { error in
-                        DispatchQueue.main.async { self.finish(error) }
+                    channel.eventLoop.execute {
+                        // Check and enable reads on the same event loop so a
+                        // close cannot deregister the socket between them.
+                        guard channel.isActive else { return }
+                        channel.setOption(ChannelOptions.autoRead, value: true).whenFailure { error in
+                            DispatchQueue.main.async { self.finish(error) }
+                        }
                     }
                 case .failure(let error): self.finish(error)
                 }
@@ -130,10 +135,17 @@ public final class TCPListener: @unchecked Sendable {
         guard channel == nil else { return }
         generation += 1
         let token = generation
+        #if os(Windows)
+        // WinSock SO_EXCLUSIVEADDRUSE is defined as ~SO_REUSEADDR.
+        // SO_REUSEADDR on Windows permits competing listeners on one port.
+        let bindOption = NIOBSDSocket.Option(rawValue: ~NIOBSDSocket.Option.so_reuseaddr.rawValue)
+        #else
+        let bindOption = NIOBSDSocket.Option.so_reuseaddr
+        #endif
         channel = try ServerBootstrap(group: NetworkRuntime.group)
-            .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .serverChannelOption(ChannelOptions.socketOption(bindOption), value: 1)
             .childChannelOption(ChannelOptions.autoRead, value: false)
-            .childChannelOption(ChannelOptions.socketOption(.tcp_nodelay), value: 1)
+            .childChannelOption(ChannelOptions.tcpOption(.tcp_nodelay), value: 1)
             .childChannelInitializer { channel in
                 let connection = TCPConnection(channel: channel)
                 DispatchQueue.main.async {
