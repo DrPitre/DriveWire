@@ -110,7 +110,9 @@ class Desktop final : public wxFrame {
                 if (!reply.value("ok", false)) {
                     if (!pending.quiet) error(text(stringValue(reply, "error", "Server operation failed")));
                 }
-                if (pending.callback) pending.callback(reply);
+                // Dialog callbacks may run a nested event loop. Dispatch them
+                // after pipe draining so they cannot re-enter its line buffer.
+                if (pending.callback) CallAfter([callback = std::move(pending.callback), reply] { callback(reply); });
             }
         } catch (const std::exception& e) { appendLog("Invalid server response: " + text(e.what())); }
     }
@@ -122,8 +124,9 @@ class Desktop final : public wxFrame {
             char byte; stream->Read(&byte, 1);
             if (!stream->LastRead()) break;
             if (byte == '\n') {
-                if (protocol) parseLine(buffer); else if (!buffer.empty()) appendLog(text(buffer));
+                auto line = std::move(buffer);
                 buffer.clear();
+                if (protocol) parseLine(line); else if (!line.empty()) appendLog(text(line));
             } else if (byte != '\r') buffer += byte;
             if (buffer.size() > 2 * 1024 * 1024) { buffer.clear(); appendLog("Oversized server log line omitted"); }
         }
