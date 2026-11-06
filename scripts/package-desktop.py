@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--build', type=pathlib.Path, required=True)
@@ -45,12 +46,16 @@ if platform.system() == 'Darwin':
     for binary in (app/'Contents/MacOS').iterdir():
         subprocess.run(['install_name_tool','-add_rpath','@executable_path/../Frameworks',str(binary)],check=True)
     subprocess.run(['codesign','--force','--deep','--sign','-',str(app)],check=True)
+    subprocess.run([sys.executable, str(repo/'scripts/test-desktop.py'), str(app/'Contents/MacOS/DriveWire Desktop'),
+                    '--server', str(app/'Contents/MacOS/drivewire-server'), '--isolate-runtime'], check=True)
     archive=shutil.make_archive(str(out/name),'zip',stage)
     print(archive)
 elif platform.system() == 'Windows':
     source=build/'Release'
     for file in source.iterdir():
         if file.suffix.lower() in ['.exe','.dll']: shutil.copy2(file,stage/file.name)
+    subprocess.run([sys.executable, str(repo/'scripts/test-desktop.py'), str(stage/'DriveWire Desktop.exe'),
+                    '--server', str(stage/'drivewire-server.exe'), '--isolate-runtime'], check=True)
     archive=shutil.make_archive(str(out/name),'zip',stage)
     print(archive)
 else:
@@ -61,5 +66,9 @@ else:
         for file in pathlib.Path(directory).glob('*.so*'):
             if file.is_file(): shutil.copy2(file,lib/file.name)
     subprocess.run(['patchelf','--set-rpath','$ORIGIN/lib',str(stage/'drivewire-server')],check=True)
+    test=[sys.executable, str(repo/'scripts/test-desktop.py'), str(stage/'DriveWire Desktop'),
+          '--server', str(stage/'drivewire-server'), '--isolate-runtime']
+    if not os.environ.get('DISPLAY'): test=['xvfb-run','-a']+test
+    subprocess.run(test, check=True)
     archive=shutil.make_archive(str(out/name),'gztar',stage)
     print(archive)

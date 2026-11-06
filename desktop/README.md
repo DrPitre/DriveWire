@@ -8,7 +8,7 @@ application and its Xcode project remain supported and separate.
 
 - Start/stop a TCP Becker-port server, choose address/port, disconnect a guest.
 - Select the RFM host root; remote OS9Boot and device directories are shared.
-- Mount four disk images, save guest changes, Save As (right-click Save), eject.
+- Mount four disk images, save guest changes, Save As, eject.
   Changed disks are protected against accidental replacement or shutdown.
 - Live connection and traffic counters, virtual serial channel status.
 - View virtual windows and send a line of input to a selected window.

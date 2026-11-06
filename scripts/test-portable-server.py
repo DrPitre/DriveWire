@@ -44,7 +44,7 @@ def check(binary, isolate_runtime):
     binary = Path(binary).resolve()
     env = os.environ.copy()
     if isolate_runtime and os.name == 'nt':
-        system = env['SystemRoot']
+        system = next(value for key, value in env.items() if key.upper() == 'SYSTEMROOT')
         env['PATH'] = os.pathsep.join([str(binary.parent), system + '\\System32', system])
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)/'host files'
