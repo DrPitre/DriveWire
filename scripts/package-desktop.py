@@ -39,12 +39,41 @@ if platform.system() == 'Darwin':
     shutil.copytree(build/'DriveWire Desktop.app',app)
     frameworks=app/'Contents/Frameworks'
     frameworks.mkdir(exist_ok=True)
-    for binary in ['DriveWire Desktop','drivewire-server']:
-        subprocess.run(['xcrun','swift-stdlib-tool','--copy','--scan-executable',str(app/'Contents/MacOS'/binary),
-                        '--destination',str(frameworks),'--platform','macosx'],check=True)
-    # Both processes may need Swift compatibility libraries on older macOS.
-    for binary in (app/'Contents/MacOS').iterdir():
-        subprocess.run(['install_name_tool','-add_rpath','@executable_path/../Frameworks',str(binary)],check=True)
+    info=json.loads(subprocess.check_output(['swift','-print-target-info']))
+    def rpaths(binary):
+        load=subprocess.check_output(['otool','-l',str(binary)],text=True)
+        return re.findall(r'cmd LC_RPATH\n.*?\n\s*path (.*?) \(offset',load)
+    binaries=list((app/'Contents/MacOS').iterdir())
+    search=[]
+    for binary in binaries:
+        search.extend(pathlib.Path(path) for path in rpaths(binary) if path.startswith('/'))
+    search.extend(pathlib.Path(path) for path in info['paths']['runtimeLibraryPaths'])
+    # Compatibility libraries can live in swift-6.2/macosx rather than
+    # swift/macosx. The executable's linker rpaths identify the right version.
+    resource=pathlib.Path(info['paths']['runtimeResourcePath'])
+    search.extend(resource.parent.glob('swift*/macosx'))
+    queue=list(binaries)
+    copied=set()
+    while queue:
+        binary=queue.pop()
+        dependencies=subprocess.check_output(['otool','-L',str(binary)],text=True)
+        for library_name in re.findall(r'^\s*@rpath/([^ ]+\.dylib) ',dependencies,re.MULTILINE):
+            if library_name in copied: continue
+            source=next((directory/library_name for directory in search if (directory/library_name).is_file()),None)
+            if source is None: raise RuntimeError('Cannot bundle required Swift library: '+library_name)
+            destination=frameworks/library_name
+            shutil.copy2(source,destination)
+            copied.add(library_name)
+            queue.append(destination)
+    # Remove development-machine fallbacks. A staged test must succeed using
+    # its bundle and system libraries, even when Xcode/Swiftly are installed.
+    for binary in binaries+list(frameworks.iterdir()):
+        for path in rpaths(binary):
+            if path.startswith('/') and not path.startswith('/usr/lib'):
+                subprocess.run(['install_name_tool','-delete_rpath',path,str(binary)],check=True)
+    for binary in binaries:
+        if '@executable_path/../Frameworks' not in rpaths(binary):
+            subprocess.run(['install_name_tool','-add_rpath','@executable_path/../Frameworks',str(binary)],check=True)
     subprocess.run(['codesign','--force','--deep','--sign','-',str(app)],check=True)
     subprocess.run([sys.executable, str(repo/'scripts/test-desktop.py'), str(app/'Contents/MacOS/DriveWire Desktop'),
                     '--server', str(app/'Contents/MacOS/drivewire-server'), '--isolate-runtime'], check=True)
