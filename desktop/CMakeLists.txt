@@ -12,7 +12,13 @@ if(DRIVEWIRE_FETCH_WX)
   set(wxBUILD_DEMOS OFF CACHE BOOL "" FORCE)
   set(wxUSE_WEBVIEW OFF CACHE BOOL "" FORCE)
   set(wxUSE_MEDIACTRL OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(wxWidgets GIT_REPOSITORY https://github.com/wxWidgets/wxWidgets.git GIT_TAG v3.2.8 GIT_SHALLOW TRUE)
+  foreach(lib IN ITEMS wxUSE_ZLIB wxUSE_LIBPNG wxUSE_LIBJPEG wxUSE_LIBTIFF wxUSE_EXPAT wxUSE_REGEX)
+    set(${lib} builtin CACHE STRING "" FORCE)
+  endforeach()
+  FetchContent_Declare(wxWidgets
+    URL https://github.com/wxWidgets/wxWidgets/releases/download/v3.2.8/wxWidgets-3.2.8.tar.bz2
+    URL_HASH SHA256=c74784904109d7229e6894c85cfa068f1106a4a07c144afd78af41f373ee0fe6
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
   FetchContent_MakeAvailable(wxWidgets)
   set(DRIVEWIRE_WX wx::core wx::base wx::net)
 else()

@@ -75,3 +75,4 @@ iOSInjectionProject/
 
 # Portable desktop distributions
 desktop/dist/
+desktop/build-*/

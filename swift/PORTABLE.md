@@ -7,7 +7,10 @@ cookies and device-root parent traversal.
 
 ## Build and run
 
-Install Swift 6.4.2 (or a compatible newer toolchain), then from this directory:
+Install Swift 6.4.2 (or a compatible newer toolchain). On Windows, first run
+`python scripts/prepare-swift.py` from the repository root; it resolves
+dependencies and applies the pinned SwiftNIO recycled-socket-handle fix. Then
+from this directory:
 
 ```sh
 swift build -c release
@@ -88,3 +91,10 @@ a remote directory listing and a completion marker.
 The portable release executable has also completed the CoCo 3 MAME RFM-root
 boot check on macOS: remote OS9Boot, GrfDrv, SysGo and Shell loads, no RBF
 modules or server-mounted virtual disks, and all guest output checks passed.
+
+## Desktop applications
+
+The [wxWidgets desktop](../desktop/README.md) builds on Windows, Linux and macOS.
+It manages this executable using private pipes, with live disk, RFM, window,
+printer and connection controls. The native Swift Mac app remains available
+through the original Xcode project.

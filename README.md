@@ -35,3 +35,9 @@ DriveWire began life in 2003 as a solution for the Tandy Color Computer. Floppy 
 In January 2010, Aaron Wolfe, Boisy Pitre, and Jim Hathaway expanded the protocol to include networking services. [This work](https://web.archive.org/web/20100121100655/http://home.spogbiper.com/) became the 1st place winner in the [2010 RetroChallenge Winter Warmup](https://web.archive.org/web/20100110223653/http://www.retrochallenge.net/updates.html). Aaron went on to create DriveWire 4, a Java-based host.
 
 DriveWire is still in use today, and there are a number of [YouTube videos](https://www.youtube.com/results?search_query=drivewire+coco) showing it in action.
+
+## Cross-platform desktop
+
+[DriveWire Desktop](desktop/README.md) uses wxWidgets on Windows, Linux and
+macOS with the shared Swift server. The original native Swift Mac application
+remains in `swift/DriveWire.xcodeproj`.
