@@ -105,9 +105,19 @@ dw_serial *dw_serial_open(const char *path,int baud,int dtr,int rts,char *error,
     struct termios previous,settings;
     if (tcgetattr(fd,&previous)<0) { problem(error,cap,"Read serial settings");close(fd);return NULL; }
     settings=previous;cfmakeraw(&settings);
+    settings.c_iflag &= ~(IXON|IXOFF|IXANY);
     settings.c_cflag=(settings.c_cflag&~(CSIZE|PARENB|CSTOPB))|CS8|CLOCAL|CREAD;
 #ifdef CRTSCTS
     settings.c_cflag &= ~CRTSCTS;
+#endif
+#ifdef CDTR_IFLOW
+    settings.c_cflag &= ~CDTR_IFLOW;
+#endif
+#ifdef CDSR_OFLOW
+    settings.c_cflag &= ~CDSR_OFLOW;
+#endif
+#ifdef CCAR_OFLOW
+    settings.c_cflag &= ~CCAR_OFLOW;
 #endif
     settings.c_cflag &= ~HUPCL;
     settings.c_cc[VMIN]=0;settings.c_cc[VTIME]=0;

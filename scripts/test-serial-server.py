@@ -62,7 +62,13 @@ with tempfile.TemporaryDirectory(prefix='DriveWire serial ') as directory:
         if os.name!='nt':
             import pty
             def pair():
-                first,second=pty.openpty();path=os.ttyname(second);os.close(second);return first,path
+                import termios
+                first,second=pty.openpty()
+                # A previously used port may have software flow control enabled.
+                attributes=termios.tcgetattr(second)
+                attributes[0] |= termios.IXON|termios.IXOFF|termios.IXANY
+                termios.tcsetattr(second,termios.TCSANOW,attributes)
+                path=os.ttyname(second);os.close(second);return first,path
             master,path=pair();link=root/'selected-port';link.symlink_to(path)
             command('configure',transport='serial',serialPath=str(link),baud=115200,root=str(root))
             command('mount',drive=0,path=str(image));command('start')
@@ -70,7 +76,7 @@ with tempfile.TemporaryDirectory(prefix='DriveWire serial ') as directory:
             import termios
             attributes=termios.tcgetattr(master)
             assert attributes[4]==termios.B115200 and attributes[5]==termios.B115200
-            assert not attributes[0] & (termios.IXON|termios.IXOFF|termios.ICRNL)
+            assert not attributes[0] & (termios.IXON|termios.IXOFF|termios.IXANY|termios.ICRNL)
             assert not attributes[1] & termios.OPOST
             assert not attributes[3] & (termios.ICANON|termios.ECHO)
             os.write(master,b'\x5a');assert request(b'\x01\0\x5a\x01',2)==b'\xff\xff'
