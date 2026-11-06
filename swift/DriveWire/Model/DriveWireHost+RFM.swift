@@ -537,15 +537,33 @@ extension DriveWireHost {
         // Match the host volume's name semantics without resolving symlinks:
         // DD/SYS may point outside DD, but its guest parent must remain DD.
         let url = URL(fileURLWithPath: path).standardized
-        let caseSensitive = (try? url.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?
-            .volumeSupportsCaseSensitiveNames ?? true
-        let key = caseSensitive ? url.path : url.path.lowercased()
+        let key = rfmIdentityPath(url)
         if let existing = rfmLSNByPath[key] { return existing }
         let lsn = rfmLSNCounter
         rfmLSNByPath[key] = lsn
         rfmLSNToPath[lsn] = path
         rfmLSNCounter += 1
         return lsn
+    }
+
+    // Recover the spelling stored by the filesystem, component by component.
+    // Foundation's volume case-sensitivity resource is unavailable on some
+    // platforms. Enumeration also respects Windows per-directory sensitivity.
+    // Only fold a name when the requested spelling actually opens on the host;
+    // exact entries always win on case-sensitive filesystems.
+    private func rfmIdentityPath(_ url: URL) -> String {
+        let parent = url.deletingLastPathComponent()
+        guard parent.path != url.path, !url.lastPathComponent.isEmpty else { return url.path }
+        let fm = FileManager.default
+        let requested = url.lastPathComponent
+        var stored = requested
+        if let names = try? fm.contentsOfDirectory(atPath: parent.path),
+           !names.contains(requested), fm.fileExists(atPath: url.path),
+           let match = names.first(where: { $0.caseInsensitiveCompare(requested) == .orderedSame }) {
+            stored = match
+        }
+        return URL(fileURLWithPath: rfmIdentityPath(parent), isDirectory: true)
+            .appendingPathComponent(stored).path
     }
 
     // Builds OS-9 directory contents for the open directory descriptor, registering each entry in the LSN map.
