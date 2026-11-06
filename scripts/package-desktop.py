@@ -70,5 +70,8 @@ else:
           '--server', str(stage/'drivewire-server'), '--isolate-runtime']
     if not os.environ.get('DISPLAY'): test=['xvfb-run','-a']+test
     subprocess.run(test, check=True)
+    launcher=stage/'drivewire'
+    launcher.write_text('#!/bin/sh\ncd -- "$(dirname -- "$0")"\nexec "./DriveWire Desktop" "$@"\n')
+    launcher.chmod(0o755)
     archive=shutil.make_archive(str(out/name),'gztar',stage)
     print(archive)

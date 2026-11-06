@@ -22,7 +22,9 @@ received text. It does not install a platform print driver.
 
 ## Build
 
-Requires CMake 3.24+, C++17, wxWidgets 3.2+, Python 3 and Swift 6.4.2.
+Requires CMake 3.24+, C++17, wxWidgets 3.2+, Python 3.10+ and Swift 6.4.2.
+The Mac build targets macOS 14 or newer. Linux artifacts target Ubuntu 24.04
+and compatible distributions; Windows x64 builds are tested on Server 2022.
 Build the Swift server first from the repository root:
 
 ```sh
@@ -97,3 +99,13 @@ are newline-delimited on stdin; responses use `@drivewire ` followed by JSON
 on stdout, distinct from existing engine diagnostics. Every response includes
 `protocol: 1`, request `id`, `ok`, and a fresh `state`; failures include `error`.
 The control interface is a private pipe, never a listening network service.
+
+## Packaged builds
+
+CI artifacts contain a ZIP (Windows/macOS) or tar.gz (Linux). Extract it and
+launch `DriveWire Desktop.exe`, `DriveWire Desktop.app`, or `./drivewire`
+respectively. The server is included. macOS bundles are signed ad hoc for local
+testing, not notarized releases. Windows needs the Microsoft C++ runtime.
+Linux needs GTK3/wxWidgets 3.2 runtime libraries (`libwxgtk3.2-1t64` on Ubuntu
+24.04); Swift runtime libraries are bundled. Each staged package is tested
+again with toolchain library environment overrides removed.
