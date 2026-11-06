@@ -295,11 +295,11 @@ class Desktop final : public wxFrame {
         bool wasConnected = state_.value("connected", false);
         state_ = state;
         bool active = running(), connected = state_.value("connected", false);
-        if (connected != wasConnected) appendLog(connected ? "Guest connected" : "Guest disconnected");
+        bool serial = stringValue(state_,"transport") == "serial";
+        if (connected != wasConnected) appendLog(serial ? (connected ? "Serial port opened" : "Serial port closed") : (connected ? "Guest connected" : "Guest disconnected"));
         connectionControls(); root_->Enable(!active); verbose_->Enable(!active);
         start_->Enable(ready_ && !active && !starting_); stop_->Enable(active); disconnect_->Enable(active && connected);
-        bool serial = stringValue(state_,"transport") == "serial";
-        SetStatusText(!active ? wxS("Stopped") : connected ? wxS("Guest connected") : serial ? wxS("Waiting for serial port") : wxS("Listening — waiting for guest"), 0);
+        SetStatusText(!active ? wxS("Stopped") : serial ? (connected ? wxS("Serial port open") : wxS("Waiting for serial port")) : connected ? wxS("Guest connected") : wxS("Listening — waiting for guest"), 0);
         SetStatusText(active ? (serial ? text(stringValue(state_,"serialPath")) : text(stringValue(state_,"bind")) + wxString::Format(":%d",state_.value("port",0))) : "", 1);
         auto serialError = stringValue(state_,"serialError");
         if (serialError != lastSerialError_) { if (!serialError.empty()) appendLog("Serial: " + text(serialError) + " (retrying)"); lastSerialError_ = serialError; }

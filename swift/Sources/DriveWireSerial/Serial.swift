@@ -38,6 +38,9 @@ public final class SerialConnection: @unchecked Sendable {
     public func start() {
         guard !started, !closed else { return }
         started = true
+        guard !path.isEmpty, (300...1_000_000).contains(baud) else {
+            finish(SerialError("Select a serial port and a baud rate from 300 through 1000000")); return
+        }
         DispatchQueue.global().async {
             var error = [CChar](repeating: 0, count: 512)
             let pointer = self.path.withCString { dw_serial_open($0, Int32(self.baud), self.dtr ? 1 : 0, self.rts ? 1 : 0, &error, error.count) }
@@ -60,6 +63,8 @@ public final class SerialConnection: @unchecked Sendable {
             }
         }
     }
+
+    deinit { session?.cancel() }
 
     public func send(_ data: Data) { session?.write(data) }
     public func cancel() { finish(nil) }

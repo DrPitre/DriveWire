@@ -4,7 +4,7 @@ import DriveWireNetworking
 import DriveWireSerial
 import Dispatch
 
-/// One persistent DriveWire guest per listener. All protocol and connection
+/// One persistent DriveWire guest over TCP or serial. Protocol and connection
 /// state runs on the main queue, including responses and guest replacement.
 public final class DriveWireServer: DriveWireDelegate {
     public let host: DriveWireHost

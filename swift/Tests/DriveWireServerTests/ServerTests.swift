@@ -6,6 +6,15 @@ import DriveWireNetworking
 
 final class ServerTests: XCTestCase {
     @MainActor
+    func testSerialRejectsInvalidBaudWithoutOpeningDevice() throws {
+        let server = DriveWireServer(serialPort: "not-a-port", baud: Int.max)
+        try server.start()
+        defer { server.stop() }
+        XCTAssertFalse(server.connected)
+        XCTAssertTrue(server.serialError?.contains("baud rate") == true)
+    }
+
+    @MainActor
     private func connect(_ port: UInt16) async -> TCPConnection {
         let ready = expectation(description: "TCP connected")
         let client = TCPConnection(host: "127.0.0.1", port: port)

@@ -8,11 +8,12 @@
 #endif
 #include <windows.h>
 #include <wchar.h>
-struct dw_serial { HANDLE handle; };
+struct dw_serial { HANDLE handle; DWORD write_millis_per_byte; };
 static void problem(char *out, size_t cap, const char *operation) {
     snprintf(out, cap, "%s: Windows error %lu", operation, (unsigned long)GetLastError());
 }
 dw_serial *dw_serial_open(const char *path, int baud, int dtr, int rts, char *error, size_t cap) {
+    if (baud<300 || baud>1000000) { snprintf(error,cap,"Invalid serial baud rate");return NULL; }
     wchar_t name[1024];
     char qualified[1024];
     if (!strncmp(path,"\\\\.\\",4)) snprintf(qualified,sizeof(qualified),"%s",path);
@@ -28,13 +29,15 @@ dw_serial *dw_serial_open(const char *path, int baud, int dtr, int rts, char *er
     settings.fRtsControl=rts?RTS_CONTROL_ENABLE:RTS_CONTROL_DISABLE;
     settings.fDsrSensitivity=FALSE;settings.fOutX=FALSE;settings.fInX=FALSE;
     settings.fErrorChar=FALSE;settings.fNull=FALSE;settings.fAbortOnError=FALSE;settings.fTXContinueOnXoff=TRUE;
-    COMMTIMEOUTS timeouts={MAXDWORD,MAXDWORD,100,0,2000};
+    /* Allow a complete response to clock out even at slower baud rates. */
+    DWORD per_byte=(DWORD)((10000+baud-1)/baud);
+    COMMTIMEOUTS timeouts={MAXDWORD,MAXDWORD,100,per_byte,2000};
     if (!SetCommState(handle,&settings)||!SetCommTimeouts(handle,&timeouts)||!PurgeComm(handle,PURGE_RXCLEAR|PURGE_TXCLEAR)) {
         problem(error,cap,"Configure serial port");CloseHandle(handle);return NULL;
     }
     dw_serial *port=malloc(sizeof(*port));
     if (!port) { snprintf(error,cap,"Out of memory");CloseHandle(handle);return NULL; }
-    port->handle=handle;return port;
+    port->handle=handle;port->write_millis_per_byte=per_byte;return port;
 }
 static int transfer(dw_serial *port, void *buffer, int count, int writing, char *error, size_t cap) {
     OVERLAPPED operation={0}; operation.hEvent=CreateEventW(NULL,TRUE,FALSE,NULL);
@@ -42,7 +45,8 @@ static int transfer(dw_serial *port, void *buffer, int count, int writing, char 
     DWORD transferred=0;
     BOOL ok=writing?WriteFile(port->handle,buffer,(DWORD)count,&transferred,&operation):ReadFile(port->handle,buffer,(DWORD)count,&transferred,&operation);
     if (!ok && GetLastError()==ERROR_IO_PENDING) {
-        DWORD wait=WaitForSingleObject(operation.hEvent,writing?2100:200);
+        uint64_t deadline=writing ? 2100+(uint64_t)count*port->write_millis_per_byte : 200;
+        DWORD wait=WaitForSingleObject(operation.hEvent,deadline>=MAXDWORD?MAXDWORD-1:(DWORD)deadline);
         if (wait==WAIT_TIMEOUT) {
             CancelIoEx(port->handle,&operation);
             /* Drain completion before releasing the OVERLAPPED stack/event. */
@@ -100,6 +104,7 @@ static speed_t speed(int baud) {
     }
 }
 dw_serial *dw_serial_open(const char *path,int baud,int dtr,int rts,char *error,size_t cap) {
+    if (baud<300 || baud>1000000) { snprintf(error,cap,"Invalid serial baud rate");return NULL; }
     int fd=open(path,O_RDWR|O_NOCTTY|O_NONBLOCK);
     if (fd<0) { problem(error,cap,"Open serial port");return NULL; }
     struct termios previous,settings;

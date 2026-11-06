@@ -18,7 +18,7 @@ parser=argparse.ArgumentParser()
 parser.add_argument('server')
 args=parser.parse_args()
 with tempfile.TemporaryDirectory(prefix='DriveWire serial ') as directory:
-    root=Path(directory);(root/'DD').mkdir();(root/'OS9Boot').write_bytes(bytes(range(256))*4)
+    root=Path(directory);(root/'DD').mkdir();(root/'OS9Boot').write_bytes(bytes(range(256))*256)
     image=root/'disk.dsk';image.write_bytes(bytes(512))
     process=subprocess.Popen([str(Path(args.server).resolve()),'--managed'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
     replies=queue.Queue()
@@ -85,8 +85,10 @@ with tempfile.TemporaryDirectory(prefix='DriveWire serial ') as directory:
             assert request(packet,1)==b'\0';assert command('status')['state']['disks'][0]['dirty']
             command('save',drive=0);assert image.read_bytes()[:256]==payload
             assert request(b'\xd6\x02\x01\0\0\x01OS9Boot\r',1)==b'\0'
-            assert request(b'\xd6\x0b\x01\x02',4)==(1024).to_bytes(4,'big')
-            os.write(master,b'\xd6\x07\x01\x04\0');assert receive(2)==b'\x04\0';assert receive(1024)==payload*4
+            assert request(b'\xd6\x0b\x01\x02',4)==(65536).to_bytes(4,'big')
+            # A maximum-sized RFM response must survive partial OS writes.
+            os.write(master,b'\xd6\x07\x01\xff\xff');assert receive(2)==b'\xff\xff';assert receive(65535)==(payload*256)[:65535]
+            os.write(master,b'\xd6\x07\x01\0\x01');assert receive(2)==b'\0\x01';assert receive(1)==b'\xff'
             assert request(b'\xd6\x0d\x01',1)==b'\0'
             # Keep an RFM cookie and a partial pathname across an actual hangup.
             cookie=request(b'\xd6\x14\x01\x01\0\0\0\x85/DD\r',4)[1:]
