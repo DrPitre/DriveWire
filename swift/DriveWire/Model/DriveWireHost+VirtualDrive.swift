@@ -19,14 +19,15 @@ extension DriveWireHost {
         }
 
         /// The drive number for this drive.
-        var driveNumber = 0
+        public internal(set) var driveNumber = 0
 
         /// A path to a file that contains the drive's data.
-        var imagePath = ""
+        public internal(set) var imagePath = ""
 
         private var bookmarkData = Data()
         private var storageContainer = Data()
         private var isStorageLoaded = false
+        public private(set) var isDirty = false
 
         /// Creates an empty in-memory virtual drive.
         ///
@@ -56,6 +57,7 @@ extension DriveWireHost {
                 let u = URL(fileURLWithPath: self.imagePath)
                 self.storageContainer = try Data(contentsOf: u)
                 self.isStorageLoaded = true
+                self.isDirty = false
             } catch {
                 self.storageContainer = Data()
                 self.isStorageLoaded = false
@@ -119,6 +121,7 @@ extension DriveWireHost {
             }
 
             isStorageLoaded = true
+            isDirty = true
             return DriveWireProtocolError.E_NONE.rawValue
         }
 
@@ -129,6 +132,7 @@ extension DriveWireHost {
                 throw CocoaError(.fileNoSuchFile)
             }
             try storageContainer.write(to: URL(fileURLWithPath: destination), options: .atomic)
+            isDirty = false
             if let path {
                 imagePath = path
             }

@@ -14,9 +14,11 @@ struct DriveWireCommand: ParsableCommand {
     @Option(help: "Virtual disk image for drive 1.") var disk1: String?
     @Option(help: "Virtual disk image for drive 2.") var disk2: String?
     @Option(help: "Virtual disk image for drive 3.") var disk3: String?
+    @Flag(help: "Use the private desktop JSON control protocol on stdin/stdout.") var managed = false
     @Flag(name: .shortAndLong, help: "Log wire traffic.") var verbose = false
 
     func run() throws {
+        if managed { runManaged() }
         let server = DriveWireServer(address: bind, port: tcpPort)
         server.logging = verbose
         if let rfmRoot {

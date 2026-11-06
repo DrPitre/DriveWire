@@ -72,3 +72,6 @@ iOSInjectionProject/
 # Swift Package Manager
 .build/
 .swiftpm/
+
+# Portable desktop distributions
+desktop/dist/

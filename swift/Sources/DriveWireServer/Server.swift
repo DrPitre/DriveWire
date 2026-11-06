@@ -10,7 +10,11 @@ public final class DriveWireServer: DriveWireDelegate {
     public var onConnectionChange: ((Bool) -> Void)?
     private let listener: TCPListener
     private var connection: TCPConnection?
-    private var running = false
+    public private(set) var running = false
+    public var connected: Bool { connection != nil }
+    public private(set) var bytesReceived: UInt64 = 0
+    public private(set) var bytesSent: UInt64 = 0
+    public private(set) var transactions: UInt64 = 0
     public var port: UInt16 { listener.port }
 
     public init(address: String = "127.0.0.1", port: UInt16 = 65504,
@@ -44,6 +48,7 @@ public final class DriveWireServer: DriveWireDelegate {
         connection = incoming
         incoming.onReceive = { [weak self, weak incoming] bytes in
             guard let self, self.connection === incoming else { return }
+            self.bytesReceived += UInt64(bytes.count)
             if self.logging { print("-> \(bytes.map { String(format: "%02x", $0) }.joined())") }
             var buffer = bytes
             self.host.send(data: &buffer)
@@ -59,9 +64,10 @@ public final class DriveWireServer: DriveWireDelegate {
     }
 
     public func dataAvailable(host: DriveWireHost, data: Data) {
+        bytesSent += UInt64(data.count)
         if logging { print("<- \(data.map { String(format: "%02x", $0) }.joined())") }
         connection?.send(data)
     }
 
-    public func transactionCompleted(opCode: UInt8) {}
+    public func transactionCompleted(opCode: UInt8) { transactions += 1 }
 }
