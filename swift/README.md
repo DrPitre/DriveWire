@@ -31,3 +31,31 @@ The initial backend keeps raw printer bytes in memory and exposes a printable
 preview in the macOS app. `OP_PRINTFLUSH` flushes the active job, clears pending
 bytes, and increments the printer flush count. The Printer view shows backend,
 byte, pending-byte, flush, last-flush, and preview status.
+
+## RFM directory contexts and file handles
+
+The RFM root contains device directories: guest `/y0/file` refers to
+`<rfm-root>/y0/file`. New path operations `$11`–`$15` use immutable 24-bit
+directory cookies instead of directory-owner PIDs. The client stores separate
+data and execution cookies in its process directory records, so `F$Fork`
+copies the exact directory state without a server notification. Later changes
+by parent or child cannot change the other's cookies, even before the child's
+first remote access. Invalid cookies fail without falling back to PID state.
+
+The extended request is `$D6, op, path, PID, cookie[3], mode, pathname, CR`.
+Successful extended ChgDir returns `$00, cookie[3]`; all errors return one byte.
+Other responses are unchanged. The directory LSN registry supplies cookies and
+retains them for the session. Host renames/deletion and recovery across server
+resets are not handled. Legacy `$01`–`$05` remain available for old clients, with
+their original PID directory behavior. The updated client requires this server
+extension; it does not silently downgrade.
+
+Regular-file reads, size, EOF and descriptor-size queries use the live file
+handle. Writes are therefore visible after seeking on the same open path and
+through other open paths. Synthesized directory records remain snapshots.
+ReadLn/WriteLn retain the existing host-LF/guest-CR text conversion.
+
+The `testRFM*` cases in `DriveWireTests` cover directory-owner selection,
+relative/self-owner changes, fork cookies before first child I/O, failed changes,
+combined directory modes,
+read-after-write, independent handles, sparse writes, size/EOF and line cursors.
