@@ -534,9 +534,15 @@ extension DriveWireHost {
 
     // Returns a stable LSN for the given absolute host path, allocating a new one if needed.
     func lsnForPath(_ path: String) -> Int {
-        if let existing = rfmLSNByPath[path] { return existing }
+        // Match the host volume's name semantics without resolving symlinks:
+        // DD/SYS may point outside DD, but its guest parent must remain DD.
+        let url = URL(fileURLWithPath: path).standardized
+        let caseSensitive = (try? url.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey]))?
+            .volumeSupportsCaseSensitiveNames ?? true
+        let key = caseSensitive ? url.path : url.path.lowercased()
+        if let existing = rfmLSNByPath[key] { return existing }
         let lsn = rfmLSNCounter
-        rfmLSNByPath[path] = lsn
+        rfmLSNByPath[key] = lsn
         rfmLSNToPath[lsn] = path
         rfmLSNCounter += 1
         return lsn
