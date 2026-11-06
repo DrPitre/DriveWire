@@ -1,0 +1,53 @@
+name: Portable Swift server
+on:
+  push:
+    branches: [main, swift-portable-server]
+    paths: ['swift/**', 'scripts/test-portable-server.py', '.github/workflows/swift-portable.yml']
+  pull_request:
+    paths: ['swift/**', 'scripts/test-portable-server.py', '.github/workflows/swift-portable.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@7591e4f04c00624cb043783da51a7fd6ee0a6bf6
+        if: runner.os != 'Windows'
+        with:
+          swift-version: '6.4.2'
+      - uses: compnerd/gha-setup-swift@57fe462cd3c7b05ae8fcff79b00719312e305257
+        if: runner.os == 'Windows'
+        with:
+          swift-version: swift-6.4.2-release
+          swift-build: 6.4.2-RELEASE
+      - run: swift test --package-path swift
+      - run: swift build --package-path swift -c release
+      - name: TCP smoke test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: python3 scripts/test-portable-server.py "$(swift build --package-path swift -c release --show-bin-path)/drivewire-server"
+      - name: Bundle Windows runtime and test executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = swift build --package-path swift -c release --show-bin-path
+          $info = swift -print-target-info | ConvertFrom-Json
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "$bin/drivewire-server.exe" dist/
+          $paths = @($info.paths.runtimeLibraryPaths) + @((Split-Path (Get-Command swift).Source))
+          foreach ($path in $paths) {
+            Get-ChildItem $path -Filter '*.dll' -ErrorAction SilentlyContinue | Copy-Item -Destination dist -Force
+          }
+          python scripts/test-portable-server.py dist/drivewire-server.exe --isolate-runtime
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: drivewire-server-windows-x64
+          path: dist/

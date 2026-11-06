@@ -6,9 +6,13 @@
 //
 
 import Foundation
-import AppKit
-import AppIntents
+import Dispatch
+#if SWIFT_PACKAGE
+import DriveWireNetworking
+#else
+import Observation
 import Network
+#endif
 
 /// An interface for receiving information from the DriveWire host.
 public protocol DriveWireDelegate {
@@ -93,7 +97,9 @@ public struct DriveWireDriveActivity: Identifiable, Equatable {
 ///
 /// The basis of communication between the guest and host is a documented set of uni- and bi-directional messages called *transactions*. A transaction is a series of one or more packets that the guest and host pass to each other.
 ///
+#if !SWIFT_PACKAGE
 @Observable
+#endif
 public class DriveWireHost : Codable {
     static let maximumLogCharacters = 24_000
     static let trimmedLogPrefix = "... older log entries trimmed ...\n"
@@ -110,7 +116,7 @@ public class DriveWireHost : Codable {
         set { logStorage = Self.trimmedLog(from: newValue) }
     }
 
-    init() {
+    public init() {
         setupTransactions()
         refreshMIDIStatus()
     }
@@ -126,12 +132,14 @@ public class DriveWireHost : Codable {
             return
         }
 
+        #if !SWIFT_PACKAGE
         guard Thread.isMainThread else {
             DispatchQueue.main.async { [weak self] in
                 self?.markDriveActivity(driveNumber: driveNumber, isReading: isReading, isWriting: isWriting)
             }
             return
         }
+        #endif
 
         if isReading {
             driveActivities[driveNumber].isReading = true
@@ -211,7 +219,7 @@ public class DriveWireHost : Codable {
     var pendingClosedVirtualSerialChannels: [UInt8] = []
     var clientRestartRequested = false
     var virtualSerialTCPConnections = [UInt8: VirtualSerialTCPConnection]()
-    var virtualSerialTCPListeners = [UInt16: NWListener]()
+    var virtualSerialTCPListeners = [UInt16: DriveWireNetworkListener]()
     var pendingVirtualSerialTCPConnections = [Int: PendingVirtualSerialTCPConnection]()
     var nextVirtualSerialTCPConnectionID = 1
     var virtualSerialIncomingPulseTokens = [UInt8: UInt64]()
@@ -233,7 +241,11 @@ public class DriveWireHost : Codable {
     var midiBufferedData = Data()
     var standardMIDIPlayback: StandardMIDIFileStreamPlayback?
     var printerBackend: DriveWirePrinterBackend = RawDriveWirePrinterBackend()
+    #if SWIFT_PACKAGE
+    var printerOutputSettingsProvider: () -> DriveWirePrinterOutputSettings = DriveWirePrinterOutputSettings.current
+    #else
     @ObservationIgnored var printerOutputSettingsProvider: () -> DriveWirePrinterOutputSettings = DriveWirePrinterOutputSettings.current
+    #endif
     var printerOutputPath: String?
     var printerOutputError: String?
     var printerLastPrintedTo: String?
@@ -244,7 +256,7 @@ public class DriveWireHost : Codable {
         case standardFile
     }
 
-    var rfmRootPath: String = NSHomeDirectory()
+    public var rfmRootPath: String = NSHomeDirectory()
     var rfmPaths: [Int: RFMPathDescriptor] = [:]
     var rfmCurrentDir: [Int: String] = [:]      // data directory per process
     var rfmCurrentExecDir: [Int: String] = [:] // execution directory per process
@@ -503,7 +515,7 @@ public class DriveWireHost : Codable {
     ///
     /// - Parameters:
     ///     - delegate: The delegate that receives messages.
-    init(delegate : DriveWireDelegate) {
+    public init(delegate : DriveWireDelegate) {
         self.delegate = delegate
 
         setupTransactions()
@@ -585,17 +597,18 @@ public class DriveWireHost : Codable {
         } while bytesConsumed > 0 && serialBuffer.count > 0
     }
 
-    var watchdog : Timer?
+    var watchdog: DispatchWorkItem?
 
     func setupWatchdog() {
         invalidateWatchdog()
-        watchdog = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false, block: { time in
-            self.resetState()
-        })
+        let work = DispatchWorkItem { [weak self] in self?.resetState() }
+        watchdog = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
     }
 
     private func invalidateWatchdog() {
-        watchdog?.invalidate()
+        watchdog?.cancel()
+        watchdog = nil
     }
 
     /// Computes a simple checksum of the passed data.
@@ -616,6 +629,12 @@ public class DriveWireHost : Codable {
     func resetState() {
         processor = OP_OPCODE
         invalidateWatchdog()
+    }
+
+    /// Retire all guest-owned paths, parser state and virtual channels on
+    /// disconnect/replacement. Mounted virtual disks remain configured.
+    public func disconnectGuest() {
+        resetGuestSessionState()
     }
 
     func resetGuestSessionState() {

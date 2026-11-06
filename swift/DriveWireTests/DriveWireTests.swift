@@ -6,8 +6,12 @@
 //
 
 import XCTest
+#if SWIFT_PACKAGE
+@testable import DriveWireCore
+#endif
 
 final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
+    var diskFixture: URL!
     var host : DriveWireHost?
 
     func transactionCompleted(opCode: UInt8) {
@@ -15,17 +19,21 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
     
     override func setUpWithError() throws {
         // Put setup code here. This method is called before the invocation of each test method in the class.
+        diskFixture = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".dsk")
+        try Data((0..<512).map { UInt8($0 % 251) }).write(to: diskFixture)
         host = DriveWireHost(delegate: self)
     }
 
     override func tearDownWithError() throws {
-        // Put teardown code here. This method is called after the invocation of each test method in the class.
+        host?.disconnectGuest()
+        host?.delegate = nil
+        try? FileManager.default.removeItem(at: diskFixture)
     }
 
     func testInsert() throws {
         do {
-            try host!.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
-            try host!.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
+            try host!.insertVirtualDisk(driveNumber: 0, imagePath: diskFixture.path)
+            try host!.insertVirtualDisk(driveNumber: 0, imagePath: diskFixture.path)
         } catch {
             host!.ejectVirtualDisk(driveNumber: 0)
         }
@@ -41,7 +49,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         expectation = XCTestExpectation(description: "Waiting for response")
         host!.send(data: &s)
         let _ = XCTWaiter.wait(for: [expectation!], timeout: 5.0)
-        let expectedResult = 0x00
+        let expectedResult = 0xFF
         let actualResult = read(bytes: 1)[0]
         XCTAssert(actualResult == expectedResult, "Error: result should be \(expectedResult), but was \(actualResult)")
     }
@@ -150,7 +158,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
     func READEX(drive : Int, lsn : Int) throws -> (UInt8, Data) {
         let host = DriveWireHost(delegate: self)
         do {
-            try host.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
+            try host.insertVirtualDisk(driveNumber: 0, imagePath: diskFixture.path)
             var readTransaction = Data([host.OPREADEX, UInt8(drive), UInt8((lsn & 0xFF000) >> 16), UInt8((lsn & 0xFF00) >> 8), UInt8(lsn & 0xFF)])
             expectation = XCTestExpectation(description: "Waiting for sector data")
             host.send(data: &readTransaction)
@@ -174,7 +182,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         var sector = Data(repeating: 0, count: 256)
         let host = DriveWireHost(delegate: self)
         do {
-            try host.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
+            try host.insertVirtualDisk(driveNumber: 0, imagePath: diskFixture.path)
             var readTransaction = Data([host.OPREAD, UInt8(drive), UInt8((lsn & 0xFF000) >> 16), UInt8((lsn & 0xFF00) >> 8), UInt8(lsn & 0xFF)])
             expectation = XCTestExpectation(description: "Waiting for response code data")
             host.send(data: &readTransaction)

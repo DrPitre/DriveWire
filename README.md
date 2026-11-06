@@ -20,7 +20,8 @@ This repository has DriveWire host implementations for supported platforms:
 
 - UNIX: [C](c)
 - Mac: [Swift](swift) and [Objective-C](objc)
-- Windows: [Delphi](delphi)
+- Windows and Linux: [portable Swift command-line server](swift/PORTABLE.md)
+- Legacy Windows implementation: [Delphi](delphi)
 
 There are other repositories that host DriveWire implementations:
 
