@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 if(CMAKE_HOST_APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
   set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS version")
 endif()
-project(DriveWireDesktop VERSION 0.1.0 LANGUAGES CXX)
+project(DriveWireDesktop VERSION 0.2.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(DRIVEWIRE_FETCH_WX "Build a pinned wxWidgets instead of a system installation" OFF)
@@ -38,8 +38,8 @@ target_link_libraries(drivewire-desktop PRIVATE ${DRIVEWIRE_WX})
 set_target_properties(drivewire-desktop PROPERTIES
   MACOSX_BUNDLE_BUNDLE_NAME "DriveWire Desktop"
   MACOSX_BUNDLE_GUI_IDENTIFIER "org.drivewire.desktop"
-  MACOSX_BUNDLE_BUNDLE_VERSION "0.1.0"
-  MACOSX_BUNDLE_SHORT_VERSION_STRING "0.1.0"
+  MACOSX_BUNDLE_BUNDLE_VERSION "0.2.0"
+  MACOSX_BUNDLE_SHORT_VERSION_STRING "0.2.0"
   OUTPUT_NAME "DriveWire Desktop")
 if(MSVC)
   target_compile_options(drivewire-desktop PRIVATE /W4 /utf-8)
@@ -52,8 +52,9 @@ if(DRIVEWIRE_SERVER)
   else()
     set(SERVER_DEST "$<TARGET_FILE_DIR:drivewire-desktop>")
   endif()
-  add_custom_command(TARGET drivewire-desktop POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DRIVEWIRE_SERVER}" "${SERVER_DEST}/")
+  add_custom_target(drivewire-stage-server ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DRIVEWIRE_SERVER}" "${SERVER_DEST}/"
+    DEPENDS drivewire-desktop "${DRIVEWIRE_SERVER}")
 endif()
 install(TARGETS drivewire-desktop BUNDLE DESTINATION . RUNTIME DESTINATION .)
 if(DRIVEWIRE_SERVER AND NOT APPLE)

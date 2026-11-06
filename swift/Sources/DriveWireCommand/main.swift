@@ -2,11 +2,17 @@ import Foundation
 import Dispatch
 import ArgumentParser
 import DriveWireServer
+import DriveWireSerial
 
 struct DriveWireCommand: ParsableCommand {
     static let configuration = CommandConfiguration(commandName: "drivewire-server",
-        abstract: "Portable DriveWire TCP server for Windows, macOS and Linux.")
+        abstract: "Portable DriveWire TCP/serial server for Windows, macOS and Linux.")
 
+    @Option(help: "Physical serial port, e.g. COM3 or /dev/cu.usbserial. Selects serial instead of TCP.") var serialPort: String?
+    @Option(help: "Serial baud rate (8N1, no software or hardware flow control).") var baud: Int = 57600
+    @Flag(help: "Leave DTR deasserted.") var noDtr = false
+    @Flag(help: "Leave RTS deasserted.") var noRts = false
+    @Flag(help: "List available physical serial ports and exit.") var listPorts = false
     @Option(help: "TCP listening address.") var bind = "127.0.0.1"
     @Option(help: "TCP listening port (Becker port defaults to 65504).") var tcpPort: UInt16 = 65504
     @Option(help: "Host directory containing OS9Boot and device folders such as DD.") var rfmRoot: String?
@@ -19,7 +25,10 @@ struct DriveWireCommand: ParsableCommand {
 
     func run() throws {
         if managed { runManaged() }
-        let server = DriveWireServer(address: bind, port: tcpPort)
+        if listPorts { for path in try SerialPorts.available() { print(path) }; return }
+        guard (300...1_000_000).contains(baud) else { throw ValidationError("Invalid baud rate") }
+        let server = serialPort.map { DriveWireServer(serialPort: $0, baud: baud, dtr: !noDtr, rts: !noRts) }
+            ?? DriveWireServer(address: bind, port: tcpPort)
         server.logging = verbose
         if let rfmRoot {
             let root = URL(fileURLWithPath: rfmRoot).standardized.path
@@ -33,7 +42,8 @@ struct DriveWireCommand: ParsableCommand {
             if let image { try server.host.insertVirtualDisk(driveNumber: number, imagePath: image) }
         }
         try server.start()
-        print("DriveWire TCP server listening on \(bind):\(server.port)")
+        if let serialPort { print("DriveWire serial server: \(serialPort) at \(baud) baud (waiting/reconnecting as needed)") }
+        else { print("DriveWire TCP server listening on \(bind):\(server.port)") }
         // libdispatch's main queue is the protocol executor on all platforms;
         // this does not depend on an AppKit or Foundation GUI event loop.
         withExtendedLifetime(server) { dispatchMain() }

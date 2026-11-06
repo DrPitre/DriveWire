@@ -11,6 +11,7 @@
 #include <wx/socket.h>
 #include <wx/aboutdlg.h>
 #include <wx/cmdline.h>
+#include <wx/combobox.h>
 #include <functional>
 #include <map>
 #include <array>
@@ -29,6 +30,11 @@ class Desktop final : public wxFrame {
     wxTextCtrl *address_, *log_, *printer_, *windowText_, *windowInput_;
     wxStaticText* stats_;
     wxSpinCtrl* port_;
+    wxChoice* transport_;
+    wxComboBox *serialPath_, *baud_;
+    wxCheckBox *dtr_, *rts_;
+    wxButton* refreshPorts_;
+    std::string lastSerialError_;
     wxDirPickerCtrl* root_;
     wxCheckBox* verbose_;
     wxButton *start_, *stop_, *disconnect_;
@@ -151,11 +157,34 @@ class Desktop final : public wxFrame {
         SetStatusText(wxS("Starting server process…"), 0);
     }
     json settings() const {
+        long baud = 0; baud_->GetValue().ToLong(&baud);
         return {{"bind", utf8(address_->GetValue())}, {"port", port_->GetValue()},
+                {"transport", transport_->GetSelection() == 1 ? "serial" : "tcp"},
+                {"serialPath", utf8(serialPath_->GetValue())}, {"baud", baud},
+                {"dtr", dtr_->GetValue()}, {"rts", rts_->GetValue()},
                 {"root", utf8(root_->GetPath())}, {"verbose", verbose_->GetValue()}};
+    }
+    void connectionControls() {
+        bool active = running(), serial = transport_->GetSelection() == 1;
+        transport_->Enable(!active);
+        address_->Enable(!active && !serial); port_->Enable(!active && !serial);
+        serialPath_->Enable(!active && serial); baud_->Enable(!active && serial);
+        dtr_->Enable(!active && serial); rts_->Enable(!active && serial);
+        refreshPorts_->Enable(ready_ && !active && serial);
+    }
+    void refreshPorts() {
+        send({{"command", "ports"}}, [this](const json& reply) {
+            if (!reply.value("ok", false)) return;
+            auto current = serialPath_->GetValue();
+            serialPath_->Clear();
+            for (const auto& path : reply.value("ports", json::array())) serialPath_->Append(text(path.get<std::string>()));
+            serialPath_->SetValue(current);
+            if (current.empty() && serialPath_->GetCount()) serialPath_->SetSelection(0);
+        });
     }
     void startup() {
         if (smoke_) { smokeTick(); return; }
+        refreshPorts();
         auto config = settings(); config["command"] = "configure"; send(config);
         for (int i = 0; i < 4; ++i) {
             auto path = drives_[i].path->GetValue();
@@ -164,6 +193,10 @@ class Desktop final : public wxFrame {
     }
     void remember() {
         if (smoke_) return;
+        preferences_.Write("transport", static_cast<long>(transport_->GetSelection()));
+        preferences_.Write("serialPath", serialPath_->GetValue());
+        preferences_.Write("baud", baud_->GetValue());
+        preferences_.Write("dtr", dtr_->GetValue()); preferences_.Write("rts", rts_->GetValue());
         preferences_.Write("bind", address_->GetValue());
         preferences_.Write("port", static_cast<long>(port_->GetValue()));
         preferences_.Write("root", root_->GetPath());
@@ -179,7 +212,7 @@ class Desktop final : public wxFrame {
         send(request, [this](const json& reply) {
             starting_ = false;
             if (reply.value("ok", false)) send({{"command", "start"}}, [this](const json& result) {
-                if (result.value("ok", false)) { remember(); appendLog("Listening for a DriveWire guest"); }
+                if (result.value("ok", false)) { remember(); appendLog("Server started"); }
             });
         });
     }
@@ -240,8 +273,14 @@ class Desktop final : public wxFrame {
                 if (disks.size() != 4) throw std::runtime_error("Configuration must have four drives");
                 auto address = object.at("bind").get<std::string>(); auto root = object.at("root").get<std::string>();
                 auto port = object.at("port").get<int>(); auto verbose = object.at("verbose").get<bool>();
+                auto transport = object.value("transport", std::string("tcp"));
+                auto serialPath = object.value("serialPath", std::string()); auto baud = object.value("baud",57600);
+                if ((transport != "tcp" && transport != "serial") || baud < 300 || baud > 1000000 || (transport == "serial" && serialPath.empty())) throw std::runtime_error("Invalid serial settings");
                 if (address.empty() || port < 0 || port > 65535 || !wxDirExists(text(root))) throw std::runtime_error("Invalid connection settings or RFM root");
                 for (const auto& disk : disks) if (!disk.empty() && !wxFileExists(text(disk))) throw std::runtime_error("Disk image not found: " + disk);
+                transport_->SetSelection(transport == "serial" ? 1 : 0); serialPath_->SetValue(text(serialPath));
+                baud_->SetValue(wxString::Format("%d",baud)); dtr_->SetValue(object.value("dtr",true)); rts_->SetValue(object.value("rts",true));
+                connectionControls();
                 address_->ChangeValue(text(address)); root_->SetPath(text(root)); port_->SetValue(port); verbose_->SetValue(verbose);
                 for (int i=0; i<4; ++i) {
                     send({{"command", "eject"}, {"drive", i}});
@@ -258,10 +297,13 @@ class Desktop final : public wxFrame {
         state_ = state;
         bool active = running(), connected = state_.value("connected", false);
         if (connected != wasConnected) appendLog(connected ? "Guest connected" : "Guest disconnected");
-        address_->Enable(!active); port_->Enable(!active); root_->Enable(!active); verbose_->Enable(!active);
+        connectionControls(); root_->Enable(!active); verbose_->Enable(!active);
         start_->Enable(ready_ && !active && !starting_); stop_->Enable(active); disconnect_->Enable(active && connected);
-        SetStatusText(!active ? wxS("Stopped") : connected ? wxS("Guest connected") : wxS("Listening — waiting for guest"), 0);
-        SetStatusText(active ? text(stringValue(state_,"bind")) + wxString::Format(":%d",state_.value("port",0)) : "", 1);
+        bool serial = stringValue(state_,"transport") == "serial";
+        SetStatusText(!active ? wxS("Stopped") : connected ? wxS("Guest connected") : serial ? wxS("Waiting for serial port") : wxS("Listening — waiting for guest"), 0);
+        SetStatusText(active ? (serial ? text(stringValue(state_,"serialPath")) : text(stringValue(state_,"bind")) + wxString::Format(":%d",state_.value("port",0))) : "", 1);
+        auto serialError = stringValue(state_,"serialError");
+        if (serialError != lastSerialError_) { if (!serialError.empty()) appendLog("Serial: " + text(serialError) + " (retrying)"); lastSerialError_ = serialError; }
         stats_->SetLabel(wxString::Format("Received: %llu bytes     Sent: %llu bytes     Transactions: %llu",
             static_cast<unsigned long long>(state_.value("received", 0ULL)),
             static_cast<unsigned long long>(state_.value("sent", 0ULL)),
@@ -370,9 +412,9 @@ class Desktop final : public wxFrame {
     }
     void smokeTick();
 public:
-    Desktop(wxString server, wxString smokeRoot) : wxFrame(nullptr,wxID_ANY,"DriveWire Desktop",wxDefaultPosition,wxSize(960,760)),
+    Desktop(wxString server, wxString smokeRoot) : wxFrame(nullptr,wxID_ANY,"DriveWire Desktop",wxDefaultPosition,wxSize(1040,860)),
         timer_(this), executable_(server), smokeRoot_(smokeRoot), smoke_(!smokeRoot.empty()) {
-        SetMinSize(wxSize(760,620));
+        SetMinSize(wxSize(820,760));
         auto* menu = new wxMenuBar; auto* file = new wxMenu;
         file->Append(wxID_OPEN,wxS("&Open configuration…\tCtrl+O")); file->Append(wxID_SAVEAS,wxS("&Save configuration…\tCtrl+Shift+S"));
         file->AppendSeparator(); file->Append(wxID_EXIT,"&Quit\tCtrl+Q"); menu->Append(file,"&File");
@@ -381,14 +423,27 @@ public:
         CreateStatusBar(2); int widths[]={-1,230}; SetStatusWidths(2,widths);
         auto* panel = new wxPanel(this); auto* layout = new wxBoxSizer(wxVERTICAL);
         auto* title = new wxStaticText(panel,wxID_ANY,"DriveWire"); title->SetFont(wxFontInfo(23).Bold()); layout->Add(title,0,wxLEFT|wxTOP,18);
-        layout->Add(new wxStaticText(panel,wxID_ANY,wxS("TCP server • RFM • virtual disks")),0,wxLEFT|wxBOTTOM,18);
+        layout->Add(new wxStaticText(panel,wxID_ANY,wxS("TCP / serial server • RFM • virtual disks")),0,wxLEFT|wxBOTTOM,18);
         auto* connection = new wxStaticBoxSizer(wxVERTICAL,panel,"Connection");
+        auto* transportRow = new wxBoxSizer(wxHORIZONTAL);
+        transportRow->Add(new wxStaticText(panel,wxID_ANY,"Transport"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+        transport_=new wxChoice(panel,wxID_ANY);transport_->Append("TCP / Becker");transport_->Append("Serial port");transport_->SetSelection(0);transportRow->Add(transport_,0);
+        connection->Add(transportRow,0,wxEXPAND|wxLEFT|wxRIGHT|wxTOP,10);
         auto* row = new wxBoxSizer(wxHORIZONTAL); row->Add(new wxStaticText(panel,wxID_ANY,"Listen address"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         address_ = new wxTextCtrl(panel,wxID_ANY,"127.0.0.1"); row->Add(address_,1,wxRIGHT,14);
         row->Add(new wxStaticText(panel,wxID_ANY,"Port"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         port_ = new wxSpinCtrl(panel,wxID_ANY,"65504",wxDefaultPosition,wxSize(140,-1),wxSP_ARROW_KEYS,0,65535,65504); row->Add(port_,0,wxRIGHT,14);
         verbose_ = new wxCheckBox(panel,wxID_ANY,"Trace wire bytes"); row->Add(verbose_,0,wxALIGN_CENTER_VERTICAL);
         connection->Add(row,0,wxEXPAND|wxALL,10);
+        auto* serialRow = new wxBoxSizer(wxHORIZONTAL);
+        serialRow->Add(new wxStaticText(panel,wxID_ANY,"Serial port"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+        serialPath_=new wxComboBox(panel,wxID_ANY);serialPath_->SetHint("COM3 or /dev/cu.usbserial...");serialRow->Add(serialPath_,1,wxRIGHT,8);
+        refreshPorts_=new wxButton(panel,wxID_ANY,"Refresh");serialRow->Add(refreshPorts_,0,wxRIGHT,12);
+        serialRow->Add(new wxStaticText(panel,wxID_ANY,"Baud"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+        baud_=new wxComboBox(panel,wxID_ANY,"57600",wxDefaultPosition,wxSize(125,-1));for(auto value:{"9600","19200","38400","57600","115200","230400"})baud_->Append(value);serialRow->Add(baud_,0,wxRIGHT,10);
+        dtr_=new wxCheckBox(panel,wxID_ANY,"DTR");dtr_->SetValue(true);serialRow->Add(dtr_,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+        rts_=new wxCheckBox(panel,wxID_ANY,"RTS");rts_->SetValue(true);serialRow->Add(rts_,0,wxALIGN_CENTER_VERTICAL);
+        connection->Add(serialRow,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,10);
         auto* rootRow = new wxBoxSizer(wxHORIZONTAL); rootRow->Add(new wxStaticText(panel,wxID_ANY,"RFM root"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         root_ = new wxDirPickerCtrl(panel,wxID_ANY,wxGetHomeDir(),"Choose RFM host root",wxDefaultPosition,wxDefaultSize,wxDIRP_DEFAULT_STYLE|wxDIRP_DIR_MUST_EXIST);
         rootRow->Add(root_,1); connection->Add(rootRow,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,10);
@@ -434,21 +489,27 @@ public:
         auto* logActions=new wxBoxSizer(wxHORIZONTAL);auto* clearLog=new wxButton(logging,wxID_ANY,"Clear");auto* saveLog=new wxButton(logging,wxID_ANY,wxS("Save log…"));logActions->Add(clearLog,0,wxRIGHT,8);logActions->Add(saveLog);logLayout->Add(logActions,0,wxLEFT|wxRIGHT|wxBOTTOM,8);
         clearLog->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){log_->Clear();});saveLog->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){exportLog();});logging->SetSizer(logLayout);notebook->AddPage(logging,"Log");
         panel->SetSizer(layout);
+        transport_->Bind(wxEVT_CHOICE,[this](wxCommandEvent&){connectionControls();if(ready_&&transport_->GetSelection()==1)refreshPorts();});
+        refreshPorts_->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){refreshPorts();});
         start_->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){start();});stop_->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){send({{"command","stop"}});});
         disconnect_->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){send({{"command","disconnect"}});});
         windowChoice_->Bind(wxEVT_CHOICE,[this](wxCommandEvent&){showWindow();});windowInput_->Bind(wxEVT_TEXT_ENTER,[this](wxCommandEvent&){int channel=windowChannel();if(channel>=0){send({{"command","windowInput"},{"channel",channel},{"text",utf8(windowInput_->GetValue())+"\r"}});windowInput_->Clear();}});
         Bind(wxEVT_MENU,[this](wxCommandEvent&){configuration(false);},wxID_OPEN);Bind(wxEVT_MENU,[this](wxCommandEvent&){configuration(true);},wxID_SAVEAS);
         Bind(wxEVT_MENU,[this](wxCommandEvent&){Close();},wxID_EXIT);Bind(wxEVT_MENU,[this](wxCommandEvent&){send({{"command","saveAll"}});},1002);
         Bind(wxEVT_MENU,[this](wxCommandEvent&){if(process_){error("Stop and quit normally before restarting a running backend.");return;}launch();},1001);
-        Bind(wxEVT_MENU,[this](wxCommandEvent&){wxAboutDialogInfo info;info.SetName("DriveWire Desktop");info.SetVersion("0.1.0");info.SetDescription("A wxWidgets desktop for the shared Swift DriveWire server.\nThe native Swift Mac application remains a separate application.");info.SetWebSite("https://github.com/DrPitre/DriveWire");wxAboutBox(info,this);},wxID_ABOUT);
+        Bind(wxEVT_MENU,[this](wxCommandEvent&){wxAboutDialogInfo info;info.SetName("DriveWire Desktop");info.SetVersion("0.2.0");info.SetDescription("A wxWidgets desktop for the shared Swift DriveWire server.\nThe native Swift Mac application remains a separate application.");info.SetWebSite("https://github.com/DrPitre/DriveWire");wxAboutBox(info,this);},wxID_ABOUT);
         Bind(wxEVT_CLOSE_WINDOW,[this](wxCloseEvent& e){if(!e.CanVeto()){if(process_)process_->CloseOutput();Destroy();return;}e.Veto();close();});
         Bind(wxEVT_END_PROCESS,&Desktop::onExit,this);Bind(wxEVT_TIMER,&Desktop::onTimer,this);
         if (!smoke_) {
+            transport_->SetSelection(preferences_.ReadLong("transport",0)==1?1:0);
+            serialPath_->SetValue(preferences_.Read("serialPath",""));baud_->SetValue(preferences_.Read("baud","57600"));
+            dtr_->SetValue(preferences_.ReadBool("dtr",true));rts_->SetValue(preferences_.ReadBool("rts",true));
             address_->ChangeValue(preferences_.Read("bind","127.0.0.1"));port_->SetValue(static_cast<int>(preferences_.ReadLong("port",65504)));
             root_->SetPath(preferences_.Read("root",wxGetHomeDir()));verbose_->SetValue(preferences_.ReadBool("verbose",false));
             if(executable_.empty())executable_=preferences_.Read("server","");
             for(int i=0;i<4;++i)drives_[i].path->ChangeValue(preferences_.Read(wxString::Format("disk%d",i),""));
         }
+        connectionControls();
         timer_.Start(50);CallAfter([this]{launch();});
     }
     ~Desktop() override {
@@ -466,6 +527,11 @@ void Desktop::smokeTick() {
     auto step=smokeStep_++;
     if(step==0) {
         root_->SetPath(smokeRoot_);port_->SetValue(0);address_->ChangeValue("127.0.0.1");
+        if (wxFileExists(smokeRoot_+"/serial-port.txt")) {
+            wxFileInputStream input(smokeRoot_+"/serial-port.txt");std::string path;while(input.CanRead()){char b;input.Read(&b,1);if(input.LastRead())path+=b;}
+            transport_->SetSelection(1);serialPath_->SetValue(text(path));baud_->SetValue("57600");connectionControls();
+            wxCommandEvent refresh(wxEVT_BUTTON,refreshPorts_->GetId());refreshPorts_->GetEventHandler()->ProcessEvent(refresh);
+        }
         auto config=settings();config["command"]="configure";send(config);
     } else if(step==1) {
         send({{"command","mount"},{"drive",0},{"path",utf8(smokeRoot_+wxS("/disk ü.dsk"))}});
@@ -473,6 +539,15 @@ void Desktop::smokeTick() {
         wxCommandEvent event(wxEVT_BUTTON,start_->GetId());start_->GetEventHandler()->ProcessEvent(event);
     } else if(step==3) {
         if(!running()) { --smokeStep_;return; }
+        if (transport_->GetSelection()==1) {
+            if (wxFileExists(smokeRoot_+"/serial-missing.txt")) {
+                if (state_.value("connected",false)||stringValue(state_,"serialError").empty()) { --smokeStep_;return; }
+                smokeStep_=5;return;
+            }
+            if (state_.value("connected",false) && !wxFileExists(smokeRoot_+"/serial-ready")) { wxFileOutputStream ready(smokeRoot_+"/serial-ready");ready.Write("ready",5); }
+            if (!dirty(0)||!wxFileExists(smokeRoot_+"/serial-guest-ok")) { --smokeStep_;return; }
+            return;
+        }
         smokeSocket_=std::make_unique<wxSocketClient>();smokeSocket_->SetTimeout(3);
         wxIPV4address endpoint;endpoint.Hostname("127.0.0.1");endpoint.Service(static_cast<unsigned short>(state_.value("port",0)));
         if(!smokeSocket_->Connect(endpoint,true)) {failSmoke("GUI-started server did not accept TCP");return;}
@@ -488,16 +563,20 @@ void Desktop::smokeTick() {
         wxCommandEvent event(wxEVT_BUTTON,drives_[0].save->GetId());drives_[0].save->GetEventHandler()->ProcessEvent(event);
     } else if(step==5) {
         if(dirty(0)){failSmoke("GUI save left disk dirty");return;}
+        bool missing=wxFileExists(smokeRoot_+"/serial-missing.txt");
         wxFileInputStream image(smokeRoot_+wxS("/disk ü.dsk"));unsigned char b=0;image.Read(&b,1);
-        if(!image.IsOk()||b!=0x41){failSmoke("GUI Save did not persist guest bytes");return;}
-        smokeSocket_->Close();
+        if(!image.IsOk()||b!=(missing?0:0x41)){failSmoke("GUI Save did not persist guest bytes");return;}
+        if(smokeSocket_)smokeSocket_->Close();
         wxCommandEvent event(wxEVT_BUTTON,stop_->GetId());stop_->GetEventHandler()->ProcessEvent(event);
     } else if(step==6) {
         if(running()){failSmoke("GUI Stop did not stop listener");return;}
         send({{"command","eject"},{"drive",0}});
     } else if(step==7) {
         if(!state_["disks"].empty()){failSmoke("Eject did not clear mounted disk");return;}
-        wxFileOutputStream file(smokeRoot_+"/ui-result.json");auto result=json({{"ok",true},{"checks",{"backend launch","configuration","Unicode disk path","start button","TCP DWINIT","guest sector write","dirty tracking","save button","persisted bytes","stop button","eject","graceful shutdown"}}}).dump(2);file.Write(result.data(),result.size());
+        json checks;
+        if (wxFileExists(smokeRoot_+"/serial-missing.txt")) checks={"serial selection", "manual COM port", "port refresh", "start button", "missing-port waiting state", "stop cancels retries", "eject", "graceful shutdown"};
+        else checks={"backend launch", "configuration", "Unicode disk path", "start button", transport_->GetSelection()==1?"serial DWINIT":"TCP DWINIT", "guest sector write", "dirty tracking", "save button", "persisted bytes", "stop button", "eject", "graceful shutdown"};
+        wxFileOutputStream file(smokeRoot_+"/ui-result.json");auto result=json({{"ok",true},{"checks",checks}}).dump(2);file.Write(result.data(),result.size());
         shutdown();
     }
 }

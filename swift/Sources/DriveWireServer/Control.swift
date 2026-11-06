@@ -1,5 +1,6 @@
 import Foundation
 import DriveWireCore
+import DriveWireSerial
 
 /// Local, versioned management protocol shared by desktop frontends and tests.
 /// Call only on the main dispatch queue, just like the protocol engine.
@@ -9,6 +10,11 @@ public final class DriveWireControl {
     private var address = "127.0.0.1"
     private var port: UInt16 = 65504
     private var verbose = false
+    private var transport = "tcp"
+    private var serialPath = ""
+    private var baud = 57600
+    private var dtr = true
+    private var rts = true
     public var shouldExit = false
 
     public init() {}
@@ -23,6 +29,8 @@ public final class DriveWireControl {
             guard let command = request["command"] as? String else { try fail("Missing command") }
             switch command {
             case "status": break
+            case "ports":
+                return ["id": id, "ok": true, "protocol": 1, "ports": try SerialPorts.available(), "state": snapshot()]
             case "configure":
                 guard server?.running != true else { try fail("Stop the server before changing connection settings") }
                 let nextAddress = request["bind"] as? String ?? address
@@ -33,12 +41,21 @@ public final class DriveWireControl {
                 guard FileManager.default.fileExists(atPath: root, isDirectory: &isDirectory), isDirectory.boolValue else {
                     try fail("RFM root is not a directory: \(root)")
                 }
+                let nextTransport = request["transport"] as? String ?? transport
+                let nextPath = request["serialPath"] as? String ?? serialPath
+                let nextBaud = request["baud"] as? Int ?? baud
+                guard ["tcp", "serial"].contains(nextTransport), (300...1_000_000).contains(nextBaud) else { try fail("Invalid transport or baud rate") }
+                guard nextTransport != "serial" || !nextPath.isEmpty else { try fail("Select a serial port") }
+                transport = nextTransport; serialPath = nextPath; baud = nextBaud
+                dtr = request["dtr"] as? Bool ?? dtr; rts = request["rts"] as? Bool ?? rts
                 address = nextAddress; port = UInt16(nextPort)
                 verbose = request["verbose"] as? Bool ?? verbose
                 host.rfmRootPath = URL(fileURLWithPath: root).standardized.path
             case "start":
                 if server?.running != true {
-                    let next = DriveWireServer(address: address, port: port, host: host)
+                    let next = transport == "serial"
+                        ? DriveWireServer(serialPort: serialPath, baud: baud, dtr: dtr, rts: rts, host: host)
+                        : DriveWireServer(address: address, port: port, host: host)
                     next.logging = verbose
                     try next.start()
                     server = next
@@ -90,7 +107,9 @@ public final class DriveWireControl {
         let printer = host.printerStatus
         return [
             "running": server?.running == true, "connected": server?.connected == true,
-            "bind": address, "port": server?.running == true ? Int(server!.port) : Int(port),
+            "bind": address, "port": server?.running == true && transport == "tcp" ? Int(server!.port) : Int(port),
+            "transport": transport, "serialPath": serialPath, "baud": baud, "dtr": dtr, "rts": rts,
+            "serialError": server?.serialError ?? "",
             "root": host.rfmRootPath, "verbose": verbose,
             "received": server?.bytesReceived ?? 0, "sent": server?.bytesSent ?? 0,
             "transactions": server?.transactions ?? 0,

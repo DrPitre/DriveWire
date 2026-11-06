@@ -14,6 +14,8 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser.git", exact: "1.6.1")
     ],
     targets: [
+        .target(name: "CDriveWireSerial"),
+        .target(name: "DriveWireSerial", dependencies: ["CDriveWireSerial"]),
         .target(name: "DriveWireNetworking", dependencies: [
             .product(name: "NIOCore", package: "swift-nio"),
             .product(name: "NIOPosix", package: "swift-nio")
@@ -29,8 +31,8 @@ let package = Package(
                           "Model/DriveWireHost+MIDI.swift", "Model/DriveWireHost+Printer.swift",
                           "Model/DriveWireHost+RFM.swift", "Model/DriveWireHost+VirtualDrive.swift",
                           "Model/DriveWireHost+VirtualSerial.swift", "Drivers/DriveWireMIDIBackend.swift"]),
-        .target(name: "DriveWireServer", dependencies: ["DriveWireCore", "DriveWireNetworking"]),
-        .executableTarget(name: "DriveWireCommand", dependencies: ["DriveWireServer",
+        .target(name: "DriveWireServer", dependencies: ["DriveWireCore", "DriveWireNetworking", "DriveWireSerial"]),
+        .executableTarget(name: "DriveWireCommand", dependencies: ["DriveWireServer", "DriveWireSerial",
             .product(name: "ArgumentParser", package: "swift-argument-parser")]),
         .testTarget(name: "DriveWireCoreTests", dependencies: ["DriveWireCore"],
                     path: "DriveWireTests", sources: ["DriveWireTests.swift"]),

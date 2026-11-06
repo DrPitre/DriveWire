@@ -35,6 +35,9 @@ jobs:
       - name: Managed server test
         shell: bash
         run: python scripts/test-managed-server.py "$(swift build --package-path swift -c release --show-bin-path)/drivewire-server${{ runner.os == 'Windows' && '.exe' || '' }}"
+      - name: Serial transport test
+        shell: bash
+        run: python scripts/test-serial-server.py "$(swift build --package-path swift -c release --show-bin-path)/drivewire-server${{ runner.os == 'Windows' && '.exe' || '' }}"
       - name: TCP smoke test
         if: runner.os != 'Windows'
         shell: bash

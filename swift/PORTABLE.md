@@ -1,7 +1,7 @@
 # Portable Swift server
 
 The Swift package builds the same protocol source files used by the Mac
-application. It provides a command-line TCP server for Windows, macOS and Linux;
+application. It provides a command-line TCP/serial server for Windows, macOS and Linux;
 RFM is shared, including remote OS9Boot loading, fork-inherited directory
 cookies and device-root parent traversal.
 
@@ -40,9 +40,20 @@ interface. Optional `--disk0` through `--disk3` mount virtual disk images;
 `--verbose` logs wire bytes. The server accepts one persistent DriveWire guest,
 retiring its paths and parser state on disconnect or replacement.
 
-This executable uses TCP for Becker-port emulators. Physical serial transport,
-a Windows GUI, and Windows-native MIDI and system-printer output are not part
-of this initial executable. The existing Mac application retains its serial,
+This executable uses TCP for Becker-port emulators or a physical serial port.
+Use `--list-ports` to enumerate devices, or select a serial guest connection:
+
+```sh
+drivewire-server --serial-port /dev/cu.usbserial --baud 57600 --rfm-root /path/to/host
+```
+
+On Windows use `--serial-port COM3`; Linux accepts `/dev/ttyUSB0`, `/dev/ttyACM0`
+or a stable `/dev/serial/by-id/...` path. Serial is raw 8N1 with no flow control.
+DTR/RTS default on; `--no-dtr` and `--no-rts` leave them deasserted. Missing or
+unplugged devices are retried every two seconds. The wxWidgets desktop exposes
+the same settings and stores them in its configuration.
+
+Windows-native MIDI and system-printer output are not part of this executable. The existing Mac application retains its serial,
 GUI, MIDI and printing backends. Portable virtual serial TCP connect/listen/join,
 Telnet decoding, virtual disks, virtual windows and in-memory printer handling
 are included. File-based printer jobs use the shared core implementation.
@@ -53,6 +64,8 @@ are included. File-based printer jobs use the shared core implementation.
   interfaces, compiled without AppKit, AppIntents, Combine or Apple Network.
 - `DriveWireNetworking`: ordered TCP byte streams using SwiftNIO, with callbacks
   delivered to the main dispatch queue on every platform.
+- `DriveWireSerial` / `CDriveWireSerial`: native Win32 and POSIX serial I/O,
+  enumeration, raw baud/line configuration and ordered read/write workers.
 - `DriveWireServer`: connection ownership and serialized protocol execution.
 - `drivewire-server`: command-line configuration and dispatch executor.
 

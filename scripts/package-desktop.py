@@ -34,6 +34,12 @@ for dependency in ['swift-nio','swift-argument-parser','swift-system','swift-col
         if (directory/filename).exists(): shutil.copy2(directory/filename,licenses/(dependency+'-'+filename))
 wx_license = build/'_deps/wxwidgets-src/docs/licence.txt'
 if wx_license.exists(): shutil.copy2(wx_license,licenses/'wxWidgets-LICENSE.txt')
+def test_desktop(app, server):
+    command=[sys.executable, str(repo/'scripts/test-desktop.py'), str(app), '--server', str(server), '--isolate-runtime']
+    if platform.system() == 'Linux' and not os.environ.get('DISPLAY'): command=['xvfb-run','-a']+command
+    subprocess.run(command, check=True)
+    subprocess.run(command+['--serial'], check=True)
+
 if platform.system() == 'Darwin':
     app=stage/'DriveWire Desktop.app'
     shutil.copytree(build/'DriveWire Desktop.app',app)
@@ -75,16 +81,14 @@ if platform.system() == 'Darwin':
         if '@executable_path/../Frameworks' not in rpaths(binary):
             subprocess.run(['install_name_tool','-add_rpath','@executable_path/../Frameworks',str(binary)],check=True)
     subprocess.run(['codesign','--force','--deep','--sign','-',str(app)],check=True)
-    subprocess.run([sys.executable, str(repo/'scripts/test-desktop.py'), str(app/'Contents/MacOS/DriveWire Desktop'),
-                    '--server', str(app/'Contents/MacOS/drivewire-server'), '--isolate-runtime'], check=True)
+    test_desktop(app/'Contents/MacOS/DriveWire Desktop', app/'Contents/MacOS/drivewire-server')
     archive=shutil.make_archive(str(out/name),'zip',stage)
     print(archive)
 elif platform.system() == 'Windows':
     source=build/'Release'
     for file in source.iterdir():
         if file.suffix.lower() in ['.exe','.dll']: shutil.copy2(file,stage/file.name)
-    subprocess.run([sys.executable, str(repo/'scripts/test-desktop.py'), str(stage/'DriveWire Desktop.exe'),
-                    '--server', str(stage/'drivewire-server.exe'), '--isolate-runtime'], check=True)
+    test_desktop(stage/'DriveWire Desktop.exe', stage/'drivewire-server.exe')
     archive=shutil.make_archive(str(out/name),'zip',stage)
     print(archive)
 else:
@@ -95,10 +99,7 @@ else:
         for file in pathlib.Path(directory).glob('*.so*'):
             if file.is_file(): shutil.copy2(file,lib/file.name)
     subprocess.run(['patchelf','--set-rpath','$ORIGIN/lib',str(stage/'drivewire-server')],check=True)
-    test=[sys.executable, str(repo/'scripts/test-desktop.py'), str(stage/'DriveWire Desktop'),
-          '--server', str(stage/'drivewire-server'), '--isolate-runtime']
-    if not os.environ.get('DISPLAY'): test=['xvfb-run','-a']+test
-    subprocess.run(test, check=True)
+    test_desktop(stage/'DriveWire Desktop', stage/'drivewire-server')
     launcher=stage/'drivewire'
     launcher.write_text('#!/bin/sh\ncd -- "$(dirname -- "$0")"\nexec "./DriveWire Desktop" "$@"\n')
     launcher.chmod(0o755)
