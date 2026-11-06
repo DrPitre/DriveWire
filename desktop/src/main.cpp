@@ -12,6 +12,7 @@
 #include <wx/aboutdlg.h>
 #include <wx/cmdline.h>
 #include <wx/combobox.h>
+#include <wx/scrolwin.h>
 #include <functional>
 #include <map>
 #include <array>
@@ -411,9 +412,9 @@ class Desktop final : public wxFrame {
     }
     void smokeTick();
 public:
-    Desktop(wxString server, wxString smokeRoot) : wxFrame(nullptr,wxID_ANY,"DriveWire Desktop",wxDefaultPosition,wxSize(1040,860)),
+    Desktop(wxString server, wxString smokeRoot) : wxFrame(nullptr,wxID_ANY,"DriveWire Desktop",wxDefaultPosition,wxSize(1040,820)),
         timer_(this), executable_(server), smokeRoot_(smokeRoot), smoke_(!smokeRoot.empty()) {
-        SetMinSize(wxSize(820,760));
+        SetMinSize(wxSize(820,680));
         auto* menu = new wxMenuBar; auto* file = new wxMenu;
         file->Append(wxID_OPEN,wxS("&Open configuration…\tCtrl+O")); file->Append(wxID_SAVEAS,wxS("&Save configuration…\tCtrl+Shift+S"));
         file->AppendSeparator(); file->Append(wxID_EXIT,"&Quit\tCtrl+Q"); menu->Append(file,"&File");
@@ -453,8 +454,8 @@ public:
         start_->Disable();stop_->Disable();disconnect_->Disable(); connection->Add(actions,0,wxLEFT|wxRIGHT|wxBOTTOM,10);
         stats_=new wxStaticText(panel,wxID_ANY,"No traffic"); connection->Add(stats_,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,10);
         layout->Add(connection,0,wxEXPAND|wxLEFT|wxRIGHT,18);
-        auto* notebook = new wxNotebook(panel,wxID_ANY); layout->Add(notebook,1,wxEXPAND|wxALL,18);
-        auto* disks = new wxPanel(notebook); auto* diskLayout = new wxBoxSizer(wxVERTICAL);
+        auto* notebook = new wxNotebook(panel,wxID_ANY); notebook->SetMinSize(wxSize(-1,160)); layout->Add(notebook,1,wxEXPAND|wxALL,18);
+        auto* disks = new wxScrolledWindow(notebook); disks->SetScrollRate(0,20); auto* diskLayout = new wxBoxSizer(wxVERTICAL);
         diskLayout->Add(new wxStaticText(disks,wxID_ANY,"Guest writes stay in memory until saved. Save changed disks before ejecting or quitting."),0,wxALL,12);
         for (int i=0;i<4;++i) {
             auto* box = new wxStaticBoxSizer(wxHORIZONTAL,disks,wxString::Format("Drive %d",i));
@@ -470,7 +471,7 @@ public:
             drive.eject->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){preserve(i,[this,i](bool save,bool discard){send({{"command","eject"},{"drive",i},{"saveBefore",save},{"discard",discard}},[this](const json& r){if(r.value("ok",false))remember();});});});
             diskLayout->Add(box,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,12);
         }
-        disks->SetSizer(diskLayout);notebook->AddPage(disks,"Disks");
+        disks->SetSizer(diskLayout);disks->FitInside();notebook->AddPage(disks,"Disks");
         auto* windows=new wxPanel(notebook);auto* windowsLayout=new wxBoxSizer(wxVERTICAL);
         windowChoice_=new wxChoice(windows,wxID_ANY); windowsLayout->Add(windowChoice_,0,wxEXPAND|wxALL,8);
         windowText_=multiline(windows);windowsLayout->Add(windowText_,1,wxEXPAND|wxLEFT|wxRIGHT,8);
