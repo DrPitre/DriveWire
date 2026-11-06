@@ -59,3 +59,10 @@ The `testRFM*` cases in `DriveWireTests` cover directory-owner selection,
 relative/self-owner changes, fork cookies before first child I/O, failed changes,
 combined directory modes,
 read-after-write, independent handles, sparse writes, size/EOF and line cursors.
+
+RFM path traversal stays within the selected OS-9 device: `/DD/..` resolves
+back to `/DD`, including multi-dot paths. The same normalization applies to
+Open/Create, ChgDir, MakDir, and Delete. This permits CoWin's early
+`../CMDS/grfdrv` load when `/DD` is an RFM system device. The companion
+NitrOS-9 `rfm_boot_test` recipe verifies a remote OS9Boot and RFM-backed `/DD`
+with no RBF modules or server-mounted virtual disks.

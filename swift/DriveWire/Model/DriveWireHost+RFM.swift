@@ -107,6 +107,23 @@ extension DriveWireHost {
 
         // Expand OS-9 multi-dot path components: N dots = N-1 parent-dir references.
         static func expandMultiDots(_ path: String) -> String {
+            if path.hasPrefix("/") {
+                let components = path.split(separator: "/").map(String.init)
+                guard let device = components.first else { return "/" }
+                var resolved = [device]
+                // An OS-9 device root's parent is itself, never the host's
+                // export root. CoWin loads ../CMDS/grfdrv before SysGo runs.
+                for component in components.dropFirst() {
+                    if component.allSatisfy({ $0 == "." }) {
+                        for _ in 0..<max(0, component.count - 1) {
+                            if resolved.count > 1 { resolved.removeLast() }
+                        }
+                    } else {
+                        resolved.append(component)
+                    }
+                }
+                return "/" + resolved.joined(separator: "/")
+            }
             return path.components(separatedBy: "/").map { c in
                 guard !c.isEmpty, c.allSatisfy({ $0 == "." }), c.count >= 2 else { return c }
                 return Array(repeating: "..", count: c.count - 1).joined(separator: "/")
@@ -398,7 +415,7 @@ extension DriveWireHost {
     }
 
     func resolveRFMPathname(_ pathname: String, processID: Int, parentProcessID: Int, isExec: Bool = false) -> String {
-        guard !(pathname as NSString).isAbsolutePath else { return pathname }
+        guard !(pathname as NSString).isAbsolutePath else { return expandOS9MultiDots(pathname) }
         let dirMap = isExec ? rfmCurrentExecDir : rfmCurrentDir
         let base: String
         // For relative requests the client puts the directory-owner PID in the
@@ -411,7 +428,7 @@ extension DriveWireHost {
             return pathname
         }
         if pathname == "." { return base }
-        return (base as NSString).appendingPathComponent(pathname)
+        return expandOS9MultiDots((base as NSString).appendingPathComponent(pathname))
     }
 
     // Expand OS-9 multi-dot path components: N dots = N-1 parent-dir references.

@@ -341,6 +341,32 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         }
     }
 
+    func testRFMDeviceRootParentStaysOnDeviceDuringBoot() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        let cmds = folder.appendingPathComponent("DD/CMDS")
+        try FileManager.default.createDirectory(at: cmds, withIntermediateDirectories: true)
+        try Data([1,2,3]).write(to: cmds.appendingPathComponent("grfdrv"))
+        let zero = Data([0,0,0])
+        let reply = contextPath(4, "/DD", pid: 1, cookie: zero, mode: 0x85)
+        XCTAssertEqual(reply.first, 0)
+        let cookie = Data(reply.dropFirst())
+        for path in ["../CMDS/grfdrv", ".../CMDS/grfdrv", "../../CMDS/grfdrv"] {
+            XCTAssertEqual(contextPath(2, path, pid: 1, cookie: cookie, mode: 4), Data([0]), path)
+            XCTAssertEqual(rfmRequest(7, [1,0,3]), Data([0,3,1,2,3]))
+            _ = rfmRequest(13,[1])
+        }
+        // Root chd .. must return a usable cookie for DD, not the export root.
+        let parent = contextPath(4, "..", pid: 1, cookie: cookie, mode: 0x85)
+        XCTAssertEqual(parent, reply)
+        XCTAssertEqual(contextPath(2, "CMDS/grfdrv", pid: 2, cookie: Data(parent.dropFirst()), mode: 4), Data([0]))
+        _ = rfmRequest(13,[1])
+        XCTAssertEqual(contextPath(3, "../created", pid: 1, cookie: cookie, mode: 3), Data([0]))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("DD/created").path))
+        XCTAssertEqual(contextPath(5, "../created", pid: 1, cookie: cookie, mode: 2), Data([0]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("DD/created").path))
+    }
+
     func testRFMOwnerContextOverridesReusedPID() {
         host!.rfmCurrentDir = [4: "/y0/data", 5: "/y0/stale"]
         host!.rfmCurrentExecDir = [4: "/y0/bin", 5: "/y0/stale-bin"]
