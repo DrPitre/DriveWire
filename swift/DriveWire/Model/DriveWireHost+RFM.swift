@@ -552,18 +552,23 @@ extension DriveWireHost {
     // Only fold a name when the requested spelling actually opens on the host;
     // exact entries always win on case-sensitive filesystems.
     private func rfmIdentityPath(_ url: URL) -> String {
-        let parent = url.deletingLastPathComponent()
-        guard parent.path != url.path, !url.lastPathComponent.isEmpty else { return url.path }
+        // Walk a finite component list: deletingLastPathComponent at a volume
+        // root does not terminate consistently across Foundation versions.
+        let components = url.pathComponents
+        guard let root = components.first else { return url.path }
+        var current = URL(fileURLWithPath: root, isDirectory: true)
         let fm = FileManager.default
-        let requested = url.lastPathComponent
-        var stored = requested
-        if let names = try? fm.contentsOfDirectory(atPath: parent.path),
-           !names.contains(requested), fm.fileExists(atPath: url.path),
-           let match = names.first(where: { $0.caseInsensitiveCompare(requested) == .orderedSame }) {
-            stored = match
+        for requested in components.dropFirst() {
+            var stored = requested
+            let candidate = current.appendingPathComponent(requested)
+            if let names = try? fm.contentsOfDirectory(atPath: current.path),
+               !names.contains(requested), fm.fileExists(atPath: candidate.path),
+               let match = names.first(where: { $0.caseInsensitiveCompare(requested) == .orderedSame }) {
+                stored = match
+            }
+            current.appendPathComponent(stored)
         }
-        return URL(fileURLWithPath: rfmIdentityPath(parent), isDirectory: true)
-            .appendingPathComponent(stored).path
+        return current.path
     }
 
     // Builds OS-9 directory contents for the open directory descriptor, registering each entry in the LSN map.

@@ -349,6 +349,11 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         }
     }
 
+    func testRFMHostRootIdentityTerminates() {
+        let root = URL(fileURLWithPath: host!.rfmRootPath).pathComponents.first ?? "/"
+        XCTAssertEqual(host!.lsnForPath(root), host!.lsnForPath(root))
+    }
+
     func testRFMPromptDirectoryIdentityMatchesParentEntry() throws {
         let folder = try rfmFolder()
         defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
