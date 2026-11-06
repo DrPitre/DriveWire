@@ -62,8 +62,6 @@ public final class DriveWireControl {
                     }
                     if command == "mount" {
                         guard let path = request["path"] as? String, !path.isEmpty else { try fail("Missing image path") }
-                        // Validate before replacing a mounted image; VirtualDrive.reload logs failures.
-                        _ = try Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe)
                         try host.insertVirtualDisk(driveNumber: number, imagePath: path)
                     } else { host.ejectVirtualDisk(driveNumber: number) }
                 }

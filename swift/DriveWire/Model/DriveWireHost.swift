@@ -527,13 +527,10 @@ public class DriveWireHost : Codable {
     ///     - driveNumber: The drive number to insert the virtual disk into.
     ///     - imagePath: The page the virtual disk image to insert.
     public func insertVirtualDisk(driveNumber : Int, imagePath : String) throws {
-        if let _ = virtualDrives.first(where: { $0.driveNumber == driveNumber }) {
-            ejectVirtualDisk(driveNumber: driveNumber)
-            // A drive with this number already exists... disallow it.
-//            throw DriveWireHostError.driveAlreadyExists
-        }
-
-        virtualDrives.append(try VirtualDrive(driveNumber: driveNumber, imagePath: imagePath))
+        // Load before replacing the old drive so a failed mount preserves it.
+        let replacement = try VirtualDrive(driveNumber: driveNumber, imagePath: imagePath)
+        ejectVirtualDisk(driveNumber: driveNumber)
+        virtualDrives.append(replacement)
     }
 
     /// Ejects a virtual disk from the virtual drive.

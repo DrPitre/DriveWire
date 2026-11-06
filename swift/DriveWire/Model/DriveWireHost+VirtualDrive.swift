@@ -49,7 +49,8 @@ extension DriveWireHost {
             self.driveNumber = driveNumber
             self.imagePath = imagePath
 
-            reload()
+            storageContainer = try Data(contentsOf: URL(fileURLWithPath: imagePath))
+            isStorageLoaded = true
         }
 
         public func reload() {

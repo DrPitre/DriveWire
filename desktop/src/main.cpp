@@ -34,7 +34,7 @@ class Desktop final : public wxFrame {
     wxButton *start_, *stop_, *disconnect_;
     wxChoice* windowChoice_;
     wxListCtrl* channels_;
-    struct DriveRow { wxTextCtrl* path; wxStaticText* state; wxButton *mount, *eject, *save; };
+    struct DriveRow { wxTextCtrl* path; wxStaticText* state; wxButton *mount, *eject, *save, *saveAs; };
     std::array<DriveRow, 4> drives_;
     wxTimer timer_;
     wxProcess* process_ = nullptr;
@@ -145,7 +145,7 @@ class Desktop final : public wxFrame {
         pid_ = wxExecute(args, wxEXEC_ASYNC | wxEXEC_HIDE_CONSOLE, process_);
         if (!pid_) { delete process_; process_ = nullptr; error("Could not launch " + path); return; }
         appendLog("Backend: " + path);
-        SetStatusText("Starting server process…", 0);
+        SetStatusText(wxS("Starting server process…"), 0);
     }
     json settings() const {
         return {{"bind", utf8(address_->GetValue())}, {"port", port_->GetValue()},
@@ -253,7 +253,7 @@ class Desktop final : public wxFrame {
         if (connected != wasConnected) appendLog(connected ? "Guest connected" : "Guest disconnected");
         address_->Enable(!active); port_->Enable(!active); root_->Enable(!active); verbose_->Enable(!active);
         start_->Enable(ready_ && !active && !starting_); stop_->Enable(active); disconnect_->Enable(active && connected);
-        SetStatusText(!active ? "Stopped" : connected ? "Guest connected" : "Listening — waiting for guest", 0);
+        SetStatusText(!active ? wxS("Stopped") : connected ? wxS("Guest connected") : wxS("Listening — waiting for guest"), 0);
         SetStatusText(active ? text(stringValue(state_,"bind")) + wxString::Format(":%d",state_.value("port",0)) : "", 1);
         stats_->ChangeValue(wxString::Format("Received: %llu bytes     Sent: %llu bytes     Transactions: %llu",
             static_cast<unsigned long long>(state_.value("received", 0ULL)),
@@ -268,7 +268,7 @@ class Desktop final : public wxFrame {
                 break;
             }
             if (!mounted) { drives_[i].state->SetLabel("Empty"); if (ready_ && ticks_ > 3) drives_[i].path->Clear(); }
-            drives_[i].mount->Enable(ready_ && !closing_); drives_[i].save->Enable(mounted && !closing_); drives_[i].eject->Enable(mounted && !closing_);
+            drives_[i].mount->Enable(ready_ && !closing_); drives_[i].save->Enable(mounted && !closing_); drives_[i].saveAs->Enable(mounted && !closing_); drives_[i].eject->Enable(mounted && !closing_);
         }
         auto printer = state_.value("printer",json::object());
         auto preview = text(stringValue(printer,"text"));
@@ -318,7 +318,7 @@ class Desktop final : public wxFrame {
         closing_ = true;
         remember();
         send({{"command","shutdown"},{"discard",true}}, [this](const json&) { if (process_) process_->CloseOutput(); });
-        SetStatusText("Closing server…",0);
+        SetStatusText(wxS("Closing server…"),0);
     }
     void onTimer(wxTimerEvent&) {
         ++ticks_;
@@ -354,7 +354,7 @@ class Desktop final : public wxFrame {
     void failSmoke(const std::string& message) {
         if (exitCode_ != 0) return;
         exitCode_=1;
-        std::ofstream out(utf8(smokeRoot_ + "/ui-result.json")); out << json({{"ok",false},{"error",message}}).dump(2);
+        std::ofstream out(utf8(smokeRoot_ + "/ui-result.json")); out << json({{"ok",false},{"error",message},{"step",smokeStep_},{"log",utf8(log_->GetValue())}}).dump(2);
         closing_=true;
         if (process_) { process_->CloseOutput(); wxProcess::Kill(static_cast<int>(pid_),wxSIGKILL,wxKILL_CHILDREN); }
         CallAfter([this] { Destroy(); });
@@ -365,19 +365,19 @@ public:
         timer_(this), executable_(server), smokeRoot_(smokeRoot), smoke_(!smokeRoot.empty()) {
         SetMinSize(wxSize(760,620));
         auto* menu = new wxMenuBar; auto* file = new wxMenu;
-        file->Append(wxID_OPEN,"&Open configuration…\tCtrl+O"); file->Append(wxID_SAVEAS,"&Save configuration…\tCtrl+Shift+S");
+        file->Append(wxID_OPEN,wxS("&Open configuration…\tCtrl+O")); file->Append(wxID_SAVEAS,wxS("&Save configuration…\tCtrl+Shift+S"));
         file->AppendSeparator(); file->Append(wxID_EXIT,"&Quit\tCtrl+Q"); menu->Append(file,"&File");
         auto* serverMenu = new wxMenu; serverMenu->Append(1001,"Restart &backend"); serverMenu->Append(1002,"Save all disk changes\tCtrl+S"); menu->Append(serverMenu,"&Server");
         auto* help = new wxMenu; help->Append(wxID_ABOUT,"&About DriveWire Desktop"); menu->Append(help,"&Help"); SetMenuBar(menu);
         CreateStatusBar(2); int widths[]={-1,230}; SetStatusWidths(2,widths);
         auto* panel = new wxPanel(this); auto* layout = new wxBoxSizer(wxVERTICAL);
         auto* title = new wxStaticText(panel,wxID_ANY,"DriveWire"); title->SetFont(wxFontInfo(23).Bold()); layout->Add(title,0,wxLEFT|wxTOP,18);
-        layout->Add(new wxStaticText(panel,wxID_ANY,"TCP server • RFM • virtual disks"),0,wxLEFT|wxBOTTOM,18);
+        layout->Add(new wxStaticText(panel,wxID_ANY,wxS("TCP server • RFM • virtual disks")),0,wxLEFT|wxBOTTOM,18);
         auto* connection = new wxStaticBoxSizer(wxVERTICAL,panel,"Connection");
         auto* row = new wxBoxSizer(wxHORIZONTAL); row->Add(new wxStaticText(panel,wxID_ANY,"Listen address"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         address_ = new wxTextCtrl(panel,wxID_ANY,"127.0.0.1"); row->Add(address_,1,wxRIGHT,14);
         row->Add(new wxStaticText(panel,wxID_ANY,"Port"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
-        port_ = new wxSpinCtrl(panel,wxID_ANY,"65504",wxDefaultPosition,wxSize(105,-1),wxSP_ARROW_KEYS,0,65535,65504); row->Add(port_,0,wxRIGHT,14);
+        port_ = new wxSpinCtrl(panel,wxID_ANY,"65504",wxDefaultPosition,wxSize(140,-1),wxSP_ARROW_KEYS,0,65535,65504); row->Add(port_,0,wxRIGHT,14);
         verbose_ = new wxCheckBox(panel,wxID_ANY,"Trace wire bytes"); row->Add(verbose_,0,wxALIGN_CENTER_VERTICAL);
         connection->Add(row,0,wxEXPAND|wxALL,10);
         auto* rootRow = new wxBoxSizer(wxHORIZONTAL); rootRow->Add(new wxStaticText(panel,wxID_ANY,"RFM root"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
@@ -397,10 +397,11 @@ public:
             auto* box = new wxStaticBoxSizer(wxHORIZONTAL,disks,wxString::Format("Drive %d",i));
             auto& drive=drives_[i]; drive.path=new wxTextCtrl(disks,wxID_ANY,"",wxDefaultPosition,wxDefaultSize,wxTE_READONLY); box->Add(drive.path,1,wxALIGN_CENTER_VERTICAL|wxALL,6);
             drive.state=new wxStaticText(disks,wxID_ANY,"Empty",wxDefaultPosition,wxSize(66,-1)); box->Add(drive.state,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,6);
-            drive.mount=new wxButton(disks,wxID_ANY,"Mount…"); drive.save=new wxButton(disks,wxID_ANY,"Save"); drive.eject=new wxButton(disks,wxID_ANY,"Eject");
-            box->Add(drive.mount,0,wxALL,4);box->Add(drive.save,0,wxALL,4);box->Add(drive.eject,0,wxALL,4);
+            drive.mount=new wxButton(disks,wxID_ANY,wxS("Mount…")); drive.save=new wxButton(disks,wxID_ANY,"Save"); drive.saveAs=new wxButton(disks,wxID_ANY,wxS("Save As…")); drive.eject=new wxButton(disks,wxID_ANY,"Eject");
+            box->Add(drive.mount,0,wxALL,4);box->Add(drive.save,0,wxALL,4);box->Add(drive.saveAs,0,wxALL,4);box->Add(drive.eject,0,wxALL,4);
             drive.mount->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){mount(i);});
             drive.save->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){saveDisk(i);});
+            drive.saveAs->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){saveDisk(i,true);});
             drive.save->Bind(wxEVT_CONTEXT_MENU,[this,i](wxContextMenuEvent&){saveDisk(i,true);});
             drive.save->SetToolTip("Save guest changes. Right-click to Save As.");
             drive.eject->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){preserve(i,[this,i]{send({{"command","eject"},{"drive",i},{"discard",true}},[this](const json& r){if(r.value("ok",false))remember();});});});
@@ -417,11 +418,11 @@ public:
         portsLayout->Add(channels_,1,wxEXPAND|wxALL,8);ports->SetSizer(portsLayout);notebook->AddPage(ports,"Serial channels");
         auto* printing=new wxPanel(notebook);auto* printLayout=new wxBoxSizer(wxVERTICAL);
         printLayout->Add(new wxStaticText(printing,wxID_ANY,"Guest printer preview. Save the received text to a file."),0,wxALL,8);printer_=multiline(printing);printLayout->Add(printer_,1,wxEXPAND|wxLEFT|wxRIGHT,8);
-        auto* savePrint=new wxButton(printing,wxID_ANY,"Save preview…");printLayout->Add(savePrint,0,wxALL,8);
+        auto* savePrint=new wxButton(printing,wxID_ANY,wxS("Save preview…"));printLayout->Add(savePrint,0,wxALL,8);
         savePrint->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){wxFileDialog d(this,"Save printer preview","","DriveWire-print.txt","Text files|*.txt|All files|*",wxFD_SAVE|wxFD_OVERWRITE_PROMPT);if(d.ShowModal()==wxID_OK&&!printer_->SaveFile(d.GetPath()))error("Could not save printer preview.");});
         printing->SetSizer(printLayout);notebook->AddPage(printing,"Printer");
         auto* logging=new wxPanel(notebook);auto* logLayout=new wxBoxSizer(wxVERTICAL);log_=multiline(logging);logLayout->Add(log_,1,wxEXPAND|wxALL,8);
-        auto* logActions=new wxBoxSizer(wxHORIZONTAL);auto* clearLog=new wxButton(logging,wxID_ANY,"Clear");auto* saveLog=new wxButton(logging,wxID_ANY,"Save log…");logActions->Add(clearLog,0,wxRIGHT,8);logActions->Add(saveLog);logLayout->Add(logActions,0,wxLEFT|wxRIGHT|wxBOTTOM,8);
+        auto* logActions=new wxBoxSizer(wxHORIZONTAL);auto* clearLog=new wxButton(logging,wxID_ANY,"Clear");auto* saveLog=new wxButton(logging,wxID_ANY,wxS("Save log…"));logActions->Add(clearLog,0,wxRIGHT,8);logActions->Add(saveLog);logLayout->Add(logActions,0,wxLEFT|wxRIGHT|wxBOTTOM,8);
         clearLog->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){log_->Clear();});saveLog->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){exportLog();});logging->SetSizer(logLayout);notebook->AddPage(logging,"Log");
         panel->SetSizer(layout);
         start_->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){start();});stop_->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){send({{"command","stop"}});});
@@ -458,7 +459,7 @@ void Desktop::smokeTick() {
         root_->SetPath(smokeRoot_);port_->SetValue(0);address_->ChangeValue("127.0.0.1");
         auto config=settings();config["command"]="configure";send(config);
     } else if(step==1) {
-        send({{"command","mount"},{"drive",0},{"path",utf8(smokeRoot_+"/disk ü.dsk")}});
+        send({{"command","mount"},{"drive",0},{"path",utf8(smokeRoot_+wxS("/disk ü.dsk"))}});
     } else if(step==2) {
         wxCommandEvent event(wxEVT_BUTTON,start_->GetId());start_->GetEventHandler()->ProcessEvent(event);
     } else if(step==3) {
@@ -478,7 +479,7 @@ void Desktop::smokeTick() {
         wxCommandEvent event(wxEVT_BUTTON,drives_[0].save->GetId());drives_[0].save->GetEventHandler()->ProcessEvent(event);
     } else if(step==5) {
         if(dirty(0)){failSmoke("GUI save left disk dirty");return;}
-        wxFileInputStream image(smokeRoot_+"/disk ü.dsk");unsigned char b=0;image.Read(&b,1);
+        wxFileInputStream image(smokeRoot_+wxS("/disk ü.dsk"));unsigned char b=0;image.Read(&b,1);
         if(!image.IsOk()||b!=0x41){failSmoke("GUI Save did not persist guest bytes");return;}
         smokeSocket_->Close();
         wxCommandEvent event(wxEVT_BUTTON,stop_->GetId());stop_->GetEventHandler()->ProcessEvent(event);
