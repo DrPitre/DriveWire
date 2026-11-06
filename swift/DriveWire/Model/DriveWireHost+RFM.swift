@@ -534,12 +534,41 @@ extension DriveWireHost {
 
     // Returns a stable LSN for the given absolute host path, allocating a new one if needed.
     func lsnForPath(_ path: String) -> Int {
-        if let existing = rfmLSNByPath[path] { return existing }
+        // Match the host volume's name semantics without resolving symlinks:
+        // DD/SYS may point outside DD, but its guest parent must remain DD.
+        let url = URL(fileURLWithPath: path).standardized
+        let key = rfmIdentityPath(url)
+        if let existing = rfmLSNByPath[key] { return existing }
         let lsn = rfmLSNCounter
-        rfmLSNByPath[path] = lsn
+        rfmLSNByPath[key] = lsn
         rfmLSNToPath[lsn] = path
         rfmLSNCounter += 1
         return lsn
+    }
+
+    // Recover the spelling stored by the filesystem, component by component.
+    // Foundation's volume case-sensitivity resource is unavailable on some
+    // platforms. Enumeration also respects Windows per-directory sensitivity.
+    // Only fold a name when the requested spelling actually opens on the host;
+    // exact entries always win on case-sensitive filesystems.
+    private func rfmIdentityPath(_ url: URL) -> String {
+        // Walk a finite component list: deletingLastPathComponent at a volume
+        // root does not terminate consistently across Foundation versions.
+        let components = url.pathComponents
+        guard let root = components.first else { return url.path }
+        var current = URL(fileURLWithPath: root, isDirectory: true)
+        let fm = FileManager.default
+        for requested in components.dropFirst() {
+            var stored = requested
+            let candidate = current.appendingPathComponent(requested)
+            if let names = try? fm.contentsOfDirectory(atPath: current.path),
+               !names.contains(requested), fm.fileExists(atPath: candidate.path),
+               let match = names.first(where: { $0.caseInsensitiveCompare(requested) == .orderedSame }) {
+                stored = match
+            }
+            current.appendPathComponent(stored)
+        }
+        return current.path
     }
 
     // Builds OS-9 directory contents for the open directory descriptor, registering each entry in the LSN map.
@@ -682,11 +711,11 @@ extension DriveWireHost {
                     print(line)
                 }
             }
-            var reply = Data([errorCode])
+            delegate?.dataAvailable(host: self, data: Data([errorCode]))
             if contextReply && errorCode == 0 {
-                reply.append(contentsOf: [UInt8((cookie >> 16) & 255), UInt8((cookie >> 8) & 255), UInt8(cookie & 255)])
+                delegate?.dataAvailableAfterReceiveBoundary(host: self, data: Data([
+                    UInt8((cookie >> 16) & 255), UInt8((cookie >> 8) & 255), UInt8(cookie & 255)]))
             }
-            delegate?.dataAvailable(host: self, data: reply)
             resetState()
             return crOffset - data.startIndex + 1
         }
@@ -798,7 +827,7 @@ extension DriveWireHost {
                     delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
                     if !lineData.isEmpty {
                         Thread.sleep(forTimeInterval: 0.002)
-                        delegate?.dataAvailable(host: self, data: lineData)
+                        delegate?.dataAvailableAfterReceiveBoundary(host: self, data: lineData)
                     }
                 }
             } else {
@@ -859,7 +888,7 @@ extension DriveWireHost {
                     delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
                     if !lineData.isEmpty {
                         Thread.sleep(forTimeInterval: 0.002)
-                        delegate?.dataAvailable(host: self, data: lineData)
+                        delegate?.dataAvailableAfterReceiveBoundary(host: self, data: lineData)
                     }
                 }
             } else {

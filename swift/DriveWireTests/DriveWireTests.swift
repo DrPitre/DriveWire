@@ -349,6 +349,44 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         }
     }
 
+    func testRFMHostRootIdentityTerminates() {
+        let root = URL(fileURLWithPath: host!.rfmRootPath).pathComponents.first ?? "/"
+        XCTAssertEqual(host!.lsnForPath(root), host!.lsnForPath(root))
+    }
+
+    func testRFMPromptDirectoryIdentityMatchesParentEntry() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        let fm = FileManager.default
+        try fm.createDirectory(at: folder.appendingPathComponent("SYS"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: folder.appendingPathComponent("DD"), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(atPath: folder.appendingPathComponent("DD/SYS").path,
+                                  withDestinationPath: "../SYS")
+        let insensitive = fm.fileExists(atPath: folder.appendingPathComponent("DD/sys").path)
+        let zero = Data([0,0,0])
+        // Enumerate the parent first, as the shell does before chd sys.
+        XCTAssertEqual(contextPath(2, "/DD", pid: 2, cookie: zero, mode: 0x81), Data([0]))
+        let parent = host!.synthesizeDirectoryEntries(for: host!.rfmPaths[1]!)
+        let parentID = Data(parent.suffix(3)) // SYS is the only non-dot entry
+        _ = rfmRequest(13, [1])
+        let spelling = insensitive ? "sys" : "SYS"
+        let changed = contextPath(4, "/DD/" + spelling, pid: 2, cookie: zero, mode: 0x81)
+        XCTAssertEqual(changed.first, 0)
+        XCTAssertEqual(Data(changed.dropFirst()), parentID)
+        XCTAssertEqual(contextPath(2, ".", pid: 2, cookie: Data(changed.dropFirst()), mode: 0x81), Data([0]))
+        let child = host!.synthesizeDirectoryEntries(for: host!.rfmPaths[1]!)
+        XCTAssertEqual(Data(child[61..<64]), parentID, "Shell+ must find dot's ID in the parent")
+        _ = rfmRequest(13, [1])
+        let up = contextPath(4, "..", pid: 2, cookie: Data(changed.dropFirst()), mode: 0x81)
+        XCTAssertEqual(up, contextPath(4, "/DD", pid: 2, cookie: zero, mode: 0x81),
+                       "Symlink resolution must not move the guest out of DD")
+        if !insensitive {
+            try fm.createDirectory(at: folder.appendingPathComponent("DD/sys"), withIntermediateDirectories: true)
+            XCTAssertNotEqual(host!.lsnForPath(folder.path + "/DD/sys"),
+                              host!.lsnForPath(folder.path + "/DD/SYS"))
+        }
+    }
+
     func testRFMDeviceRootParentStaysOnDeviceDuringBoot() throws {
         let folder = try rfmFolder()
         defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }

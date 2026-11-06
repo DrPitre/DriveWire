@@ -131,3 +131,16 @@ testing, not notarized releases. Windows needs the Microsoft C++ runtime.
 Linux needs GTK3/wxWidgets 3.2 runtime libraries (`libwxgtk3.2-1t64` on Ubuntu
 24.04); Swift runtime libraries are bundled. Each staged package is tested
 again with toolchain library environment overrides removed.
+
+## CoCo bitbanger RFM replies
+
+The portable serial backend drains each RFM status/count prefix and waits 2 ms
+before sending the continuation (directory cookie or file data). The CoCo has
+no receive FIFO and calls DWRead separately for those pieces. Without the gap,
+bytes can arrive while the guest returns from one call and prepares the next,
+causing error 244 even though sector reads work.
+
+Only context-aware ChgDir cookies and Read/ReadLn payloads use this gap. Sector
+reads and payload bytes remain contiguous; TCP has no added delay. This replaces
+the diagnostic delay after every byte. The native SwiftUI/ORSSerial backend is
+unchanged by this portable-backend fix.
