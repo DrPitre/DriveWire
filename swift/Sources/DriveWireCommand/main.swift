@@ -26,6 +26,7 @@ struct DriveWireCommand: ParsableCommand {
     func run() throws {
         if managed { runManaged() }
         if listPorts { for path in try SerialPorts.available() { print(path) }; return }
+        if let serialPort, serialPort.isEmpty { throw ValidationError("Select a serial port") }
         guard (300...1_000_000).contains(baud) else { throw ValidationError("Invalid baud rate") }
         let server = serialPort.map { DriveWireServer(serialPort: $0, baud: baud, dtr: !noDtr, rts: !noRts) }
             ?? DriveWireServer(address: bind, port: tcpPort)
@@ -40,6 +41,14 @@ struct DriveWireCommand: ParsableCommand {
         }
         for (number, image) in [disk0, disk1, disk2, disk3].enumerated() {
             if let image { try server.host.insertVirtualDisk(driveNumber: number, imagePath: image) }
+        }
+        if let serialPort {
+            var lastState = ""
+            server.onConnectionChange = { [weak server] connected in
+                guard let server else { return }
+                let state = connected ? "Serial port opened: \(serialPort)" : "Waiting for \(serialPort): \(server.serialError ?? "disconnected")"
+                if state != lastState { print(state); lastState = state }
+            }
         }
         try server.start()
         if let serialPort { print("DriveWire serial server: \(serialPort) at \(baud) baud (waiting/reconnecting as needed)") }

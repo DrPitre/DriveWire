@@ -67,6 +67,12 @@ with tempfile.TemporaryDirectory(prefix='DriveWire serial ') as directory:
             command('configure',transport='serial',serialPath=str(link),baud=115200,root=str(root))
             command('mount',drive=0,path=str(image));command('start')
             wait_state(lambda state:state['connected'])
+            import termios
+            attributes=termios.tcgetattr(master)
+            assert attributes[4]==termios.B115200 and attributes[5]==termios.B115200
+            assert not attributes[0] & (termios.IXON|termios.IXOFF|termios.ICRNL)
+            assert not attributes[1] & termios.OPOST
+            assert not attributes[3] & (termios.ICANON|termios.ECHO)
             os.write(master,b'\x5a');assert request(b'\x01\0\x5a\x01',2)==b'\xff\xff'
             # All byte values include XON/XOFF, NUL, CR/LF and 0xff.
             payload=bytes(range(256));packet=b'\x57\0\0\0\0'+payload+sum(payload).to_bytes(2,'big')
@@ -87,10 +93,13 @@ with tempfile.TemporaryDirectory(prefix='DriveWire serial ') as directory:
             # Test stale cookies before DWINIT, which itself resets guest state.
             assert request(b'\xd6\x12\x01\x02'+cookie+b'\x81.\r',1)==b'\xd8'
             assert request(b'\x5a\x01',1)==b'\xff'
-            # Stop cancels retries and switching back to TCP retains mounted disks.
+            changed=b'C'*256
+            assert request(b'\x57\0\0\0\0'+changed+sum(changed).to_bytes(2,'big'),1)==b'\0'
+            # Stop and switching back to TCP must retain unsaved guest writes.
             command('stop');time.sleep(.3)
             command('configure',transport='tcp',port=0)
-            state=command('start')['state'];assert state['port']>0 and state['disks']
+            state=command('start')['state'];assert state['port']>0 and state['disks'][0]['dirty']
+            command('saveAll');assert image.read_bytes()[:256]==changed
             command('stop')
         command('shutdown');assert process.wait(timeout=5)==0
         print('PASS: serial discovery, missing-port retry/stop'+(', PTY fragmented protocol, binary disk I/O, RFM bootfile, hangup/reconnect, stale cookie retirement and transport switching' if os.name!='nt' else ' (Windows physical COM byte transfer still needs hardware validation)'))

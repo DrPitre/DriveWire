@@ -179,7 +179,6 @@ class Desktop final : public wxFrame {
             serialPath_->Clear();
             for (const auto& path : reply.value("ports", json::array())) serialPath_->Append(text(path.get<std::string>()));
             serialPath_->SetValue(current);
-            if (current.empty() && serialPath_->GetCount()) serialPath_->SetSelection(0);
         });
     }
     void startup() {

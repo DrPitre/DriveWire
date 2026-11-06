@@ -73,7 +73,7 @@ with tempfile.TemporaryDirectory(prefix='DriveWire desktop ') as folder:
     if guest: guest.join(timeout=1)
     if master is not None: os.close(master)
     if failures: raise SystemExit('FAIL: serial guest: '+str(failures))
-    result_path = root / 'ui-result.json' 
+    result_path = root / 'ui-result.json'
     if not result_path.exists():
         raise SystemExit(f'FAIL: desktop exited {code} without a result\n' + (root / 'gui.log').read_text(errors='replace'))
     result = json.loads(result_path.read_text())

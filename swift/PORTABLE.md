@@ -53,7 +53,8 @@ DTR/RTS default on; `--no-dtr` and `--no-rts` leave them deasserted. Missing or
 unplugged devices are retried every two seconds. The wxWidgets desktop exposes
 the same settings and stores them in its configuration.
 
-Windows-native MIDI and system-printer output are not part of this executable. The existing Mac application retains its serial,
+Windows-native MIDI and system-printer output are not part of this executable.
+The existing Mac application retains its serial,
 GUI, MIDI and printing backends. Portable virtual serial TCP connect/listen/join,
 Telnet decoding, virtual disks, virtual windows and in-memory printer handling
 are included. File-based printer jobs use the shared core implementation.
