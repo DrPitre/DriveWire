@@ -349,6 +349,91 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         }
     }
 
+    func testRFMRenameUsesParentPermissionsAndPreservesDirectoryCookies() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        let fm = FileManager.default
+        let parent = folder.appendingPathComponent("y0/data")
+        let zero = Data([0, 0, 0])
+        func rename(_ old: String, _ new: String) -> Data {
+            func field(_ name: String) -> [UInt8] { Array(name.utf8) + Array(repeating: 0, count: 30 - name.utf8.count) }
+            return rfmRequest(12, [1, 0x2D] + field(old) + field(new))
+        }
+        try Data("untouched".utf8).write(to: parent.appendingPathComponent("old"))
+        #if !os(Windows)
+        try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: parent.appendingPathComponent("old").path)
+        #endif
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: zero, mode: 0x82), Data([0]))
+        XCTAssertEqual(rename("old", "new"), Data([0]), "Child access permissions do not authorize rename")
+        XCTAssertFalse(fm.fileExists(atPath: parent.appendingPathComponent("old").path))
+        #if !os(Windows)
+        XCTAssertEqual((try fm.attributesOfItem(atPath: parent.appendingPathComponent("new").path))[.posixPermissions] as? Int, 0)
+        #endif
+        XCTAssertEqual(rename("new", "child"), Data([218]))
+        XCTAssertEqual(rename("missing", "other"), Data([216]))
+        XCTAssertEqual(rename("..", "other"), Data([215]))
+        XCTAssertEqual(rename("new", "a/b"), Data([215]))
+        XCTAssertEqual(rename("new", "NEW"), Data([0]))
+        XCTAssertTrue(try fm.contentsOfDirectory(atPath: parent.path).contains("NEW"))
+        try fm.createSymbolicLink(atPath: parent.appendingPathComponent("link").path, withDestinationPath: "missing-target")
+        XCTAssertEqual(rename("link", "link2"), Data([0]))
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: parent.appendingPathComponent("link2").path), "missing-target")
+        let cookie = contextPath(4, "/y0/data/child", pid: 3, cookie: zero, mode: 0x81)
+        try Data("nested".utf8).write(to: parent.appendingPathComponent("child/file"))
+        XCTAssertEqual(contextPath(2, "file", pid: 3, cookie: Data(cookie.dropFirst()), mode: 1, number: 2), Data([0]))
+        #if os(Windows)
+        // Windows may deny moving a directory containing an open file handle.
+        _ = rfmRequest(13, [2])
+        #endif
+        XCTAssertEqual(rename("child", "renamed"), Data([0]))
+        #if os(Windows)
+        XCTAssertEqual(contextPath(2, "file", pid: 3, cookie: Data(cookie.dropFirst()), mode: 1, number: 2), Data([0]))
+        #endif
+        XCTAssertEqual(host!.rfmPaths[2]?.pathname, "/y0/data/renamed/file")
+        XCTAssertEqual(rfmRequest(7, [2, 0, 6]), Data([0, 6]) + Data("nested".utf8))
+        XCTAssertEqual(contextPath(4, "/y0/data/renamed", pid: 3, cookie: zero, mode: 0x81), cookie)
+        XCTAssertEqual(contextPath(2, "file", pid: 3, cookie: Data(cookie.dropFirst()), mode: 1, number: 3), Data([0]))
+        #if !os(Windows)
+        try fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parent.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path) }
+        if !fm.isWritableFile(atPath: parent.path) { XCTAssertEqual(rename("NEW", "denied"), Data([214])) }
+        #endif
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: zero, mode: 0x81, number: 4), Data([0]))
+        let record = [UInt8](repeating: 0, count: 60)
+        XCTAssertEqual(rfmRequest(12, [4, 0x2D] + record), Data([215]))
+    }
+
+    func testRFMRenameFramingAndDirectoryMode() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        let parent = folder.appendingPathComponent("y0/data")
+        try Data([1, 2, 3]).write(to: parent.appendingPathComponent("old"))
+        let zero = Data([0, 0, 0])
+        let record = Array("old".utf8) + Array(repeating: UInt8(0), count: 27)
+            + Array("new".utf8) + Array(repeating: UInt8(0), count: 27)
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: zero, mode: 0x81), Data([0]))
+        XCTAssertEqual(rfmRequest(11, [1, 0x2D]), Data([0]))
+        XCTAssertEqual(rfmRequest(11, [99, 0x2D]), Data([201]))
+        XCTAssertEqual(rfmRequest(12, [1, 0x2D] + record), Data([214]))
+        XCTAssertEqual(rfmRequest(12, [99, 0x2D] + record), Data([201]))
+        XCTAssertEqual(rfmRequest(12, [1, 0xFE]), Data([208]))
+        _ = rfmRequest(13, [1])
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: zero, mode: 0x82), Data([0]))
+        responseData.removeAll()
+        let packet: [UInt8] = [0xD6, 12, 1, 0x2D] + record
+        for (index, byte) in packet.enumerated() {
+            var fragment = Data([byte])
+            host!.send(data: &fragment)
+            if index < packet.count - 1 {
+                XCTAssertTrue(responseData.isEmpty)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: parent.appendingPathComponent("old").path))
+            }
+        }
+        XCTAssertEqual(responseData, Data([0]))
+        XCTAssertEqual(try Data(contentsOf: parent.appendingPathComponent("new")), Data([1, 2, 3]))
+        XCTAssertEqual(rfmRequest(12, [1, 0xFE]), Data([208]), "Parser remains aligned after rename")
+    }
+
     func testRFMHostRootIdentityTerminates() {
         let root = URL(fileURLWithPath: host!.rfmRootPath).pathComponents.first ?? "/"
         XCTAssertEqual(host!.lsnForPath(root), host!.lsnForPath(root))
