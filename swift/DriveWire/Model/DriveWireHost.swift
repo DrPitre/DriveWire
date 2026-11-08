@@ -23,8 +23,18 @@ public protocol DriveWireDelegate {
     ///     - data: The data available for the delegate.
     func dataAvailable(host : DriveWireHost, data : Data)
 
+    /// A continuation that follows a separate guest receive call. Buffered
+    /// transports can forward immediately; physical serial must allow turnaround.
+    func dataAvailableAfterReceiveBoundary(host: DriveWireHost, data: Data)
+
     /// Informs the delegate that a DriveWire transaction completed.
     func transactionCompleted(opCode : UInt8)
+}
+
+public extension DriveWireDelegate {
+    func dataAvailableAfterReceiveBoundary(host: DriveWireHost, data: Data) {
+        dataAvailable(host: host, data: data)
+    }
 }
 
 /// Statistical information about the host.
