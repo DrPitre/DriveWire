@@ -41,7 +41,11 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         expectation = XCTestExpectation(description: "Waiting for response")
         host!.send(data: &s)
         let _ = XCTWaiter.wait(for: [expectation!], timeout: 5.0)
-        let expectedResult = 0x00
+        // Must be non-zero: OP_DWINIT's own comment records that a zero here
+        // makes the NitrOS-9 driver take the host for a DW3 server and disable
+        // every DW4 extension, the virtual serial poller included. The 0x00 this
+        // expected predates that.
+        let expectedResult = 0xFF
         let actualResult = read(bytes: 1)[0]
         XCTAssert(actualResult == expectedResult, "Error: result should be \(expectedResult), but was \(actualResult)")
     }
