@@ -219,6 +219,41 @@ final class ServerTests: XCTestCase {
     }
 
     @MainActor
+    func testVirtualSerialPeerCloseDrainsInputAndNotifiesGuest() async throws {
+        let listener = TCPListener(port: 0)
+        var remote: TCPConnection?
+        try listener.start { connection in
+            remote = connection
+            connection.onReady = { connection.send(Data([41, 42])) }
+            connection.start()
+        }
+        let host = DriveWireHost()
+        defer { host.disconnectGuest(); remote?.cancel(); listener.cancel() }
+        let arguments = ["127.0.0.1", String(listener.port)]
+        _ = host.tcpConnect(arguments, channel: 1)
+        for _ in 0..<100 where host.virtualSerialInput[1]?.count != 2 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(host.virtualSerialInput[1], Data([41, 42]))
+        remote?.cancel()
+        for _ in 0..<100 where host.pendingClosedVirtualSerialChannels.isEmpty {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(host.pendingClosedVirtualSerialChannels, [1])
+        XCTAssertEqual(host.pollVirtualSerial(), Data([2, 41]))
+        XCTAssertEqual(host.pollVirtualSerial(), Data([2, 42]))
+        XCTAssertEqual(host.pollVirtualSerial(), Data([16, 1]))
+        XCTAssertEqual(host.pollVirtualSerial(), Data([0, 0]))
+        XCTAssertFalse(host.openVirtualSerialChannels.contains(1))
+
+        // Reopening before a pending close is polled must not retire the new peer.
+        host.pendingClosedVirtualSerialChannels.append(1)
+        _ = host.tcpConnect(arguments, channel: 1)
+        XCTAssertTrue(host.pendingClosedVirtualSerialChannels.isEmpty)
+        XCTAssertTrue(host.openVirtualSerialChannels.contains(1))
+    }
+
+    @MainActor
     func testVirtualSerialListenJoinAndTelnet() async throws {
         let reservation = TCPListener(port: 0)
         try reservation.start { $0.cancel() }
@@ -242,5 +277,12 @@ final class ServerTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertEqual(host.virtualSerialInput[2], Data([104,105,13,255]))
+        client.cancel()
+        for _ in 0..<100 where !host.pendingClosedVirtualSerialChannels.contains(2) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(host.pendingClosedVirtualSerialChannels.contains(2))
+        XCTAssertEqual(host.readVirtualSerial(channel: 2, count: 4), Data([104,105,13,255]))
+        XCTAssertEqual(host.pollVirtualSerial(), Data([16,2]))
     }
 }

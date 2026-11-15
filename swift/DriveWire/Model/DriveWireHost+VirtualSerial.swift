@@ -755,6 +755,7 @@ extension DriveWireHost {
 
         let host = arguments[0]
         virtualSerialTCPConnections[channel]?.close()
+        pendingClosedVirtualSerialChannels.removeAll { $0 == channel }
         openVirtualSerialChannels.insert(channel)
         refreshVirtualSerialChannelStatuses()
 
@@ -814,6 +815,7 @@ extension DriveWireHost {
         }
 
         virtualSerialTCPConnections[channel]?.close()
+        pendingClosedVirtualSerialChannels.removeAll { $0 == channel }
         openVirtualSerialChannels.insert(channel)
         let connection = makeVirtualSerialTCPConnection(
             channel: channel,
@@ -879,7 +881,10 @@ extension DriveWireHost {
             DispatchQueue.main.async {
                 guard let self, let reference, self.virtualSerialTCPConnections[channel] === reference else { return }
                 self.virtualSerialTCPConnections[channel] = nil
-                self.openVirtualSerialChannels.remove(channel)
+                // Drain buffered input before telling the guest the peer closed.
+                if !self.pendingClosedVirtualSerialChannels.contains(channel) {
+                    self.pendingClosedVirtualSerialChannels.append(channel)
+                }
                 self.refreshVirtualSerialChannelStatuses()
             }
         })
@@ -899,7 +904,10 @@ extension DriveWireHost {
             DispatchQueue.main.async {
                 guard let self, let reference, self.virtualSerialTCPConnections[channel] === reference else { return }
                 self.virtualSerialTCPConnections[channel] = nil
-                self.openVirtualSerialChannels.remove(channel)
+                // Drain buffered input before telling the guest the peer closed.
+                if !self.pendingClosedVirtualSerialChannels.contains(channel) {
+                    self.pendingClosedVirtualSerialChannels.append(channel)
+                }
                 self.refreshVirtualSerialChannelStatuses()
             }
         })

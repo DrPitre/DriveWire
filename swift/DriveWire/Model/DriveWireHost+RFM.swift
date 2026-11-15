@@ -4,6 +4,9 @@
 //
 
 import Foundation
+#if os(Windows)
+import WinSDK
+#endif
 
 extension DriveWireHost {
     struct RFMPathDescriptor {
@@ -1115,7 +1118,25 @@ extension DriveWireHost {
         }
         do {
             if URL(fileURLWithPath: oldKey).lastPathComponent != new {
+                #if os(Windows)
+                // Foundation rejects an existing destination before attempting
+                // the move, including the same entry under different casing.
+                // A native rename supports that case without replacing another
+                // entry: deliberately leave MOVEFILE_REPLACE_EXISTING unset.
+                let from = Array(source.path.utf16) + [0]
+                let to = Array(destination.path.utf16) + [0]
+                let renamed = from.withUnsafeBufferPointer { sourcePath in
+                    to.withUnsafeBufferPointer { destinationPath in
+                        MoveFileExW(sourcePath.baseAddress, destinationPath.baseAddress, 0)
+                    }
+                }
+                if !renamed {
+                    let code = GetLastError()
+                    return code == DWORD(ERROR_ALREADY_EXISTS) || code == DWORD(ERROR_FILE_EXISTS) ? 218 : 214
+                }
+                #else
                 try fm.moveItem(at: source, to: destination)
+                #endif
             }
         } catch {
             let error = error as NSError
