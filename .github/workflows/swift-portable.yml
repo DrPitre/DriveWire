@@ -73,7 +73,7 @@ jobs:
           cmake --build desktop/build --config Release --parallel 4
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Copy-Item dist/*.dll desktop/build/Release/ -Force
-          python scripts/test-desktop.py "desktop/build/Release/DriveWire Desktop.exe" --server desktop/build/Release/drivewire-server.exe
+          python scripts/test-desktop.py "desktop/build/Release/DriveWire Swift Server.exe" --server desktop/build/Release/drivewire-server.exe
       - name: Build wxWidgets desktop (macOS and Linux)
         if: runner.os != 'Windows'
         shell: bash
@@ -83,9 +83,9 @@ jobs:
           cmake -S desktop -B desktop/build -DCMAKE_BUILD_TYPE=Release -DDRIVEWIRE_FETCH_WX=$fetch -DDRIVEWIRE_SERVER="$(swift build --package-path swift -c release --show-bin-path)/drivewire-server"
           cmake --build desktop/build --parallel 4
           if [ "$RUNNER_OS" = macOS ]; then
-            python3 scripts/test-desktop.py "desktop/build/DriveWire Desktop.app/Contents/MacOS/DriveWire Desktop" --server "desktop/build/DriveWire Desktop.app/Contents/MacOS/drivewire-server"
+            python3 scripts/test-desktop.py "desktop/build/DriveWire Swift Server.app/Contents/MacOS/DriveWire Swift Server" --server "desktop/build/DriveWire Swift Server.app/Contents/MacOS/drivewire-server"
           else
-            xvfb-run -a python3 scripts/test-desktop.py "desktop/build/DriveWire Desktop" --server desktop/build/drivewire-server
+            xvfb-run -a python3 scripts/test-desktop.py "desktop/build/DriveWire Swift Server" --server desktop/build/drivewire-server
           fi
       - name: Package desktop
         shell: bash

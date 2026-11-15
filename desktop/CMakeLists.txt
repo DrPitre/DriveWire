@@ -33,14 +33,20 @@ else()
   set(DRIVEWIRE_WX ${wxWidgets_LIBRARIES})
 endif()
 add_executable(drivewire-desktop WIN32 MACOSX_BUNDLE src/main.cpp)
+if(APPLE)
+  set(DRIVEWIRE_ICON "${CMAKE_CURRENT_SOURCE_DIR}/resources/DriveWireConnection.icns")
+  target_sources(drivewire-desktop PRIVATE "${DRIVEWIRE_ICON}")
+  set_source_files_properties("${DRIVEWIRE_ICON}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+  set_target_properties(drivewire-desktop PROPERTIES MACOSX_BUNDLE_ICON_FILE DriveWireConnection.icns)
+endif()
 target_include_directories(drivewire-desktop PRIVATE third_party)
 target_link_libraries(drivewire-desktop PRIVATE ${DRIVEWIRE_WX})
 set_target_properties(drivewire-desktop PROPERTIES
-  MACOSX_BUNDLE_BUNDLE_NAME "DriveWire Desktop"
+  MACOSX_BUNDLE_BUNDLE_NAME "DriveWire Swift Server"
   MACOSX_BUNDLE_GUI_IDENTIFIER "org.drivewire.desktop"
   MACOSX_BUNDLE_BUNDLE_VERSION "0.2.0"
   MACOSX_BUNDLE_SHORT_VERSION_STRING "0.2.0"
-  OUTPUT_NAME "DriveWire Desktop")
+  OUTPUT_NAME "DriveWire Swift Server")
 if(MSVC)
   target_compile_options(drivewire-desktop PRIVATE /W4 /utf-8)
 else()
@@ -61,7 +67,7 @@ if(DRIVEWIRE_SERVER AND NOT APPLE)
   install(PROGRAMS "${DRIVEWIRE_SERVER}" DESTINATION .)
 endif()
 install(FILES README.md third_party/JSON-LICENSE.MIT DESTINATION licenses)
-set(CPACK_PACKAGE_NAME DriveWire-Desktop)
+set(CPACK_PACKAGE_NAME DriveWire-Swift-Server)
 set(CPACK_PACKAGE_VENDOR DriveWire)
 set(CPACK_GENERATOR ZIP)
 include(CPack)

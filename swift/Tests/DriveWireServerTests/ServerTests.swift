@@ -6,6 +6,72 @@ import DriveWireNetworking
 
 final class ServerTests: XCTestCase {
     @MainActor
+    func testVirtualWindowClosesUsingSCFDescriptorPort() {
+        let host = DriveWireHost()
+        for port in [UInt8(17), 18, 31] {
+            let window = UInt8(0x80) | (port - 16)
+            _ = host.OP_SERSETSTAT(data: Data([0xC4, port, 0x29]))
+            XCTAssertTrue(host.virtualWindows.contains { $0.channel == window })
+            host.sendVirtualWindowInput("pending", channel: window)
+            _ = host.OP_SERSETSTAT(data: Data([0xC4, port, 0x2A]))
+            XCTAssertFalse(host.virtualWindows.contains { $0.channel == window })
+            XCTAssertNil(host.virtualSerialInput[window])
+            XCTAssertFalse(host.openVirtualSerialChannels.contains(window))
+            _ = host.OP_SERINIT(data: Data([0x45, port]))
+            _ = host.OP_SERTERM(data: Data([0x46, port]))
+            XCTAssertTrue(host.virtualWindows.isEmpty)
+        }
+        _ = host.OP_SERINIT(data: Data([0x45, 1]))
+        _ = host.OP_SERSETSTAT(data: Data([0xC4, 17, 0x2A]))
+        XCTAssertTrue(host.openVirtualSerialChannels.contains(1))
+    }
+
+    @MainActor
+    func testVirtualWindowOutputImplicitlyOpensInteractiveInput() {
+        let host = DriveWireHost()
+        _ = host.OP_SERWRITE(data: Data([0xC3, 130, 62]))
+        XCTAssertFalse(host.openVirtualSerialChannels.contains(130))
+        host.sendVirtualWindowInput("x", channel: 130)
+        XCTAssertEqual(host.pollVirtualSerial(), Data([0x42, 120]))
+        _ = host.OP_SERTERM(data: Data([0x46, 130]))
+        host.sendVirtualWindowInput("late", channel: 130)
+        XCTAssertTrue(host.virtualWindows.isEmpty)
+        XCTAssertNil(host.virtualSerialInput[130])
+    }
+
+    @MainActor
+    func testVirtualWindowDisappearsOnGuestCloseAndReopensCleanly() {
+        let host = DriveWireHost()
+        _ = host.OP_SERINIT(data: Data([0x45, 129]))
+        host.appendVirtualWindowOutput(Data("prompt".utf8), channel: 129)
+        host.sendVirtualWindowInput("pending", channel: 129)
+        _ = host.OP_SERTERM(data: Data([0x46, 129]))
+        XCTAssertFalse(host.virtualWindows.contains { $0.channel == 129 })
+        XCTAssertNil(host.virtualSerialInput[129])
+        host.sendVirtualWindowInput("late input", channel: 129)
+        XCTAssertTrue(host.virtualWindows.isEmpty)
+        XCTAssertNil(host.virtualSerialInput[129])
+        _ = host.OP_SERINIT(data: Data([0x45, 129]))
+        XCTAssertEqual(host.virtualWindows.first?.text, "")
+        _ = host.OP_SERSETSTAT(data: Data([0xC4, 129, 0x2A]))
+        XCTAssertTrue(host.virtualWindows.isEmpty)
+    }
+
+    @MainActor
+    func testVirtualWindowReceivesTerminalControlKeys() {
+        let host = DriveWireHost()
+        _ = host.OP_SERINIT(data: Data([0x45, 129]))
+        _ = host.OP_SERINIT(data: Data([0x45, 130]))
+        let input = "hello\r\u{03}\u{04}\u{08}\u{09}\u{0A}\u{0C}\u{1B}\u{7F}"
+        host.sendVirtualWindowInput(input, channel: 129)
+        XCTAssertEqual(host.virtualSerialInput[129], Data(input.utf8))
+        host.sendVirtualWindowInput("a\r\nbé", channel: 130)
+        XCTAssertEqual(host.virtualSerialInput[130], Data("a\rb".utf8))
+        host.sendVirtualWindowInput("ignored", channel: 1)
+        XCTAssertNil(host.virtualSerialInput[1])
+    }
+
+    @MainActor
     func testSerialRejectsInvalidBaudWithoutOpeningDevice() throws {
         let server = DriveWireServer(serialPort: "not-a-port", baud: Int.max)
         try server.start()

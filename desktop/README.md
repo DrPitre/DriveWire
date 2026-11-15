@@ -1,4 +1,4 @@
-# DriveWire Desktop
+# DriveWire Swift Server
 
 A wxWidgets desktop application for Windows, Linux and macOS, using the same
 Swift DriveWire protocol engine as the native Mac app. The existing SwiftUI
@@ -12,7 +12,9 @@ application and its Xcode project remain supported and separate.
 - Mount four disk images, save guest changes, Save As, eject.
   Changed disks are protected against accidental replacement or shutdown.
 - Live connection and traffic counters, virtual serial channel status.
-- View virtual windows and send a line of input to a selected window.
+- Interactive virtual windows with direct keystrokes, control keys, copy/paste,
+  and a blinking block cursor. Newly opened windows are selected and focused;
+  guest-closed windows disappear.
 - Printer text preview and export, bounded live log and log export.
 - Remember settings, import/export JSON configurations, recover a crashed backend.
 
@@ -60,7 +62,7 @@ cmake --build desktop/build --config Release --parallel 4
 
 `DRIVEWIRE_FETCH_WX=ON` builds pinned wxWidgets 3.2.8 statically on any platform.
 This avoids requiring a wxWidgets DLL installation on Windows. macOS produces
-`DriveWire Desktop.app`; other platforms produce `DriveWire Desktop[.exe]`.
+`DriveWire Swift Server.app`; other platforms produce `DriveWire Swift Server[.exe]`.
 The backend is placed next to the UI executable. `--server PATH` selects a
 different backend without shell quoting or PATH lookup.
 
@@ -101,7 +103,7 @@ python3 scripts/test-serial-server.py /path/to/drivewire-server
 python3 scripts/test-desktop.py /path/to/gui-executable --server /path/to/drivewire-server
 ```
 
-On Linux prefix the second command with `xvfb-run -a`. The desktop test creates
+On Linux prefix the desktop command with `xvfb-run -a`. The desktop test creates
 an isolated configuration and temporary image, exercises real Start/Save/Stop
 controls, sends DWINIT and a sector write over TCP, checks persisted bytes,
 and shuts down the child gracefully. It also checks Unicode paths. No user
@@ -125,7 +127,7 @@ The control interface is a private pipe, never a listening network service.
 ## Packaged builds
 
 CI artifacts contain a ZIP (Windows/macOS) or tar.gz (Linux). Extract it and
-launch `DriveWire Desktop.exe`, `DriveWire Desktop.app`, or `./drivewire`
+launch `DriveWire Swift Server.exe`, `DriveWire Swift Server.app`, or `./drivewire`
 respectively. The server is included. macOS bundles are signed ad hoc for local
 testing, not notarized releases. Windows needs the Microsoft C++ runtime.
 Linux needs GTK3/wxWidgets 3.2 runtime libraries (`libwxgtk3.2-1t64` on Ubuntu
