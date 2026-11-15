@@ -700,6 +700,7 @@ extension DriveWireHost {
 
         let channel = UInt8(portNumber)
         virtualSerialTCPConnections[channel]?.close()
+        pendingClosedVirtualSerialChannels.removeAll { $0 == channel }
         openVirtualSerialChannels.insert(channel)
         refreshVirtualSerialChannelStatuses()
 
