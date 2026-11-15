@@ -1373,7 +1373,7 @@ OP_SERWRITE              |  195  (0xC3)  | C+128 | DW 4.0.0 |
 OP_SERSETSTAT         |  196  (0xC4)  | D+128 | DW 4.0.0 |
 OP_SERTERM              | 197   (0xC5)  | E+128 | DW 4.0.5 |
 OP_READEX                | 210   (0xD2)  | R+128  | DW 3 |
-OP_RFM                       | 214   (0xD6)  |  V+128 | N/A |
+[OP_RFM](docs/rfm-protocol.md)                       | 214   (0xD6)  |  V+128 | N/A |
 OP_230K230K               | 230   (0xE6)  |            |  DW 4.0.0  | For 230k mode
 OP_REREADEX            | 242   (0xF2)  | r+128   | DW 3 |
 OP_RESET3                 | 248   (0xF8)  |            | DW 4.0.0 |
