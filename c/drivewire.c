@@ -117,7 +117,6 @@ int loadPreferences(struct dwTransferData *datapack)
 int savePreferences(struct dwTransferData *datapack)
 {
 	FILE	*pf;
-	char	buffer[81];
 	int	i;
 
 
@@ -192,7 +191,6 @@ void logHeader(void)
 
 int main(int argc, char **argv)
 {
-    int i;
     pthread_t thread_id;
     int quitter = 0;
 
