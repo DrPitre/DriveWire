@@ -11,7 +11,10 @@ final class DriveWireTCPServerDriver: DriveWireDelegate {
     let host = DriveWireHost()
 
     private let port: UInt16
-    private let queue = DispatchQueue(label: "DriveWireTCPServer")
+    // Match the host's virtual-serial callbacks and watchdog: all mutate
+    // shared protocol state on the main queue. A private callback queue here
+    // races those dictionaries while processing guest traffic.
+    private let queue = DispatchQueue.main
     private var listener: NWListener?
     private var connection: NWConnection?
 

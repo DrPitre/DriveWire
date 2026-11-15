@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		68DD10012026072800000002 /* DriveWireTCPServerDriverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68DD10012026072800000001 /* DriveWireTCPServerDriverTests.swift */; };
+		68DD10012026072800000003 /* DriveWireTCPServerDriver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 688B098C300A61B9002F6FA5 /* DriveWireTCPServerDriver.swift */; };
 		68003A292E22901800DA741F /* ArgumentParser in Frameworks */ = {isa = PBXBuildFile; productRef = 68003A282E22901800DA741F /* ArgumentParser */; };
 		6809D2E02B25410F0092A869 /* DriveWire.docc in Sources */ = {isa = PBXBuildFile; fileRef = 686E2FC42AC8A5B200F94CFD /* DriveWire.docc */; };
 		6818E5A12AC9D5E200A6C300 /* DriveWireHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6818E5A02AC9D5E200A6C300 /* DriveWireHost.swift */; };
@@ -87,6 +89,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		68DD10012026072800000001 /* DriveWireTCPServerDriverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveWireTCPServerDriverTests.swift; sourceTree = "<group>"; };
 		68015B842AD470CB00AB717A /* drivewire-cli.xctestplan */ = {isa = PBXFileReference; lastKnownFileType = text; path = "drivewire-cli.xctestplan"; sourceTree = "<group>"; };
 		6818E5A02AC9D5E200A6C300 /* DriveWireHost.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = DriveWireHost.swift; sourceTree = "<group>"; };
 		6837432F2E001C03003BCE8D /* DriveWireTCPDriver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DriveWireTCPDriver.swift; sourceTree = "<group>"; };
@@ -203,6 +206,7 @@
 			isa = PBXGroup;
 			children = (
 				68A4A0E62AC723670041F161 /* DriveWireTests.swift */,
+				68DD10012026072800000001 /* DriveWireTCPServerDriverTests.swift */,
 			);
 			path = DriveWireTests;
 			sourceTree = "<group>";
@@ -424,6 +428,8 @@
 				688B09B4300AF8EC002F6FA5 /* DriveWireHost+Printer.swift in Sources */,
 				688B09AC300AF5EF002F6FA5 /* DriveWireHost+DriveOps.swift in Sources */,
 				68A4A0E72AC723670041F161 /* DriveWireTests.swift in Sources */,
+				68DD10012026072800000002 /* DriveWireTCPServerDriverTests.swift in Sources */,
+				68DD10012026072800000003 /* DriveWireTCPServerDriver.swift in Sources */,
 				688B099C300AF5EC002F6FA5 /* DriveWireHost+Logging.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
