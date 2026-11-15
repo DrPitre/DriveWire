@@ -349,6 +349,70 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         }
     }
 
+    func testRFMReadDirIterationMetadataAndRewind() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        let parent = folder.appendingPathComponent("y0/data")
+        try Data([1, 2, 3]).write(to: parent.appendingPathComponent("one"))
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: Data([0,0,0]), mode: 0x81), Data([0]))
+        // Use a deterministic snapshot with deleted, dot and maximum-name entries.
+        let id = host!.lsnForPath(parent.appendingPathComponent("one").path)
+        let make = DriveWireHost.RFMPathDescriptor.makeOS9DirEntry
+        host!.rfmPaths[1]?.fileContents = make(".", 1) + make("..", 1)
+            + Data(repeating: 0, count: 32) + make("one", id) + make(String(repeating: "x", count: 29), id)
+        func next(_ count: Int) -> Data {
+            rfmRequest(11, [1, 0x2E, UInt8(count >> 8), UInt8(count & 255)])
+        }
+        let first = next(32)
+        XCTAssertEqual(first, Data([0,0]) + make("one", id))
+        XCTAssertEqual(host!.rfmPaths[1]?.filePosition, 128)
+        let extended = next(45)
+        XCTAssertEqual(extended.count, 47)
+        XCTAssertEqual(Array(extended[43..<47]), [0,0,0,3])
+        XCTAssertEqual(extended[30], UInt8(ascii: "x") | 0x80)
+        XCTAssertEqual(next(32), Data([0,211]))
+        XCTAssertEqual(next(45), Data([0,211]))
+        host!.rfmPaths[1]?.filePosition = 0
+        XCTAssertEqual(next(32), first)
+        // Names need no child metadata lookup; failed extended reads are retryable.
+        try FileManager.default.removeItem(at: parent.appendingPathComponent("one"))
+        host!.rfmPaths[1]?.filePosition = 96
+        XCTAssertEqual(next(45), Data([0,216]))
+        XCTAssertEqual(host!.rfmPaths[1]?.filePosition, 96)
+        XCTAssertEqual(next(32), first)
+        XCTAssertEqual(next(33), Data([0,215]))
+        host!.rfmPaths[1]?.filePosition = 1
+        XCTAssertEqual(next(32), Data([0,215]))
+        host!.rfmPaths[1]?.mode = 0x82
+        XCTAssertEqual(rfmRequest(11, [1,0x2E]), Data([214]))
+        XCTAssertEqual(rfmRequest(11, [99,0x2E]), Data([201]))
+        XCTAssertEqual(rfmRequest(12, [1,0xFE]), Data([208]))
+    }
+
+    func testRFMReadDirFragmentedRequestAndReceiveBoundary() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: Data([0,0,0]), mode: 0x81), Data([0]))
+        host!.rfmPaths[1]?.fileContents = DriveWireHost.RFMPathDescriptor.makeOS9DirEntry("one", lsn: 1)
+        responseData.removeAll()
+        readDirBoundaryCount = 0
+        for byte: UInt8 in [0xD6, 11, 1, 0x2E, 0] {
+            var fragment = Data([byte]); host!.send(data: &fragment)
+        }
+        XCTAssertEqual(responseData, Data([0]), "Only ready is sent before complete count")
+        var last = Data([32]); host!.send(data: &last)
+        XCTAssertEqual(responseData.count, 34)
+        XCTAssertEqual(readDirBoundaryCount, 1)
+        XCTAssertEqual(rfmRequest(11, [1,0x2E,0,32]), Data([0,211]))
+        XCTAssertEqual(readDirBoundaryCount, 1, "EOF has no record payload")
+    }
+
+    var readDirBoundaryCount = 0
+    func dataAvailableAfterReceiveBoundary(host: DriveWireHost, data: Data) {
+        readDirBoundaryCount += 1
+        dataAvailable(host: host, data: data)
+    }
+
     func testRFMRenameUsesParentPermissionsAndPreservesDirectoryCookies() throws {
         let folder = try rfmFolder()
         defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
