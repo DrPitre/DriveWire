@@ -7,7 +7,7 @@ cookies and device-root parent traversal.
 
 ## Build and run
 
-Install Swift 6.4.2 (or a compatible newer toolchain). On Windows, first run
+Install Swift 6.4.2 (or a compatible newer toolchain). On Windows, use the Swift toolchain matching your machine (x64 or Arm64). First run
 `python scripts/prepare-swift.py` from the repository root; it resolves
 dependencies and applies the pinned SwiftNIO recycled-socket-handle fix. Then
 from this directory:
@@ -87,7 +87,8 @@ and RFM. Additional TCP integration tests cover fragmented/coalesced packets,
 connection replacement, retired handles/cookies, listen failures and virtual
 serial connect/listen/join. Tests use temporary fixtures, not user disk images.
 
-The GitHub Actions workflow builds and tests on Windows, macOS and Linux. Its
+The GitHub Actions workflow builds and tests on Windows x64, Windows Arm64,
+macOS and Linux. Windows Arm64 tests execute on a native Arm64 runner. Its
 Windows artifact bundles the Swift runtime DLLs and runs the external TCP test
 with the toolchain removed from the child's PATH, checking deployment as well
 as compilation. Windows still requires the Microsoft C/C++ runtime.
