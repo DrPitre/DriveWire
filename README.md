@@ -2,6 +2,11 @@
 
 This is the official repository for DriveWire.
 
+**The future of DriveWire is the cross-platform Swift server**, with one shared
+engine for Windows, Linux, and macOS. New users should start with
+[DriveWire Swift Server](desktop/README.md) or its
+[command-line interface](swift/PORTABLE.md).
+
 DriveWire defines a standard for guest computers to access input/output resources on a host computer. This model gives the guest computer the appearance that it is directly connected to a large storage device, when in fact, connectivity is provided by a serial connection or TCP transport.
 
 There are distinct advantages in utilizing DriveWire as a storage medium:
@@ -14,10 +19,10 @@ The essence of communication between the guest and host is a documented set of u
 
 [The DriveWire Specification](https://github.com/boisy/DriveWire/wiki/DriveWire-Specification) provides the information needed to implement both a host and a guest.
 
-## Cross-platform Swift server and desktop
+## The future: cross-platform Swift
 
-**DriveWire Swift Server runs on Windows, Linux, and macOS.** The portable
-Swift protocol engine is available both as a command-line server and through
+**DriveWire Swift Server is the focus of future development across Windows,
+Linux, and macOS.** The shared Swift protocol engine is available both as a command-line server and through
 a wxWidgets desktop application. It supports physical serial connections and
 TCP/Becker connections for compatible guest systems and emulators.
 
@@ -35,7 +40,8 @@ logging. It shares the Swift engine with the separate native macOS SwiftUI app.
 
 ## Host platforms
 
-This repository has DriveWire host implementations for supported platforms:
+The cross-platform Swift server is the recommended starting point. The native
+Mac apps and earlier host implementations remain available in this repository:
 
 - Windows, Linux, and macOS: [Swift server](swift/PORTABLE.md) and
   [wxWidgets desktop](desktop/README.md)
