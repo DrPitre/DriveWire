@@ -14,8 +14,7 @@ import Network
 /// The host is not thread-safe and does not pretend to be: it takes guest input
 /// on whatever queue the driver calls `send(data:)` from, while its own
 /// virtual-serial paths append input and refresh channel status via
-/// `DispatchQueue.main.async`, and its idle `watchdog` is a `Timer` that needs a
-/// running run loop. `DriveWireTCPDriver` already hops to the main queue before
+/// `DispatchQueue.main.async`, and its idle watchdog also runs on the main queue. `DriveWireTCPDriver` already hops to the main queue before
 /// calling `send(data:)`. A driver that does not leaves two queues reading and
 /// mutating the same dictionaries: Thread Sanitizer flags it, and in practice
 /// `drivewire-cli` segfaults inside `pollVirtualSerial()`.
@@ -79,7 +78,7 @@ final class DriveWireTCPServerDriverTests: XCTestCase {
                        + "instead of the main queue. DriveWireHost's state is also "
                        + "mutated from the main queue (virtual-serial input, "
                        + "channel status), so anything else races it, and its "
-                       + "watchdog Timer needs a running run loop.")
+                       + "watchdog also runs on the main queue.")
     }
 
     /// Records which queue `DriveWireHost` called its delegate back on.

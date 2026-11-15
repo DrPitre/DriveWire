@@ -68,3 +68,11 @@ fastlane/test_output
 # https://github.com/johnno1962/injectionforxcode
 
 iOSInjectionProject/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Portable desktop distributions
+desktop/dist/
+desktop/build-*/

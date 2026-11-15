@@ -11,16 +11,9 @@ final class DriveWireTCPServerDriver: DriveWireDelegate {
     let host = DriveWireHost()
 
     private let port: UInt16
-    // DriveWireHost is confined to the main queue: accepted `tcp listen`
-    // connections append guest input and refresh channel status via
-    // DispatchQueue.main, and its idle watchdog is a Timer, which needs a
-    // running run loop. Deliver every Network callback on that same queue so
-    // guest traffic reaches the host -- and this driver's own `connection`
-    // property -- on one serial queue. DriveWireTCPDriver hops to the main
-    // queue before host.send(data:) for the same reason; a private queue here
-    // races the host's dictionaries, and drivewire-cli segfaults inside
-    // pollVirtualSerial(). The CLI's RunLoop.current.run() services the main
-    // queue, so callbacks are always delivered.
+    // Match the host's virtual-serial callbacks and watchdog: all mutate
+    // shared protocol state on the main queue. A private callback queue here
+    // races those dictionaries while processing guest traffic.
     private let queue = DispatchQueue.main
     private var listener: NWListener?
     private var connection: NWConnection?

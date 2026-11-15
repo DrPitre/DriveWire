@@ -82,9 +82,9 @@ extension DriveWireHost {
                     localFile = needsWrite
                         ? try FileHandle(forUpdating: url)
                         : try FileHandle(forReadingFrom: url)
-                    if let f = localFile {
-                        fileContents = f.availableData
-                    }
+                    // Regular files are read through their live handle. Only directories
+                    // use fileContents, which holds their synthesized OS-9 records.
+                    attributes = try FileManager.default.attributesOfItem(atPath: localPathname)
                 }
             } catch {
                 return 216
@@ -107,6 +107,23 @@ extension DriveWireHost {
 
         // Expand OS-9 multi-dot path components: N dots = N-1 parent-dir references.
         static func expandMultiDots(_ path: String) -> String {
+            if path.hasPrefix("/") {
+                let components = path.split(separator: "/").map(String.init)
+                guard let device = components.first else { return "/" }
+                var resolved = [device]
+                // An OS-9 device root's parent is itself, never the host's
+                // export root. CoWin loads ../CMDS/grfdrv before SysGo runs.
+                for component in components.dropFirst() {
+                    if component.allSatisfy({ $0 == "." }) {
+                        for _ in 0..<max(0, component.count - 1) {
+                            if resolved.count > 1 { resolved.removeLast() }
+                        }
+                    } else {
+                        resolved.append(component)
+                    }
+                }
+                return "/" + resolved.joined(separator: "/")
+            }
             return path.components(separatedBy: "/").map { c in
                 guard !c.isEmpty, c.allSatisfy({ $0 == "." }), c.count >= 2 else { return c }
                 return Array(repeating: "..", count: c.count - 1).joined(separator: "/")
@@ -145,7 +162,7 @@ extension DriveWireHost {
             // FD.LNK (byte 8): link count
             fd[8] = 1
             // FD.SIZ (bytes 9-12): file size, big-endian
-            let sz = attributes[.size] as? Int ?? 0
+            let sz = localFile != nil ? byteCount : (attributes[.size] as? Int ?? 0)
             fd[9]  = UInt8((sz >> 24) & 0xFF)
             fd[10] = UInt8((sz >> 16) & 0xFF)
             fd[11] = UInt8((sz >> 8) & 0xFF)
@@ -161,20 +178,44 @@ extension DriveWireHost {
             return Data(fd.prefix(count))
         }
 
-        mutating func readLineFromFile(maximumCount: Int) -> (UInt8, Data) {
-            guard filePosition < fileContents.count else { return (211, Data()) }
-            var data = Data()
-            while filePosition < fileContents.count && data.count < maximumCount {
-                var byte = fileContents[filePosition]
-                filePosition += 1
-                if byte == 0x0A { byte = 0x0D }
-                data.append(byte)
-                if byte == 0x0D { break }
+        /// Logical size without changing the RFM cursor. Handle offsets are always
+        /// set from filePosition before I/O, so a size query can safely seek to EOF.
+        var byteCount: Int {
+            if let file = localFile {
+                if let length = try? file.seekToEnd(), let count = Int(exactly: length) {
+                    return count
+                }
+                return attributes[.size] as? Int ?? 0
             }
-            return (0, data)
+            return fileContents.count
+        }
+
+        mutating func readLineFromFile(maximumCount: Int) -> (UInt8, Data) {
+            let (error, bytes) = readFromFile(maximumCount: maximumCount)
+            guard error == 0 else { return (error, bytes) }
+            guard let terminator = bytes.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) else {
+                return (0, bytes)
+            }
+            let consumed = bytes.distance(from: bytes.startIndex, to: terminator) + 1
+            filePosition -= bytes.count - consumed
+            var line = Data(bytes.prefix(consumed))
+            line[line.count - 1] = 0x0D
+            return (0, line)
         }
 
         mutating func readFromFile(maximumCount: Int) -> (UInt8, Data) {
+            guard maximumCount > 0 else { return (0, Data()) }
+            if let file = localFile {
+                do {
+                    try file.seek(toOffset: UInt64(filePosition))
+                    let bytes = try file.read(upToCount: maximumCount) ?? Data()
+                    guard !bytes.isEmpty else { return (211, Data()) }
+                    filePosition += bytes.count
+                    return (0, bytes)
+                } catch {
+                    return (245, Data())  // E$Read
+                }
+            }
             guard filePosition < fileContents.count else { return (211, Data()) }
             let end = min(filePosition + maximumCount, fileContents.count)
             let data = Data(fileContents[filePosition..<end])
@@ -198,11 +239,18 @@ extension DriveWireHost {
             } else {
                 bytesToWrite = data
             }
-            file.seek(toFileOffset: UInt64(filePosition))
-            file.write(bytesToWrite)
-            file.synchronizeFile()
-            filePosition += bytesToWrite.count
-            return 0
+            guard !bytesToWrite.isEmpty else { return 0 }
+            do {
+                try file.seek(toOffset: UInt64(filePosition))
+                try file.write(contentsOf: bytesToWrite)
+                try file.synchronize()
+                filePosition += bytesToWrite.count
+                attributes[.size] = byteCount
+                attributes[.modificationDate] = Date()
+                return 0
+            } catch {
+                return 246  // E$Write
+            }
         }
     }
 
@@ -229,6 +277,8 @@ extension DriveWireHost {
             let rfmSubOp = data[1]
             currentSubTransaction = rfmSubOp
             switch currentSubTransaction {
+            case 0x11...0x15:
+                processor = { self.rfmContextPath(data: $0, operation: rfmSubOp & 0x0F) }
             case DWRFMTransaction.OP_RFM_CREATE.rawValue:
                 processor = OPRFMCREATE
             case DWRFMTransaction.OP_RFM_OPEN.rawValue:
@@ -236,7 +286,7 @@ extension DriveWireHost {
             case DWRFMTransaction.OP_RFM_MAKDIR.rawValue:
                 processor = OPRFMMAKDIR
             case DWRFMTransaction.OP_RFM_CHGDIR.rawValue:
-                processor = OPRFMCHGDIR
+                processor = { self.OPRFMCHGDIR(data: $0) }
             case DWRFMTransaction.OP_RFM_DELETE.rawValue:
                 processor = OPRFMDELETE
             case DWRFMTransaction.OP_RFM_SEEK.rawValue:
@@ -264,11 +314,50 @@ extension DriveWireHost {
         return result
     }
 
+    // Context protocol: path, PID, immutable directory LSN (24-bit), mode,
+    // CR-terminated pathname. No PID lookup is used, including for stale cookies.
+    func rfmContextPath(data: Data, operation: UInt8) -> Int {
+        guard data.count >= 6, let cr = data.dropFirst(6).firstIndex(of: 13) else { return 0 }
+        let cookie = Int(data[2]) << 16 | Int(data[3]) << 8 | Int(data[4])
+        let name = String(bytes: data[6..<cr].map { $0 & 0x7F }, encoding: .ascii) ?? ""
+        var pathname = name
+        if !name.hasPrefix("/"), cookie != 0 {
+            guard let directory = rfmLSNToPath[cookie] else {
+                delegate?.dataAvailable(host: self, data: Data([216]))
+                resetState()
+                return cr + 1
+            }
+            let root = URL(fileURLWithPath: rfmRootPath).standardized.path
+            guard directory.hasPrefix(root + "/") else {
+                delegate?.dataAvailable(host: self, data: Data([216]))
+                resetState()
+                return cr + 1
+            }
+            pathname = String(directory.dropFirst(root.count)) + "/" + name
+        } else if !name.hasPrefix("/") {
+            // Zero has no directory; never fall back to a mutable PID context.
+            delegate?.dataAvailable(host: self, data: Data([216]))
+            resetState()
+            return cr + 1
+        }
+        let header = Data([data[0], data[1], 0, data[5]])
+        switch operation {
+        case 1: _ = OPRFMCREATE(data: header)
+        case 2: _ = OPRFMOPEN(data: header)
+        case 3: _ = OPRFMMAKDIR(data: header)
+        case 4: _ = OPRFMCHGDIR(data: header, contextReply: true)
+        case 5: _ = OPRFMDELETE(data: header)
+        default: preconditionFailure("invalid context operation")
+        }
+        _ = processor?(Data(pathname.utf8) + Data([13]))
+        return cr + 1
+    }
+
     func OPRFMCREATE(data : Data) -> Int {
         return rfmOpen(data: data, shouldCreate: true)
     }
 
-    // Receives: path#(1) + processID(1) + mode(1), then pathname terminated by CR ($0D).
+    // Receives: path#(1), PID(1), directory-owner/parent PID(1), mode(1), then a CR-terminated pathname.
     // Sends back: 1-byte error code.
     func OPRFMOPEN(data : Data) -> Int {
         return rfmOpen(data: data, shouldCreate: false)
@@ -299,7 +388,7 @@ extension DriveWireHost {
             let pid = rfmPaths[capturedPathNumber]?.processID ?? 0
             let ppid = rfmPaths[capturedPathNumber]?.parentProcessID ?? 0
             let mode = rfmPaths[capturedPathNumber]?.mode ?? 0
-            let isExec = (mode & 0x04) != 0
+            let isExec = (mode & 0x24) != 0
             let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
                                               processID: pid, parentProcessID: ppid, isExec: isExec)
             rfmPaths[capturedPathNumber]?.pathname = pathname
@@ -315,8 +404,8 @@ extension DriveWireHost {
             delegate?.dataAvailable(host: self, data: Data([errorCode]))
             let dirLabel = isExec ? "execDir" : "dataDir"
             let dirVal = isExec
-                ? (rfmCurrentExecDir[pid] ?? rfmCurrentExecDir[ppid] ?? "none")
-                : (rfmCurrentDir[pid] ?? rfmCurrentDir[ppid] ?? "none")
+                ? (rfmCurrentExecDir[ppid] ?? rfmCurrentExecDir[pid] ?? "none")
+                : (rfmCurrentDir[ppid] ?? rfmCurrentDir[pid] ?? "none")
             let msg = "OP_RFM_\(shouldCreate ? "CREATE" : "OPEN")(path#\(capturedPathNumber), pid=\(pid), ppid=\(ppid), mode=0x\(String(mode, radix: 16)), \(dirLabel)=\(dirVal), resolved=\(pathname)) -> \(errorCode)"
             log += msg + "\n"
             print(msg)
@@ -326,18 +415,20 @@ extension DriveWireHost {
     }
 
     func resolveRFMPathname(_ pathname: String, processID: Int, parentProcessID: Int, isExec: Bool = false) -> String {
-        guard !(pathname as NSString).isAbsolutePath else { return pathname }
+        guard !(pathname as NSString).isAbsolutePath else { return expandOS9MultiDots(pathname) }
         let dirMap = isExec ? rfmCurrentExecDir : rfmCurrentDir
         let base: String
-        if let cwd = dirMap[processID] {
+        // For relative requests the client puts the directory-owner PID in the
+        // parent field. It is authoritative even if this request's PID was reused.
+        if let cwd = dirMap[parentProcessID] {
             base = cwd
-        } else if let cwd = dirMap[parentProcessID] {
+        } else if let cwd = dirMap[processID] {
             base = cwd
         } else {
             return pathname
         }
         if pathname == "." { return base }
-        return (base as NSString).appendingPathComponent(pathname)
+        return expandOS9MultiDots((base as NSString).appendingPathComponent(pathname))
     }
 
     // Expand OS-9 multi-dot path components: N dots = N-1 parent-dir references.
@@ -437,18 +528,49 @@ extension DriveWireHost {
         case 0x2A: return "SS.Close"
         case 0x2B: return "SS.HngUp"
         case 0x2C: return "SS.FSig"
+        case 0x2D: return "SS.Rename"
+        case 0x2E: return "SS.ReadDir"
         default:   return hexDisplay(code)
         }
     }
 
     // Returns a stable LSN for the given absolute host path, allocating a new one if needed.
     func lsnForPath(_ path: String) -> Int {
-        if let existing = rfmLSNByPath[path] { return existing }
+        // Match the host volume's name semantics without resolving symlinks:
+        // DD/SYS may point outside DD, but its guest parent must remain DD.
+        let url = URL(fileURLWithPath: path).standardized
+        let key = rfmIdentityPath(url)
+        if let existing = rfmLSNByPath[key] { return existing }
         let lsn = rfmLSNCounter
-        rfmLSNByPath[path] = lsn
+        rfmLSNByPath[key] = lsn
         rfmLSNToPath[lsn] = path
         rfmLSNCounter += 1
         return lsn
+    }
+
+    // Recover the spelling stored by the filesystem, component by component.
+    // Foundation's volume case-sensitivity resource is unavailable on some
+    // platforms. Enumeration also respects Windows per-directory sensitivity.
+    // Only fold a name when the requested spelling actually opens on the host;
+    // exact entries always win on case-sensitive filesystems.
+    private func rfmIdentityPath(_ url: URL) -> String {
+        // Walk a finite component list: deletingLastPathComponent at a volume
+        // root does not terminate consistently across Foundation versions.
+        let components = url.pathComponents
+        guard let root = components.first else { return url.path }
+        var current = URL(fileURLWithPath: root, isDirectory: true)
+        let fm = FileManager.default
+        for requested in components.dropFirst() {
+            var stored = requested
+            let candidate = current.appendingPathComponent(requested)
+            if let names = try? fm.contentsOfDirectory(atPath: current.path),
+               !names.contains(requested), fm.fileExists(atPath: candidate.path),
+               let match = names.first(where: { $0.caseInsensitiveCompare(requested) == .orderedSame }) {
+                stored = match
+            }
+            current.appendPathComponent(stored)
+        }
+        return current.path
     }
 
     // Builds OS-9 directory contents for the open directory descriptor, registering each entry in the LSN map.
@@ -499,7 +621,7 @@ extension DriveWireHost {
         func OPRFMGETMKDIRPATH(data: Data) -> Int {
             guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
             let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
-            let isExec = (capturedMode & 0x04) != 0
+            let isExec = (capturedMode & 0x24) != 0
             let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
                                               processID: capturedProcessID,
                                               parentProcessID: capturedParentProcessID,
@@ -526,7 +648,7 @@ extension DriveWireHost {
         }
     }
 
-    func OPRFMCHGDIR(data: Data) -> Int {
+    func OPRFMCHGDIR(data: Data, contextReply: Bool = false) -> Int {
         var result = 0
         let expectedCount = 4
         var capturedPathNumber = 0
@@ -548,13 +670,14 @@ extension DriveWireHost {
         func OPRFMGETCHGDIRPATH(data: Data) -> Int {
             guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
             let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
-            let isExec = (capturedMode & 0x04) != 0
+            let isExec = (capturedMode & 0x24) != 0
             let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
                                               processID: capturedProcessID,
                                               parentProcessID: capturedParentProcessID,
                                               isExec: isExec)
             let expandedPathname = expandOS9MultiDots(pathname)
             var errorCode: UInt8 = 216
+            var cookie = 0
             if !expandedPathname.isEmpty && !expandedPathname.contains("\0") {
                 let localPath = (expandedPathname as NSString).isAbsolutePath
                     ? rfmRootPath + expandedPathname : rfmRootPath + "/" + expandedPathname
@@ -568,21 +691,16 @@ extension DriveWireHost {
                 if FileManager.default.fileExists(atPath: effectiveResolved, isDirectory: &isDir), isDir.boolValue {
                     var relativePath = String(effectiveResolved.dropFirst(normalizedRoot.count))
                     if relativePath.isEmpty { relativePath = deviceRoot }
-                    // Only store this process's CWD when it differs from the parent's.
-                    // If it matches, remove any stale entry so the parent lookup always wins.
-                    if isExec {
-                        if relativePath == rfmCurrentExecDir[capturedParentProcessID] {
-                            rfmCurrentExecDir.removeValue(forKey: capturedProcessID)
-                        } else {
-                            rfmCurrentExecDir[capturedProcessID] = relativePath
-                        }
-                    } else {
-                        if relativePath == rfmCurrentDir[capturedParentProcessID] {
-                            rfmCurrentDir.removeValue(forKey: capturedProcessID)
-                        } else {
-                            rfmCurrentDir[capturedProcessID] = relativePath
-                        }
+                    // A successful change establishes this PID's own context, even
+                    // when the owner is itself or the path equals its parent's.
+                    // Removing that entry would lose chd . and inherited snapshots.
+                    if capturedMode & 0x1B != 0 {
+                        rfmCurrentDir[capturedProcessID] = relativePath
                     }
+                    if capturedMode & 0x24 != 0 {
+                        rfmCurrentExecDir[capturedProcessID] = relativePath
+                    }
+                    cookie = lsnForPath(effectiveResolved)
                     errorCode = 0
                     let dirLabel = isExec ? "execDir" : "dataDir"
                     let line = "OP_RFM_CHGDIR(path#\(capturedPathNumber), pid=\(capturedProcessID), ppid=\(capturedParentProcessID), \(dirLabel)=\(relativePath)) -> 0\n"
@@ -596,6 +714,10 @@ extension DriveWireHost {
                 }
             }
             delegate?.dataAvailable(host: self, data: Data([errorCode]))
+            if contextReply && errorCode == 0 {
+                delegate?.dataAvailableAfterReceiveBoundary(host: self, data: Data([
+                    UInt8((cookie >> 16) & 255), UInt8((cookie >> 8) & 255), UInt8(cookie & 255)]))
+            }
             resetState()
             return crOffset - data.startIndex + 1
         }
@@ -623,7 +745,7 @@ extension DriveWireHost {
         func OPRFMGETDELETEPATH(data: Data) -> Int {
             guard let crOffset = data.firstIndex(of: 0x0D) else { return 0 }
             let pathBytes = data[data.startIndex..<crOffset].map { $0 & 0x7F }
-            let isExec = (capturedMode & 0x04) != 0
+            let isExec = (capturedMode & 0x24) != 0
             let pathname = resolveRFMPathname(String(bytes: pathBytes, encoding: .ascii) ?? "",
                                               processID: capturedProcessID,
                                               parentProcessID: capturedParentProcessID,
@@ -707,7 +829,7 @@ extension DriveWireHost {
                     delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
                     if !lineData.isEmpty {
                         Thread.sleep(forTimeInterval: 0.002)
-                        delegate?.dataAvailable(host: self, data: lineData)
+                        delegate?.dataAvailableAfterReceiveBoundary(host: self, data: lineData)
                     }
                 }
             } else {
@@ -768,7 +890,7 @@ extension DriveWireHost {
                     delegate?.dataAvailable(host: self, data: Data([UInt8(lineData.count >> 8), UInt8(lineData.count & 0xFF)]))
                     if !lineData.isEmpty {
                         Thread.sleep(forTimeInterval: 0.002)
-                        delegate?.dataAvailable(host: self, data: lineData)
+                        delegate?.dataAvailableAfterReceiveBoundary(host: self, data: lineData)
                     }
                 }
             } else {
@@ -818,8 +940,18 @@ extension DriveWireHost {
             result = expectedCount
             log += "OP_RFM_GETSTT(path#\(capturedPathNumber), \(DriveWireHost.ssCodeName(statCode)))\n"
             print("OP_RFM_GETSTT(path#\(capturedPathNumber), \(DriveWireHost.ssCodeName(statCode)))")
-            if statCode == 0x02 {  // SS.Size — send 4-byte file size
-                let size = rfmPaths[capturedPathNumber]?.fileContents.count ?? 0
+            if statCode == 0x2E {  // SS.ReadDir: ready, count, status + portable record
+                let error: UInt8
+                if let path = rfmPaths[capturedPathNumber] {
+                    error = path.mode & 0x81 == 0x81 ? 0 : 214
+                } else { error = 201 }
+                delegate?.dataAvailable(host: self, data: Data([error]))
+                if error == 0 { processor = OPRFMREADDIR } else { resetState() }
+            } else if statCode == 0x2D {  // SS.Rename capability probe
+                delegate?.dataAvailable(host: self, data: Data([rfmPaths[capturedPathNumber] == nil ? 201 : 0]))
+                resetState()
+            } else if statCode == 0x02 {  // SS.Size — send 4-byte file size
+                let size = rfmPaths[capturedPathNumber]?.byteCount ?? 0
                 let msg = "OP_RFM_GETSTT(path#\(capturedPathNumber), SS.Size) -> \(size)"
                 log += msg + "\n"; print(msg)
                 delegate?.dataAvailable(host: self, data: Data([
@@ -835,7 +967,7 @@ extension DriveWireHost {
                     UInt8((pos >> 8) & 0xFF),  UInt8(pos & 0xFF)]))
                 resetState()
             } else if statCode == 0x06 {  // SS.EOF — send 0 (not EOF) or E$EOF (211)
-                let isEOF = rfmPaths[capturedPathNumber].map { $0.filePosition >= $0.fileContents.count } ?? true
+                let isEOF = rfmPaths[capturedPathNumber].map { $0.filePosition >= $0.byteCount } ?? true
                 let response: UInt8 = isEOF ? 211 : 0
                 let msg = "OP_RFM_GETSTT(path#\(capturedPathNumber), SS.EOF) -> \(isEOF ? "EOF" : "OK")"
                 log += msg + "\n"; print(msg)
@@ -851,6 +983,19 @@ extension DriveWireHost {
         }
 
         return result
+
+        func OPRFMREADDIR(data: Data) -> Int {
+            guard data.count >= 2 else { return 0 }
+            let count = Int(data[0]) << 8 | Int(data[1])
+            let (status, entry) = readRFMDirectory(pathNumber: capturedPathNumber, count: count)
+            delegate?.dataAvailable(host: self, data: Data([status]))
+            if status == 0 {
+                // The bitbanger starts a new DWRead after receiving the status.
+                delegate?.dataAvailableAfterReceiveBoundary(host: self, data: entry)
+            }
+            resetState()
+            return 2
+        }
 
         func OPRFMGETSSFD(data: Data) -> Int {
             guard data.count >= 2 else { return 0 }
@@ -882,10 +1027,111 @@ extension DriveWireHost {
         }
     }
 
-    // Receives nothing (rfm.asm sendit only sends the sub-op). No response.
+    // Iterate the existing directory snapshot. Its cookies stay private to the
+    // file manager; callers never use them to fetch a descriptor sector.
+    // Sharing the normal path position also preserves seek(0) rewind behavior.
+    func readRFMDirectory(pathNumber: Int, count: Int) -> (UInt8, Data) {
+        guard count == 32 || count == 45 else { return (215, Data()) }
+        guard var path = rfmPaths[pathNumber] else { return (201, Data()) }
+        guard path.mode & 0x81 == 0x81 else { return (214, Data()) }
+        guard path.filePosition >= 0 && path.filePosition % 32 == 0 else { return (215, Data()) }
+        while path.filePosition + 32 <= path.fileContents.count {
+            let start = path.filePosition
+            var entry = Data(path.fileContents[start..<start + 32])
+            if entry[0] == 0 || entry[0] == 0xAE || (entry[0] == 0x2E && entry[1] == 0xAE) {
+                path.filePosition += 32
+                rfmPaths[pathNumber] = path
+                continue
+            }
+            if count == 45 {
+                let id = Int(entry[29]) << 16 | Int(entry[30]) << 8 | Int(entry[31])
+                guard let hostPath = rfmLSNToPath[id] else { return (216, Data()) }
+                var child = RFMPathDescriptor()
+                do { child.attributes = try FileManager.default.attributesOfItem(atPath: hostPath) }
+                catch { return (216, Data()) }
+                entry.append(child.synthesizeFD(count: 13))
+            }
+            path.filePosition += 32
+            rfmPaths[pathNumber] = path
+            return (0, entry)
+        }
+        return (211, Data())
+    }
+
+    // SETSTT: path, status. SS.Rename ($2D) adds two zero-padded
+    // 30-byte basenames. Reply: one OS-9 status byte, including on failure.
     func OPRFMSETSTT(data: Data) -> Int {
-        print("OP_RFM_SETSTT")
+        guard data.count >= 2 else { return 0 }
+        let count = data[1] == 0x2D ? 62 : 2
+        guard data.count >= count else { return 0 }
+        let error: UInt8 = data[1] == 0x2D
+            ? renameRFMEntry(parent: Int(data[0]), record: Data(data[2..<62])) : 208
+        delegate?.dataAvailable(host: self, data: Data([error]))
         resetState()
+        return count
+    }
+
+    private func renameRFMEntry(parent: Int, record: Data) -> UInt8 {
+        func name(_ field: Data) -> String? {
+            guard let end = field.firstIndex(of: 0), end > field.startIndex,
+                  field.distance(from: field.startIndex, to: end) <= 29,
+                  field[end...].allSatisfy({ $0 == 0 }) else { return nil }
+            let bytes = field[..<end]
+            guard bytes.allSatisfy({ $0 >= 0x21 && $0 < 0x7F && ![47, 92, 58].contains($0) }),
+                  let value = String(data: bytes, encoding: .ascii), value != ".", value != ".." else { return nil }
+            return value
+        }
+        guard record.count == 60, let old = name(Data(record.prefix(30))),
+              let new = name(Data(record.suffix(30))) else { return 215 }
+        guard let descriptor = rfmPaths[parent] else { return 201 }
+        guard descriptor.mode & 0x82 == 0x82 else { return 214 }
+        let fm = FileManager.default
+        let directory = URL(fileURLWithPath: rfmRootPath + descriptor.pathname).standardized
+        let root = URL(fileURLWithPath: rfmRootPath).standardized.path
+        guard directory.path.hasPrefix(root + "/"), fm.isWritableFile(atPath: directory.path) else { return 214 }
+        let source = directory.appendingPathComponent(old)
+        let destination = directory.appendingPathComponent(new)
+        // attributesOfItem also recognizes a dangling symlink: rename its entry.
+        guard (try? fm.attributesOfItem(atPath: source.path)) != nil else { return 216 }
+        let oldKey = rfmIdentityPath(source)
+        if (try? fm.attributesOfItem(atPath: destination.path)) != nil,
+           rfmIdentityPath(destination) != oldKey { return 218 }
+        func moved(_ absolute: String) -> String? {
+            let key = rfmIdentityPath(URL(fileURLWithPath: absolute))
+            guard key == oldKey || key.hasPrefix(oldKey + "/") else { return nil }
+            return destination.path + key.dropFirst(oldKey.count)
+        }
+        // Resolve aliases before the old spelling disappears. Cookies keep their
+        // numeric identity, and open descendants and legacy CWDs follow the move.
+        let cookieMoves = rfmLSNToPath.compactMap { id, path in moved(path).map { (id, $0) } }
+        let pathMoves = rfmPaths.compactMap { id, path in
+            moved(rfmRootPath + path.pathname).map { (id, String($0.dropFirst(root.count))) }
+        }
+        let dataMoves = rfmCurrentDir.compactMap { id, path in
+            moved(rfmRootPath + path).map { (id, String($0.dropFirst(root.count))) }
+        }
+        let execMoves = rfmCurrentExecDir.compactMap { id, path in
+            moved(rfmRootPath + path).map { (id, String($0.dropFirst(root.count))) }
+        }
+        do {
+            if URL(fileURLWithPath: oldKey).lastPathComponent != new {
+                try fm.moveItem(at: source, to: destination)
+            }
+        } catch {
+            let error = error as NSError
+            if error.domain == NSCocoaErrorDomain && error.code == NSFileWriteFileExistsError { return 218 }
+            return 214
+        }
+        for (id, path) in cookieMoves { rfmLSNToPath[id] = path }
+        let movedIDs = Set(cookieMoves.map { $0.0 })
+        rfmLSNByPath = rfmLSNByPath.filter { !movedIDs.contains($0.value) }
+        for (id, path) in cookieMoves { rfmLSNByPath[rfmIdentityPath(URL(fileURLWithPath: path))] = id }
+        for (id, path) in pathMoves { rfmPaths[id]?.pathname = path }
+        for (id, path) in dataMoves { rfmCurrentDir[id] = path }
+        for (id, path) in execMoves { rfmCurrentExecDir[id] = path }
+        for (id, path) in Array(rfmPaths) where path.mode & 0x80 != 0 {
+            rfmPaths[id]?.fileContents = synthesizeDirectoryEntries(for: path)
+        }
         return 0
     }
 

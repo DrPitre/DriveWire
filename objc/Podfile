@@ -1,6 +1,6 @@
-source 'https://github.com/CocoaPods/Specs.git'
+source 'https://cdn.cocoapods.org/'
 
-platform :osx, '10.9'
+platform :osx, '12.0'
 
 workspace 'DriveWire.xcworkspace'
 
@@ -9,3 +9,12 @@ target 'DriveWire' do
 	pod 'Sparkle'
 	pod 'CocoaLumberjack'
 end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    target.build_configurations.each do |config|
+      config.build_settings['MACOSX_DEPLOYMENT_TARGET'] = '12.0'
+    end
+  end
+end
+

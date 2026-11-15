@@ -13,8 +13,209 @@ public struct DriveWirePrinterStatus: Equatable {
     public var flushedJobs: Int = 0
     public var lastFlushedAt: Date?
     public var lastOutputPath: String?
+    public var lastPrintedTo: String?
     public var previewText: String = ""
     public var lastError: String?
+}
+
+/// Where completed printer jobs go when the guest flushes the printer.
+public struct DriveWirePrinterOutputSettings: Equatable {
+    public enum Format: String, CaseIterable, Identifiable {
+        /// Line endings converted to the host's, control codes other than tab
+        /// and form feed dropped
+        case text
+        /// The guest's bytes unchanged, for printers that understand its codes
+        case raw
+
+        public var id: String { rawValue }
+    }
+
+    public var saveToFolder = false
+    public var folderPath = Self.defaultFolderPath
+    public var sendToPrinter = false
+    /// The CUPS destination name, or empty for the system default printer.
+    public var printerName = ""
+    public var format = Format.text
+
+    public static let defaultFolderPath = (NSHomeDirectory() as NSString).appendingPathComponent("Documents/DriveWire Printouts")
+
+    public enum Keys {
+        public static let saveToFolder = "printerSaveToFolder"
+        public static let folderPath = "printerFolderPath"
+        public static let sendToPrinter = "printerSendToPrinter"
+        public static let printerName = "printerName"
+        public static let format = "printerFormat"
+    }
+
+    public init() {
+    }
+
+    public init(userDefaults: UserDefaults) {
+        saveToFolder = userDefaults.bool(forKey: Keys.saveToFolder)
+        if let path = userDefaults.string(forKey: Keys.folderPath), !path.isEmpty {
+            folderPath = path
+        }
+        sendToPrinter = userDefaults.bool(forKey: Keys.sendToPrinter)
+        printerName = userDefaults.string(forKey: Keys.printerName) ?? ""
+        format = Format(rawValue: userDefaults.string(forKey: Keys.format) ?? "") ?? .text
+    }
+
+    public static func current() -> DriveWirePrinterOutputSettings {
+        DriveWirePrinterOutputSettings(userDefaults: .standard)
+    }
+}
+
+enum DriveWirePrintJob {
+    /// Converts guest printer bytes to host text: CR, LF and CR LF each end a
+    /// line, tab and form feed are kept, and other control codes are dropped.
+    static func plainText(from data: Data) -> Data {
+        var text = Data()
+        text.reserveCapacity(data.count)
+        var previousByteWasCarriageReturn = false
+        for byte in data {
+            switch byte {
+            case 0x0D:
+                text.append(0x0A)
+                previousByteWasCarriageReturn = true
+                continue
+            case 0x0A:
+                if !previousByteWasCarriageReturn {
+                    text.append(0x0A)
+                }
+            case 0x09, 0x0C, 0x20...0x7E:
+                text.append(byte)
+            default:
+                break
+            }
+            previousByteWasCarriageReturn = false
+        }
+        return text
+    }
+
+    /// Writes a job to a new, timestamped file in `folder`, creating the folder if needed.
+    static func save(_ data: Data, toFolder folder: String, format: DriveWirePrinterOutputSettings.Format, date: Date = Date()) throws -> URL {
+        let folderURL = URL(fileURLWithPath: folder, isDirectory: true)
+        try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        let stem = "DriveWire-print-" + formatter.string(from: date)
+        let fileExtension = format == .raw ? "prn" : "txt"
+
+        var url = folderURL.appendingPathComponent(stem).appendingPathExtension(fileExtension)
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: url.path) {
+            url = folderURL.appendingPathComponent("\(stem)-\(suffix)").appendingPathExtension(fileExtension)
+            suffix += 1
+        }
+
+        try data.write(to: url, options: .withoutOverwriting)
+        return url
+    }
+}
+
+/// Sends jobs to macOS printers through CUPS.
+enum DriveWireSystemPrinter {
+    static let lpPath = "/usr/bin/lp"
+    static let lpstatPath = "/usr/bin/lpstat"
+
+    /// The CUPS destination names, as `lpstat -e` lists them.
+    static func availablePrinters() -> [String] {
+        guard let output = try? run(lpstatPath, arguments: ["-e"]), output.status == 0 else {
+            return []
+        }
+        return String(decoding: output.standardOutput, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter { !$0.isEmpty }
+    }
+
+    /// The `lp` arguments for a job. Raw jobs bypass the CUPS filters so the
+    /// printer gets the guest's bytes; text jobs are laid out by CUPS.
+    static func lpArguments(printerName: String, format: DriveWirePrinterOutputSettings.Format) -> [String] {
+        var arguments: [String] = []
+        if !printerName.isEmpty {
+            arguments += ["-d", printerName]
+        }
+        arguments += ["-t", "DriveWire"]
+        switch format {
+        case .raw:
+            arguments += ["-o", "raw"]
+        case .text:
+            arguments += ["-o", "document-format=text/plain"]
+        }
+        return arguments
+    }
+
+    /// Submits a job without blocking the caller, then reports `lp`'s result on the main queue.
+    static func submit(_ data: Data, printerName: String, format: DriveWirePrinterOutputSettings.Format, completion: @escaping (Result<String, Error>) -> Void) {
+        let arguments = lpArguments(printerName: printerName, format: format)
+        DispatchQueue.global(qos: .utility).async {
+            let result: Result<String, Error>
+            do {
+                let output = try run(lpPath, arguments: arguments, input: data)
+                let message = String(decoding: output.standardOutput + output.standardError, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if output.status == 0 {
+                    result = .success(message)
+                } else {
+                    result = .failure(PrintError.lpFailed(message.isEmpty ? "lp exited with status \(output.status)" : message))
+                }
+            } catch {
+                result = .failure(error)
+            }
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    enum PrintError: LocalizedError {
+        case lpFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .lpFailed(let message):
+                return message
+            }
+        }
+    }
+
+    private struct Output {
+        let status: Int32
+        let standardOutput: Data
+        let standardError: Data
+    }
+
+    private static func run(_ path: String, arguments: [String], input: Data? = nil) throws -> Output {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+
+        let standardInput = Pipe()
+        let standardOutput = Pipe()
+        let standardError = Pipe()
+        process.standardInput = standardInput
+        process.standardOutput = standardOutput
+        process.standardError = standardError
+
+        try process.run()
+
+        // Feed the job on its own queue so a large job can't deadlock against
+        // lp filling its output pipes
+        DispatchQueue.global(qos: .utility).async {
+            if let input {
+                standardInput.fileHandleForWriting.write(input)
+            }
+            try? standardInput.fileHandleForWriting.close()
+        }
+
+        let outputData = standardOutput.fileHandleForReading.readDataToEndOfFile()
+        let errorData = standardError.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return Output(status: process.terminationStatus, standardOutput: outputData, standardError: errorData)
+    }
 }
 
 protocol DriveWirePrinterBackend: AnyObject {
@@ -29,7 +230,8 @@ protocol DriveWirePrinterBackend: AnyObject {
     var lastError: String? { get }
 
     func write(_ data: Data)
-    func flush()
+    /// Ends the current job and returns its bytes, or `nil` if it was empty.
+    func flush() -> Data?
     func reset()
 }
 
@@ -42,6 +244,7 @@ extension DriveWirePrinterBackend {
 final class RawDriveWirePrinterBackend: DriveWirePrinterBackend {
     let name = "Raw Memory Printer"
     private var buffer = Data()
+    private var lastJob = Data()
     private(set) var bytesReceived = 0
     private(set) var flushedJobs = 0
     private(set) var lastFlushedAt: Date?
@@ -57,7 +260,7 @@ final class RawDriveWirePrinterBackend: DriveWirePrinterBackend {
     }
 
     var previewText: String {
-        Self.preview(from: buffer)
+        Self.preview(from: buffer.isEmpty ? lastJob : buffer)
     }
 
     func write(_ data: Data) {
@@ -66,20 +269,24 @@ final class RawDriveWirePrinterBackend: DriveWirePrinterBackend {
         lastError = nil
     }
 
-    func flush() {
+    func flush() -> Data? {
         guard !buffer.isEmpty else {
             lastFlushedAt = Date()
-            return
+            return nil
         }
 
         flushedJobs += 1
         lastFlushedAt = Date()
+        let job = buffer
+        lastJob = job
         buffer.removeAll(keepingCapacity: true)
         lastError = nil
+        return job
     }
 
     func reset() {
         buffer.removeAll(keepingCapacity: true)
+        lastJob.removeAll()
         bytesReceived = 0
         flushedJobs = 0
         lastFlushedAt = nil
@@ -137,17 +344,19 @@ final class TextDriveWirePrinterBackend: DriveWirePrinterBackend {
         lastError = nil
     }
 
-    func flush() {
+    func flush() -> Data? {
         guard !text.isEmpty else {
             lastFlushedAt = Date()
-            return
+            return nil
         }
 
         flushedJobs += 1
         lastFlushedAt = Date()
+        let job = Data(text.utf8)
         text.removeAll(keepingCapacity: true)
         previousByteWasCarriageReturn = false
         lastError = nil
+        return job
     }
 
     func reset() {
@@ -191,10 +400,49 @@ extension DriveWireHost {
             pendingBytes: printerBackend.pendingBytes,
             flushedJobs: printerBackend.flushedJobs,
             lastFlushedAt: printerBackend.lastFlushedAt,
-            lastOutputPath: printerBackend.lastOutputURL?.path,
+            lastOutputPath: printerOutputPath ?? printerBackend.lastOutputURL?.path,
+            lastPrintedTo: printerLastPrintedTo,
             previewText: printerBackend.previewText,
-            lastError: printerBackend.lastError
+            lastError: printerOutputError ?? printerBackend.lastError
         )
+    }
+
+    /// Saves and prints a completed job as the printer output settings ask.
+    func deliverPrintJob(_ job: Data) {
+        let settings = printerOutputSettingsProvider()
+        guard settings.saveToFolder || settings.sendToPrinter else {
+            return
+        }
+
+        printerOutputError = nil
+        let payload = settings.format == .text ? DriveWirePrintJob.plainText(from: job) : job
+
+        if settings.saveToFolder {
+            do {
+                let url = try DriveWirePrintJob.save(payload, toFolder: settings.folderPath, format: settings.format)
+                printerOutputPath = url.path
+                reportActivity("Printer job saved to \(url.path)")
+            } catch {
+                printerOutputError = "Could not save printer job: \(error.localizedDescription)"
+                reportActivity(printerOutputError!, isError: true)
+            }
+        }
+
+        if settings.sendToPrinter {
+            let destination = settings.printerName.isEmpty ? "the default printer" : settings.printerName
+            DriveWireSystemPrinter.submit(payload, printerName: settings.printerName, format: settings.format) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let message):
+                    self.printerLastPrintedTo = destination
+                    self.reportActivity("Printer job sent to \(destination)" + (message.isEmpty ? "" : ": \(message)"))
+                case .failure(let error):
+                    self.printerOutputError = "Could not print to \(destination): \(error.localizedDescription)"
+                    self.reportActivity(self.printerOutputError!, isError: true)
+                }
+                self.refreshPrinterStatus()
+            }
+        }
     }
 
     func writePrinterData(_ data: Data) {
@@ -209,6 +457,9 @@ extension DriveWireHost {
 
     func resetPrinterState() {
         printerBackend.reset()
+        printerOutputPath = nil
+        printerOutputError = nil
+        printerLastPrintedTo = nil
         refreshPrinterStatus()
     }
 
@@ -230,7 +481,9 @@ extension DriveWireHost {
     func OP_PRINTFLUSH(data : Data) -> Int {
         currentTransaction = OPPRINTFLUSH
         resetState()
-        printerBackend.flush()
+        if let job = printerBackend.flush() {
+            deliverPrintJob(job)
+        }
         refreshPrinterStatus()
         reportActivity("Printer flush")
         delegate?.transactionCompleted(opCode: currentTransaction)

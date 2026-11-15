@@ -11,8 +11,9 @@ import ORSSerial
 import AppIntents
 
 extension UTType {
-    static var exampleText: UTType {
-        UTType(importedAs: "com.boisypitre.drivewire-document")
+    /// A saved DriveWire session (`.dwdoc`), which this app declares and owns.
+    static var driveWireDocument: UTType {
+        UTType(exportedAs: "com.boisypitre.drivewire-document")
     }
 }
 
@@ -67,7 +68,7 @@ final class DriveWireDocument: FileDocument {
     
     @Published var connectionType: ConnectionType = .serial
     
-    static var readableContentTypes: [UTType] { [.exampleText] }
+    static var readableContentTypes: [UTType] { [.driveWireDocument] }
     
     init(connectionType: ConnectionType = .serial) {
         self.connectionType = connectionType

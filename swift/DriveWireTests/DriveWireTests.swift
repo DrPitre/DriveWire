@@ -6,8 +6,12 @@
 //
 
 import XCTest
+#if SWIFT_PACKAGE
+@testable import DriveWireCore
+#endif
 
 final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
+    var diskFixture: URL!
     var host : DriveWireHost?
 
     func transactionCompleted(opCode: UInt8) {
@@ -15,17 +19,21 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
     
     override func setUpWithError() throws {
         // Put setup code here. This method is called before the invocation of each test method in the class.
+        diskFixture = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".dsk")
+        try Data((0..<512).map { UInt8($0 % 251) }).write(to: diskFixture)
         host = DriveWireHost(delegate: self)
     }
 
     override func tearDownWithError() throws {
-        // Put teardown code here. This method is called after the invocation of each test method in the class.
+        host?.disconnectGuest()
+        host?.delegate = nil
+        try? FileManager.default.removeItem(at: diskFixture)
     }
 
     func testInsert() throws {
         do {
-            try host!.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
-            try host!.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
+            try host!.insertVirtualDisk(driveNumber: 0, imagePath: diskFixture.path)
+            try host!.insertVirtualDisk(driveNumber: 0, imagePath: diskFixture.path)
         } catch {
             host!.ejectVirtualDisk(driveNumber: 0)
         }
@@ -41,10 +49,6 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         expectation = XCTestExpectation(description: "Waiting for response")
         host!.send(data: &s)
         let _ = XCTWaiter.wait(for: [expectation!], timeout: 5.0)
-        // Must be non-zero: OP_DWINIT's own comment records that a zero here
-        // makes the NitrOS-9 driver take the host for a DW3 server and disable
-        // every DW4 extension, the virtual serial poller included. The 0x00 this
-        // expected predates that.
         let expectedResult = 0xFF
         let actualResult = read(bytes: 1)[0]
         XCTAssert(actualResult == expectedResult, "Error: result should be \(expectedResult), but was \(actualResult)")
@@ -154,7 +158,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
     func READEX(drive : Int, lsn : Int) throws -> (UInt8, Data) {
         let host = DriveWireHost(delegate: self)
         do {
-            try host.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
+            try host.insertVirtualDisk(driveNumber: 0, imagePath: diskFixture.path)
             var readTransaction = Data([host.OPREADEX, UInt8(drive), UInt8((lsn & 0xFF000) >> 16), UInt8((lsn & 0xFF00) >> 8), UInt8(lsn & 0xFF)])
             expectation = XCTestExpectation(description: "Waiting for sector data")
             host.send(data: &readTransaction)
@@ -178,7 +182,7 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         var sector = Data(repeating: 0, count: 256)
         let host = DriveWireHost(delegate: self)
         do {
-            try host.insertVirtualDisk(driveNumber: 0, imagePath: "/Users/boisy/test.dsk")
+            try host.insertVirtualDisk(driveNumber: 0, imagePath: diskFixture.path)
             var readTransaction = Data([host.OPREAD, UInt8(drive), UInt8((lsn & 0xFF000) >> 16), UInt8((lsn & 0xFF00) >> 8), UInt8(lsn & 0xFF)])
             expectation = XCTestExpectation(description: "Waiting for response code data")
             host.send(data: &readTransaction)
@@ -195,11 +199,457 @@ final class DriveWireSwiftTests: XCTestCase, DriveWireDelegate {
         }
     }
 
+    func testPrinterPlainTextConvertsLineEndingsAndDropsControlCodes() throws {
+        let job = Data([0x41, 0x0D, 0x42, 0x0D, 0x0A, 0x43, 0x0A, 0x09, 0x1B, 0x45, 0x0C, 0x44, 0x80, 0x0D])
+        XCTAssertEqual(DriveWirePrintJob.plainText(from: job), Data("A\nB\nC\n\tE\u{0C}D\n".utf8))
+    }
+
+    func testPrinterSaveUsesUniqueTimestampedNames() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+        defer { try? FileManager.default.removeItem(atPath: folder) }
+        let date = Date(timeIntervalSince1970: 0)
+
+        let first = try DriveWirePrintJob.save(Data("one".utf8), toFolder: folder, format: .text, date: date)
+        let second = try DriveWirePrintJob.save(Data("two".utf8), toFolder: folder, format: .text, date: date)
+        let raw = try DriveWirePrintJob.save(Data([0x1B]), toFolder: folder, format: .raw, date: date)
+
+        XCTAssertTrue(first.lastPathComponent.hasPrefix("DriveWire-print-"))
+        XCTAssertEqual(first.pathExtension, "txt")
+        XCTAssertEqual(second.lastPathComponent, first.deletingPathExtension().lastPathComponent + "-2.txt")
+        XCTAssertEqual(raw.pathExtension, "prn")
+        XCTAssertEqual(try Data(contentsOf: first), Data("one".utf8))
+        XCTAssertEqual(try Data(contentsOf: second), Data("two".utf8))
+    }
+
+    func testPrinterLPArguments() throws {
+        XCTAssertEqual(
+            DriveWireSystemPrinter.lpArguments(printerName: "", format: .text),
+            ["-t", "DriveWire", "-o", "document-format=text/plain"]
+        )
+        XCTAssertEqual(
+            DriveWireSystemPrinter.lpArguments(printerName: "Epson_FX", format: .raw),
+            ["-d", "Epson_FX", "-t", "DriveWire", "-o", "raw"]
+        )
+    }
+
+    func testPrinterSubmitReportsUnknownPrinter() throws {
+        let done = XCTestExpectation(description: "lp finished")
+        var outcome: Result<String, Error>?
+        DriveWireSystemPrinter.submit(Data("x".utf8), printerName: "DriveWire_No_Such_Printer", format: .text) { result in
+            outcome = result
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 10)
+
+        guard case .failure(let error) = try XCTUnwrap(outcome) else {
+            return XCTFail("lp accepted a job for a printer that does not exist")
+        }
+        XCTAssertFalse(error.localizedDescription.isEmpty)
+    }
+
+    func testPrinterFlushSavesJobToFolder() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
+        defer { try? FileManager.default.removeItem(atPath: folder) }
+        var settings = DriveWirePrinterOutputSettings()
+        settings.saveToFolder = true
+        settings.folderPath = folder
+        host!.printerOutputSettingsProvider = { settings }
+
+        for byte in Array("HI\r".utf8) {
+            var s = Data([host!.OPPRINT, byte])
+            host!.send(data: &s)
+        }
+        var flush = Data([host!.OPPRINTFLUSH])
+        host!.send(data: &flush)
+
+        let path = try XCTUnwrap(host!.printerStatus.lastOutputPath)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), Data("HI\n".utf8))
+        XCTAssertEqual(host!.printerStatus.flushedJobs, 1)
+        XCTAssertEqual(host!.printerStatus.pendingBytes, 0)
+        XCTAssertEqual(host!.printerStatus.previewText, "HI\r")
+    }
+
+    func testPrinterFlushWithoutOutputSettingsSavesNothing() throws {
+        host!.printerOutputSettingsProvider = { DriveWirePrinterOutputSettings() }
+
+        var s = Data([host!.OPPRINT, 0x41])
+        host!.send(data: &s)
+        var flush = Data([host!.OPPRINTFLUSH])
+        host!.send(data: &flush)
+
+        XCTAssertNil(host!.printerStatus.lastOutputPath)
+        XCTAssertEqual(host!.printerStatus.flushedJobs, 1)
+    }
+
     func testPerformanceExample() throws {
         // This is an example of a performance test case.
         measure {
             // Put the code you want to measure the time of here.
         }
+    }
+
+    // Exercise complete wire transactions so framing and per-handle state are
+    // checked along with the directory resolver and live file contents.
+    private func rfmRequest(_ operation: UInt8, _ payload: [UInt8]) -> Data {
+        expectation = nil
+        responseData.removeAll()
+        var packet = Data([host!.OPRFM, operation] + payload)
+        host!.send(data: &packet)
+        return responseData
+    }
+
+    private func rfmPathRequest(_ operation: UInt8, _ path: String,
+                                pid: UInt8, owner: UInt8, mode: UInt8, number: UInt8 = 1) -> Data {
+        rfmRequest(operation, [number, pid, owner, mode] + Array(path.utf8) + [13])
+    }
+
+    private func rfmFolder() throws -> URL {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        for path in ["y0/data/child", "y0/bin/child"] {
+            try FileManager.default.createDirectory(at: folder.appendingPathComponent(path),
+                                                    withIntermediateDirectories: true)
+        }
+        host!.rfmRootPath = folder.path
+        return folder
+    }
+
+    private func contextPath(_ op: UInt8, _ path: String, pid: UInt8,
+                             cookie: Data, mode: UInt8, number: UInt8 = 1) -> Data {
+        rfmRequest(op | 0x10, [number, pid] + Array(cookie) + [mode] + Array(path.utf8) + [13])
+    }
+
+    func testRFMForkCookiesSurviveParentChangesBeforeChildFirstIO() throws {
+        let folder = try rfmFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let zero = Data([0, 0, 0])
+        for mode: UInt8 in [0x81, 0x84] {
+            let base = mode == 0x81 ? "/y0/data" : "/y0/bin"
+            let reply = contextPath(4, base, pid: 4, cookie: zero, mode: mode)
+            XCTAssertEqual(reply.count, 4)
+            XCTAssertEqual(reply.first, 0)
+            let inherited = Data(reply.dropFirst()) // exactly what F$Fork copies
+            let changed = contextPath(4, "child", pid: 4, cookie: inherited, mode: mode)
+            XCTAssertEqual(changed.first, 0)
+            XCTAssertNotEqual(Data(changed.dropFirst()), inherited)
+            // Child has made no request before the parent's change.
+            XCTAssertEqual(contextPath(2, ".", pid: 5, cookie: inherited, mode: mode), Data([0]))
+            XCTAssertEqual(host!.rfmPaths[1]?.pathname, base)
+            _ = rfmRequest(13, [1])
+            // Child changes independently; parent and sibling still hold their cookies.
+            XCTAssertEqual(contextPath(4, "child", pid: 5, cookie: inherited, mode: mode).first, 0)
+            XCTAssertEqual(contextPath(2, ".", pid: 4, cookie: Data(changed.dropFirst()), mode: mode), Data([0]))
+            XCTAssertEqual(host!.rfmPaths[1]?.pathname, base + "/child")
+            _ = rfmRequest(13, [1])
+            XCTAssertEqual(contextPath(2, ".", pid: 5, cookie: inherited, mode: mode), Data([0]))
+            XCTAssertEqual(host!.rfmPaths[1]?.pathname, base)
+            _ = rfmRequest(13, [1])
+            XCTAssertEqual(contextPath(4, "missing", pid: 5, cookie: inherited, mode: mode), Data([216]))
+            XCTAssertEqual(contextPath(2, ".", pid: 5, cookie: Data([255,255,255]), mode: mode), Data([216]))
+            XCTAssertEqual(contextPath(2, ".", pid: 5, cookie: zero, mode: mode), Data([216]))
+        }
+    }
+
+    func testRFMReadDirIterationMetadataAndRewind() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        let parent = folder.appendingPathComponent("y0/data")
+        try Data([1, 2, 3]).write(to: parent.appendingPathComponent("one"))
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: Data([0,0,0]), mode: 0x81), Data([0]))
+        // Use a deterministic snapshot with deleted, dot and maximum-name entries.
+        let id = host!.lsnForPath(parent.appendingPathComponent("one").path)
+        let make = DriveWireHost.RFMPathDescriptor.makeOS9DirEntry
+        host!.rfmPaths[1]?.fileContents = make(".", 1) + make("..", 1)
+            + Data(repeating: 0, count: 32) + make("one", id) + make(String(repeating: "x", count: 29), id)
+        func next(_ count: Int) -> Data {
+            rfmRequest(11, [1, 0x2E, UInt8(count >> 8), UInt8(count & 255)])
+        }
+        let first = next(32)
+        XCTAssertEqual(first, Data([0,0]) + make("one", id))
+        XCTAssertEqual(host!.rfmPaths[1]?.filePosition, 128)
+        let extended = next(45)
+        XCTAssertEqual(extended.count, 47)
+        XCTAssertEqual(Array(extended[43..<47]), [0,0,0,3])
+        XCTAssertEqual(extended[30], UInt8(ascii: "x") | 0x80)
+        XCTAssertEqual(next(32), Data([0,211]))
+        XCTAssertEqual(next(45), Data([0,211]))
+        host!.rfmPaths[1]?.filePosition = 0
+        XCTAssertEqual(next(32), first)
+        // Names need no child metadata lookup; failed extended reads are retryable.
+        try FileManager.default.removeItem(at: parent.appendingPathComponent("one"))
+        host!.rfmPaths[1]?.filePosition = 96
+        XCTAssertEqual(next(45), Data([0,216]))
+        XCTAssertEqual(host!.rfmPaths[1]?.filePosition, 96)
+        XCTAssertEqual(next(32), first)
+        XCTAssertEqual(next(33), Data([0,215]))
+        host!.rfmPaths[1]?.filePosition = 1
+        XCTAssertEqual(next(32), Data([0,215]))
+        host!.rfmPaths[1]?.mode = 0x82
+        XCTAssertEqual(rfmRequest(11, [1,0x2E]), Data([214]))
+        XCTAssertEqual(rfmRequest(11, [99,0x2E]), Data([201]))
+        XCTAssertEqual(rfmRequest(12, [1,0xFE]), Data([208]))
+    }
+
+    func testRFMReadDirFragmentedRequestAndReceiveBoundary() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: Data([0,0,0]), mode: 0x81), Data([0]))
+        host!.rfmPaths[1]?.fileContents = DriveWireHost.RFMPathDescriptor.makeOS9DirEntry("one", lsn: 1)
+        responseData.removeAll()
+        readDirBoundaryCount = 0
+        for byte: UInt8 in [0xD6, 11, 1, 0x2E, 0] {
+            var fragment = Data([byte]); host!.send(data: &fragment)
+        }
+        XCTAssertEqual(responseData, Data([0]), "Only ready is sent before complete count")
+        var last = Data([32]); host!.send(data: &last)
+        XCTAssertEqual(responseData.count, 34)
+        XCTAssertEqual(readDirBoundaryCount, 1)
+        XCTAssertEqual(rfmRequest(11, [1,0x2E,0,32]), Data([0,211]))
+        XCTAssertEqual(readDirBoundaryCount, 1, "EOF has no record payload")
+    }
+
+    var readDirBoundaryCount = 0
+    func dataAvailableAfterReceiveBoundary(host: DriveWireHost, data: Data) {
+        readDirBoundaryCount += 1
+        dataAvailable(host: host, data: data)
+    }
+
+    func testRFMRenameUsesParentPermissionsAndPreservesDirectoryCookies() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        let fm = FileManager.default
+        let parent = folder.appendingPathComponent("y0/data")
+        let zero = Data([0, 0, 0])
+        func rename(_ old: String, _ new: String) -> Data {
+            func field(_ name: String) -> [UInt8] { Array(name.utf8) + Array(repeating: 0, count: 30 - name.utf8.count) }
+            return rfmRequest(12, [1, 0x2D] + field(old) + field(new))
+        }
+        try Data("untouched".utf8).write(to: parent.appendingPathComponent("old"))
+        #if !os(Windows)
+        try fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: parent.appendingPathComponent("old").path)
+        #endif
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: zero, mode: 0x82), Data([0]))
+        XCTAssertEqual(rename("old", "new"), Data([0]), "Child access permissions do not authorize rename")
+        XCTAssertFalse(fm.fileExists(atPath: parent.appendingPathComponent("old").path))
+        #if !os(Windows)
+        XCTAssertEqual((try fm.attributesOfItem(atPath: parent.appendingPathComponent("new").path))[.posixPermissions] as? Int, 0)
+        #endif
+        XCTAssertEqual(rename("new", "child"), Data([218]))
+        XCTAssertEqual(rename("missing", "other"), Data([216]))
+        XCTAssertEqual(rename("..", "other"), Data([215]))
+        XCTAssertEqual(rename("new", "a/b"), Data([215]))
+        XCTAssertEqual(rename("new", "NEW"), Data([0]))
+        XCTAssertTrue(try fm.contentsOfDirectory(atPath: parent.path).contains("NEW"))
+        try fm.createSymbolicLink(atPath: parent.appendingPathComponent("link").path, withDestinationPath: "missing-target")
+        XCTAssertEqual(rename("link", "link2"), Data([0]))
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: parent.appendingPathComponent("link2").path), "missing-target")
+        let cookie = contextPath(4, "/y0/data/child", pid: 3, cookie: zero, mode: 0x81)
+        try Data("nested".utf8).write(to: parent.appendingPathComponent("child/file"))
+        XCTAssertEqual(contextPath(2, "file", pid: 3, cookie: Data(cookie.dropFirst()), mode: 1, number: 2), Data([0]))
+        #if os(Windows)
+        // Windows may deny moving a directory containing an open file handle.
+        _ = rfmRequest(13, [2])
+        #endif
+        XCTAssertEqual(rename("child", "renamed"), Data([0]))
+        #if os(Windows)
+        XCTAssertEqual(contextPath(2, "file", pid: 3, cookie: Data(cookie.dropFirst()), mode: 1, number: 2), Data([0]))
+        #endif
+        XCTAssertEqual(host!.rfmPaths[2]?.pathname, "/y0/data/renamed/file")
+        XCTAssertEqual(rfmRequest(7, [2, 0, 6]), Data([0, 6]) + Data("nested".utf8))
+        XCTAssertEqual(contextPath(4, "/y0/data/renamed", pid: 3, cookie: zero, mode: 0x81), cookie)
+        XCTAssertEqual(contextPath(2, "file", pid: 3, cookie: Data(cookie.dropFirst()), mode: 1, number: 3), Data([0]))
+        #if !os(Windows)
+        try fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parent.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: parent.path) }
+        if !fm.isWritableFile(atPath: parent.path) { XCTAssertEqual(rename("NEW", "denied"), Data([214])) }
+        #endif
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: zero, mode: 0x81, number: 4), Data([0]))
+        let record = [UInt8](repeating: 0, count: 60)
+        XCTAssertEqual(rfmRequest(12, [4, 0x2D] + record), Data([215]))
+    }
+
+    func testRFMRenameFramingAndDirectoryMode() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        let parent = folder.appendingPathComponent("y0/data")
+        try Data([1, 2, 3]).write(to: parent.appendingPathComponent("old"))
+        let zero = Data([0, 0, 0])
+        let record = Array("old".utf8) + Array(repeating: UInt8(0), count: 27)
+            + Array("new".utf8) + Array(repeating: UInt8(0), count: 27)
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: zero, mode: 0x81), Data([0]))
+        XCTAssertEqual(rfmRequest(11, [1, 0x2D]), Data([0]))
+        XCTAssertEqual(rfmRequest(11, [99, 0x2D]), Data([201]))
+        XCTAssertEqual(rfmRequest(12, [1, 0x2D] + record), Data([214]))
+        XCTAssertEqual(rfmRequest(12, [99, 0x2D] + record), Data([201]))
+        XCTAssertEqual(rfmRequest(12, [1, 0xFE]), Data([208]))
+        _ = rfmRequest(13, [1])
+        XCTAssertEqual(contextPath(2, "/y0/data", pid: 2, cookie: zero, mode: 0x82), Data([0]))
+        responseData.removeAll()
+        let packet: [UInt8] = [0xD6, 12, 1, 0x2D] + record
+        for (index, byte) in packet.enumerated() {
+            var fragment = Data([byte])
+            host!.send(data: &fragment)
+            if index < packet.count - 1 {
+                XCTAssertTrue(responseData.isEmpty)
+                XCTAssertTrue(FileManager.default.fileExists(atPath: parent.appendingPathComponent("old").path))
+            }
+        }
+        XCTAssertEqual(responseData, Data([0]))
+        XCTAssertEqual(try Data(contentsOf: parent.appendingPathComponent("new")), Data([1, 2, 3]))
+        XCTAssertEqual(rfmRequest(12, [1, 0xFE]), Data([208]), "Parser remains aligned after rename")
+    }
+
+    func testRFMHostRootIdentityTerminates() {
+        let root = URL(fileURLWithPath: host!.rfmRootPath).pathComponents.first ?? "/"
+        XCTAssertEqual(host!.lsnForPath(root), host!.lsnForPath(root))
+    }
+
+    func testRFMPromptDirectoryIdentityMatchesParentEntry() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        let fm = FileManager.default
+        try fm.createDirectory(at: folder.appendingPathComponent("SYS"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: folder.appendingPathComponent("DD"), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(atPath: folder.appendingPathComponent("DD/SYS").path,
+                                  withDestinationPath: "../SYS")
+        let insensitive = fm.fileExists(atPath: folder.appendingPathComponent("DD/sys").path)
+        let zero = Data([0,0,0])
+        // Enumerate the parent first, as the shell does before chd sys.
+        XCTAssertEqual(contextPath(2, "/DD", pid: 2, cookie: zero, mode: 0x81), Data([0]))
+        let parent = host!.synthesizeDirectoryEntries(for: host!.rfmPaths[1]!)
+        let parentID = Data(parent.suffix(3)) // SYS is the only non-dot entry
+        _ = rfmRequest(13, [1])
+        let spelling = insensitive ? "sys" : "SYS"
+        let changed = contextPath(4, "/DD/" + spelling, pid: 2, cookie: zero, mode: 0x81)
+        XCTAssertEqual(changed.first, 0)
+        XCTAssertEqual(Data(changed.dropFirst()), parentID)
+        XCTAssertEqual(contextPath(2, ".", pid: 2, cookie: Data(changed.dropFirst()), mode: 0x81), Data([0]))
+        let child = host!.synthesizeDirectoryEntries(for: host!.rfmPaths[1]!)
+        XCTAssertEqual(Data(child[61..<64]), parentID, "Shell+ must find dot's ID in the parent")
+        _ = rfmRequest(13, [1])
+        let up = contextPath(4, "..", pid: 2, cookie: Data(changed.dropFirst()), mode: 0x81)
+        XCTAssertEqual(up, contextPath(4, "/DD", pid: 2, cookie: zero, mode: 0x81),
+                       "Symlink resolution must not move the guest out of DD")
+        if !insensitive {
+            try fm.createDirectory(at: folder.appendingPathComponent("DD/sys"), withIntermediateDirectories: true)
+            XCTAssertNotEqual(host!.lsnForPath(folder.path + "/DD/sys"),
+                              host!.lsnForPath(folder.path + "/DD/SYS"))
+        }
+    }
+
+    func testRFMDeviceRootParentStaysOnDeviceDuringBoot() throws {
+        let folder = try rfmFolder()
+        defer { host!.resetRFMState(); try? FileManager.default.removeItem(at: folder) }
+        let cmds = folder.appendingPathComponent("DD/CMDS")
+        try FileManager.default.createDirectory(at: cmds, withIntermediateDirectories: true)
+        try Data([1,2,3]).write(to: cmds.appendingPathComponent("grfdrv"))
+        let zero = Data([0,0,0])
+        let reply = contextPath(4, "/DD", pid: 1, cookie: zero, mode: 0x85)
+        XCTAssertEqual(reply.first, 0)
+        let cookie = Data(reply.dropFirst())
+        for path in ["../CMDS/grfdrv", ".../CMDS/grfdrv", "../../CMDS/grfdrv"] {
+            XCTAssertEqual(contextPath(2, path, pid: 1, cookie: cookie, mode: 4), Data([0]), path)
+            XCTAssertEqual(rfmRequest(7, [1,0,3]), Data([0,3,1,2,3]))
+            _ = rfmRequest(13,[1])
+        }
+        // Root chd .. must return a usable cookie for DD, not the export root.
+        let parent = contextPath(4, "..", pid: 1, cookie: cookie, mode: 0x85)
+        XCTAssertEqual(parent, reply)
+        XCTAssertEqual(contextPath(2, "CMDS/grfdrv", pid: 2, cookie: Data(parent.dropFirst()), mode: 4), Data([0]))
+        _ = rfmRequest(13,[1])
+        XCTAssertEqual(contextPath(3, "../created", pid: 1, cookie: cookie, mode: 3), Data([0]))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("DD/created").path))
+        XCTAssertEqual(contextPath(5, "../created", pid: 1, cookie: cookie, mode: 2), Data([0]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("DD/created").path))
+    }
+
+    func testRFMOwnerContextOverridesReusedPID() {
+        host!.rfmCurrentDir = [4: "/y0/data", 5: "/y0/stale"]
+        host!.rfmCurrentExecDir = [4: "/y0/bin", 5: "/y0/stale-bin"]
+        XCTAssertEqual(host!.resolveRFMPathname("marker", processID: 5, parentProcessID: 4), "/y0/data/marker")
+        XCTAssertEqual(host!.resolveRFMPathname("tool", processID: 5, parentProcessID: 4, isExec: true), "/y0/bin/tool")
+        XCTAssertEqual(host!.resolveRFMPathname("/y0/absolute", processID: 5, parentProcessID: 4), "/y0/absolute")
+        // Preserve the fallback used by callers without a known owner context.
+        XCTAssertEqual(host!.resolveRFMPathname("marker", processID: 5, parentProcessID: 0), "/y0/stale/marker")
+    }
+
+    func testRFMSelfOwnerDotAndRelativeDirectoryChanges() throws {
+        let folder = try rfmFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        for (mode, base) in [(UInt8(0x81), "/y0/data"), (UInt8(0x84), "/y0/bin")] {
+            XCTAssertEqual(rfmPathRequest(4, base, pid: 7, owner: 0, mode: mode), Data([0]))
+            for path in [".", "child", "..", "./child", ".."] {
+                XCTAssertEqual(rfmPathRequest(4, path, pid: 7, owner: 7, mode: mode), Data([0]), path)
+            }
+            let actual = mode == 0x81 ? host!.rfmCurrentDir[7] : host!.rfmCurrentExecDir[7]
+            XCTAssertEqual(actual, base)
+            XCTAssertEqual(rfmPathRequest(4, "missing", pid: 7, owner: 7, mode: mode), Data([216]))
+            let afterError = mode == 0x81 ? host!.rfmCurrentDir[7] : host!.rfmCurrentExecDir[7]
+            XCTAssertEqual(afterError, base)
+        }
+        XCTAssertEqual(host!.rfmCurrentDir[7], "/y0/data")
+        XCTAssertEqual(host!.rfmCurrentExecDir[7], "/y0/bin")
+    }
+
+    func testRFMDirectoryContextSnapshotAndCombinedMode() throws {
+        let folder = try rfmFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        XCTAssertEqual(rfmPathRequest(4, "/y0/data", pid: 4, owner: 0, mode: 0x81), Data([0]))
+        XCTAssertEqual(rfmPathRequest(4, ".", pid: 5, owner: 4, mode: 0x81), Data([0]))
+        XCTAssertEqual(host!.rfmCurrentDir[5], "/y0/data")
+        XCTAssertEqual(rfmPathRequest(4, "child", pid: 4, owner: 4, mode: 0x81), Data([0]))
+        XCTAssertEqual(host!.resolveRFMPathname("marker", processID: 8, parentProcessID: 5), "/y0/data/marker")
+        XCTAssertEqual(rfmPathRequest(4, "/y0/bin", pid: 7, owner: 0, mode: 0x85), Data([0]))
+        XCTAssertEqual(host!.rfmCurrentDir[7], "/y0/bin")
+        XCTAssertEqual(host!.rfmCurrentExecDir[7], "/y0/bin")
+    }
+
+    func testRFMLiveReadWriteSizeEOFAndIndependentHandles() throws {
+        let folder = try rfmFolder()
+        defer {
+            host!.resetRFMState()
+            try? FileManager.default.removeItem(at: folder)
+        }
+        XCTAssertEqual(rfmPathRequest(1, "/y0/file", pid: 9, owner: 0, mode: 3), Data([0]))
+        XCTAssertTrue(rfmRequest(8, [1, 0, 3] + Array("ABC".utf8)).isEmpty)
+        XCTAssertEqual(rfmRequest(11, [1, 2]), Data([0, 0, 0, 3]))
+        XCTAssertEqual(rfmRequest(6, [1, 0, 0, 0, 0]), Data([0]))
+        XCTAssertEqual(rfmRequest(11, [1, 6]), Data([0]))
+        XCTAssertEqual(rfmRequest(7, [1, 0, 3]), Data([0, 3] + Array("ABC".utf8)))
+        XCTAssertEqual(rfmRequest(11, [1, 6]), Data([211]))
+        XCTAssertEqual(rfmPathRequest(2, "/y0/file", pid: 9, owner: 0, mode: 1, number: 2), Data([0]))
+        XCTAssertEqual(rfmRequest(6, [1, 0, 0, 0, 1]), Data([0]))
+        XCTAssertTrue(rfmRequest(8, [1, 0, 1, 90]).isEmpty)
+        XCTAssertEqual(rfmRequest(7, [2, 0, 3]), Data([0, 3] + Array("AZC".utf8)))
+        XCTAssertEqual(rfmRequest(6, [1, 0, 0, 0, 5]), Data([0]))
+        XCTAssertTrue(rfmRequest(8, [1, 0, 1, 81]).isEmpty)
+        XCTAssertEqual(rfmRequest(11, [2, 6]), Data([0])) // other handle sees growth
+        XCTAssertEqual(rfmRequest(11, [2, 2]), Data([0, 0, 0, 6]))
+        XCTAssertEqual(rfmRequest(7, [2, 0, 3]), Data([0, 3, 0, 0, 81]))
+        XCTAssertEqual(rfmRequest(6, [1, 0, 0, 0, 8]), Data([0]))
+        XCTAssertTrue(rfmRequest(8, [1, 0, 0]).isEmpty) // empty write must not extend
+        XCTAssertEqual(rfmRequest(11, [1, 2]), Data([0, 0, 0, 6]))
+        let fd = rfmRequest(11, [2, 15, 0, 16])
+        XCTAssertEqual(fd.count, 16)
+        XCTAssertEqual(Data(fd[9..<13]), Data([0, 0, 0, 6]))
+        XCTAssertEqual(try Data(contentsOf: folder.appendingPathComponent("y0/file")), Data([65, 90, 67, 0, 0, 81]))
+    }
+
+    func testRFMLiveReadLineKeepsCursorAndTextTranslation() throws {
+        let folder = try rfmFolder()
+        defer {
+            host!.resetRFMState()
+            try? FileManager.default.removeItem(at: folder)
+        }
+        XCTAssertEqual(rfmPathRequest(1, "/y0/lines", pid: 9, owner: 0, mode: 3), Data([0]))
+        XCTAssertTrue(rfmRequest(10, [1, 0, 3, 65, 13, 90]).isEmpty)
+        XCTAssertTrue(rfmRequest(10, [1, 0, 2, 66, 13]).isEmpty)
+        XCTAssertEqual(rfmRequest(11, [1, 2]), Data([0, 0, 0, 4]))
+        XCTAssertEqual(rfmRequest(6, [1, 0, 0, 0, 0]), Data([0]))
+        XCTAssertEqual(rfmRequest(9, [1, 0, 16]), Data([0, 2, 65, 13]))
+        XCTAssertEqual(rfmRequest(11, [1, 5]), Data([0, 0, 0, 2]))
+        XCTAssertEqual(rfmRequest(9, [1, 0, 16]), Data([0, 2, 66, 13]))
+        XCTAssertEqual(rfmRequest(9, [1, 0, 16]), Data([0, 0]))
+        XCTAssertEqual(try Data(contentsOf: folder.appendingPathComponent("y0/lines")), Data([65, 10, 66, 10]))
     }
 
 }
