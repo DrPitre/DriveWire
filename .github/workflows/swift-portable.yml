@@ -13,7 +13,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-24.04, windows-2022]
+        os: [macos-15, ubuntu-24.04, windows-2022, windows-11-arm]
+        include:
+          - os: windows-2022
+            swift_arch: amd64
+            cmake_arch: x64
+            artifact_arch: x64
+          - os: windows-11-arm
+            swift_arch: arm64
+            cmake_arch: ARM64
+            artifact_arch: arm64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -27,6 +36,7 @@ jobs:
         with:
           swift-version: swift-6.4.2-release
           swift-build: 6.4.2-RELEASE
+          build_arch: ${{ matrix.swift_arch }}
       - name: Prepare Windows SwiftNIO
         if: runner.os == 'Windows'
         run: python scripts/prepare-swift.py
@@ -47,18 +57,13 @@ jobs:
         shell: pwsh
         run: |
           $bin = swift build --package-path swift -c release --show-bin-path
-          $info = swift -print-target-info | ConvertFrom-Json
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "$bin/drivewire-server.exe" dist/
-          $paths = @($info.paths.runtimeLibraryPaths) + @((Split-Path (Get-Command swift).Source))
-          foreach ($path in $paths) {
-            Get-ChildItem $path -Filter '*.dll' -ErrorAction SilentlyContinue | Copy-Item -Destination dist -Force
-          }
+          python scripts/bundle-windows-runtime.py "$bin/drivewire-server.exe" dist --arch ${{ matrix.cmake_arch }}
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python scripts/test-portable-server.py dist/drivewire-server.exe --isolate-runtime
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
         with:
-          name: drivewire-server-windows-x64
+          name: drivewire-server-windows-${{ matrix.artifact_arch }}
           path: dist/
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
@@ -68,7 +73,7 @@ jobs:
         shell: pwsh
         run: |
           $server = "$(swift build --package-path swift -c release --show-bin-path)/drivewire-server.exe"
-          cmake -S desktop -B desktop/build -DDRIVEWIRE_FETCH_WX=ON -DDRIVEWIRE_SERVER="$server"
+          cmake -S desktop -B desktop/build -A ${{ matrix.cmake_arch }} -DDRIVEWIRE_FETCH_WX=ON -DDRIVEWIRE_SERVER="$server"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build desktop/build --config Release --parallel 4
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

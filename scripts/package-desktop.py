@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+from windows_arch import pe_architecture
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--build', type=pathlib.Path, required=True)
@@ -18,7 +19,12 @@ repo = pathlib.Path(__file__).resolve().parents[1]
 build = args.build.resolve()
 out = args.output.resolve()
 out.mkdir(parents=True, exist_ok=True)
-name = 'DriveWire-Swift-Server-' + platform.system() + '-' + platform.machine()
+architecture = platform.machine()
+if platform.system() == 'Windows':
+    architecture = pe_architecture(build/'Release/DriveWire Swift Server.exe')
+    if pe_architecture(build/'Release/drivewire-server.exe') != architecture:
+        raise RuntimeError('Desktop and server architectures do not match')
+name = 'DriveWire-Swift-Server-' + platform.system() + '-' + architecture
 stage = out / name
 if stage.exists(): shutil.rmtree(stage)
 stage.mkdir()
@@ -87,7 +93,10 @@ if platform.system() == 'Darwin':
 elif platform.system() == 'Windows':
     source=build/'Release'
     for file in source.iterdir():
-        if file.suffix.lower() in ['.exe','.dll']: shutil.copy2(file,stage/file.name)
+        if file.suffix.lower() in ['.exe','.dll']:
+            if pe_architecture(file) != architecture:
+                raise RuntimeError('Wrong-architecture Windows binary: '+str(file))
+            shutil.copy2(file,stage/file.name)
     test_desktop(stage/'DriveWire Swift Server.exe', stage/'drivewire-server.exe')
     archive=shutil.make_archive(str(out/name),'zip',stage)
     print(archive)

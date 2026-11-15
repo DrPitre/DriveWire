@@ -28,7 +28,8 @@ Swift Mac app. The desktop printer tab exports received text.
 
 Requires CMake 3.24+, C++17, wxWidgets 3.2+, Python 3.10+ and Swift 6.4.2.
 The Mac build targets macOS 14 or newer. Linux artifacts target Ubuntu 24.04
-and compatible distributions; Windows x64 builds are tested on Server 2022.
+and compatible distributions. Windows builds cover x64 on Server 2022 and
+Arm64 on Windows 11 Arm, including native execution of the test suite.
 Build the Swift server first from the repository root:
 
 ```sh
@@ -56,9 +57,13 @@ On Windows from a developer PowerShell with Swift and Visual Studio C++ tools:
 python scripts/prepare-swift.py
 swift build --package-path swift -c release
 $server = "$(swift build --package-path swift -c release --show-bin-path)/drivewire-server.exe"
-cmake -S desktop -B desktop/build -DDRIVEWIRE_FETCH_WX=ON -DDRIVEWIRE_SERVER="$server"
+cmake -S desktop -B desktop/build -A x64 -DDRIVEWIRE_FETCH_WX=ON -DDRIVEWIRE_SERVER="$server"
 cmake --build desktop/build --config Release --parallel 4
 ```
+
+For a native Windows Arm64 build, install the Arm64 Swift toolchain and Visual
+Studio ARM64 C++ tools, then use `-A ARM64` instead of `-A x64`. Build the server
+and desktop for the same architecture.
 
 `DRIVEWIRE_FETCH_WX=ON` builds pinned wxWidgets 3.2.8 statically on any platform.
 This avoids requiring a wxWidgets DLL installation on Windows. macOS produces
@@ -110,7 +115,7 @@ and shuts down the child gracefully. It also checks Unicode paths. No user
 preferences are changed. Add `--serial` to test the same controls through an OS
 PTY on macOS/Linux. Serial integration tests cover raw binary disk I/O, RFM
 bootfile reads, partial packets, actual PTY hangup, reopen on a replaced device
-path, retired cookies and transport switching. Windows CI compiles the native
+path, retired cookies and transport switching. Windows CI runs on both x64 and Arm64 and compiles the native
 Win32 serial implementation and tests port enumeration, missing-COM retry/stop
 and serial GUI controls. Physical COM/USB transfer and modem-line behavior still
 require validation with real hardware; PTYs cannot verify those electrical lines.
@@ -129,7 +134,11 @@ The control interface is a private pipe, never a listening network service.
 CI artifacts contain a ZIP (Windows/macOS) or tar.gz (Linux). Extract it and
 launch `DriveWire Swift Server.exe`, `DriveWire Swift Server.app`, or `./drivewire`
 respectively. The server is included. macOS bundles are signed ad hoc for local
-testing, not notarized releases. Windows needs the Microsoft C++ runtime.
+testing, not notarized releases. Windows needs the Microsoft C++ runtime for the selected architecture. Choose
+the `Windows-AMD64` archive for Intel/AMD PCs or `Windows-ARM64` for Arm PCs
+and Windows 11 Arm VMs on Apple Silicon. Both the GUI and bundled server are
+native to that archive’s architecture. USB serial adapters still need Windows
+drivers for the host architecture.
 Linux needs GTK3/wxWidgets 3.2 runtime libraries (`libwxgtk3.2-1t64` on Ubuntu
 24.04); Swift runtime libraries are bundled. Each staged package is tested
 again with toolchain library environment overrides removed.
