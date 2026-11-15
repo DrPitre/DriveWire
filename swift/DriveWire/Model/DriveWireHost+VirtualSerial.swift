@@ -311,7 +311,7 @@ extension DriveWireHost {
     func OP_SERINIT(data : Data) -> Int {
         currentTransaction = OPSERINIT
         guard data.count >= 2 else { return 0 }
-        let ch = data[1]
+        let ch = virtualSerialLifecycleChannel(data[1])
         openVirtualSerialChannels.insert(ch)
         refreshVirtualSerialChannelStatuses()
         if isVirtualWindowChannel(ch) {
@@ -411,7 +411,7 @@ extension DriveWireHost {
     func OP_SERSETSTAT(data : Data) -> Int {
         currentTransaction = OPSERSETSTAT
         guard data.count >= 3 else { return 0 }
-        let ch = data[1]; let code = data[2]
+        let ch = virtualSerialLifecycleChannel(data[1]); let code = data[2]
         let expectedCount = code == 0x28 ? 29 : 3
         guard data.count >= expectedCount else { return 0 }
         switch code {
@@ -488,7 +488,8 @@ extension DriveWireHost {
         return Data(response)
     }
 
-    func retireVirtualSerialChannel(_ channel: UInt8) {
+    func retireVirtualSerialChannel(_ guestChannel: UInt8) {
+        let channel = virtualSerialLifecycleChannel(guestChannel)
         if isMIDIVirtualSerialChannel(channel) {
             reportActivity("MIDI channel retiring after \(midiFileBytesReceived) file byte\(midiFileBytesReceived == 1 ? "" : "s"), tracks \(standardMIDIPlayback?.completedFileTrackCount ?? 0)/\(standardMIDIPlayback?.expectedFileTrackCount ?? 0)")
             finishMIDIStream()
@@ -545,16 +546,16 @@ extension DriveWireHost {
     }
 
     public func sendVirtualWindowInput(_ text: String, channel: UInt8) {
-        guard isVirtualWindowChannel(channel), !text.isEmpty else {
+        guard isVirtualWindowChannel(channel),
+              virtualWindows.contains(where: { $0.channel == channel && $0.isOpen }),
+              !text.isEmpty else {
             return
         }
-        let normalized = text.replacingOccurrences(of: "\n", with: "\r")
-        let bytes = normalized.compactMap { character -> UInt8? in
-            guard let scalar = character.unicodeScalars.first else { return nil }
-            if scalar.value == 0x08 || scalar.value == 0x09 || scalar.value == 0x0D || scalar.value == 0x1B || (scalar.value >= 0x20 && scalar.value <= 0x7E) {
-                return UInt8(scalar.value)
-            }
-            return nil
+        // Terminal keystrokes include control bytes (interrupt, EOF, cursor
+        // movement). UI paste handlers normalize newlines before sending.
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\r")
+        let bytes = normalized.unicodeScalars.compactMap { scalar -> UInt8? in
+            scalar.value <= 0x7F ? UInt8(scalar.value) : nil
         }
         guard !bytes.isEmpty else { return }
         virtualSerialInput[channel, default: Data()].append(contentsOf: bytes)
@@ -581,7 +582,7 @@ extension DriveWireHost {
         guard let index = virtualWindowIndex(for: channel, createIfNeeded: false) else {
             return
         }
-        virtualWindows[index].isOpen = false
+        virtualWindows.remove(at: index)
         refreshVirtualSerialChannelStatuses()
     }
 
@@ -904,6 +905,12 @@ extension DriveWireHost {
         })
         reference = connection
         return connection
+    }
+
+    // SCF descriptors use ports 17...31 for /Z1.../Z15 in lifecycle
+    // messages; fast window output uses internal channels 129...143.
+    func virtualSerialLifecycleChannel(_ channel: UInt8) -> UInt8 {
+        (17...31).contains(channel) ? 0x80 | (channel - 16) : channel
     }
 
     func isVirtualWindowChannel(_ channel: UInt8) -> Bool {

@@ -20,11 +20,14 @@ with tempfile.TemporaryDirectory(prefix='DriveWire control ') as folder:
     process = subprocess.Popen([str(pathlib.Path(args.server).resolve()), '--managed'],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     messages = queue.Queue()
+    logs = queue.Queue()
     def read():
         for line in process.stdout:
             marker = line.find(b'@drivewire ')
             if marker >= 0:
                 messages.put(json.loads(line[marker+11:]))
+            elif line.strip():
+                logs.put(line.decode().strip())
     threading.Thread(target=read, daemon=True).start()
     serial = 0
     def command(name, ok=True, **fields):
@@ -39,13 +42,19 @@ with tempfile.TemporaryDirectory(prefix='DriveWire control ') as folder:
         assert messages.get(timeout=15)['id']==0
         command('nonsense',ok=False)
         command('configure',root=str(root/'missing'),ok=False)
-        command('configure',bind='127.0.0.1',port=0,root=str(root))
+        command('configure',bind='127.0.0.1',port=0,root=str(root),verbose=True)
         command('mount',drive=0,path=str(image))
         command('mount',drive=0,path=str(root/'missing'),ok=False)
         state=command('start')
         command('configure',port=65504,ok=False)
         with socket.create_connection(('127.0.0.1',state['port']),timeout=5) as guest:
             guest.sendall(bytes([0x5a,1]));assert guest.recv(1)==b'\xff'
+            # Even a tiny exchange must be visible before shutdown or a full stdout buffer.
+            command('status')
+            trace=[]
+            while not logs.empty(): trace.append(logs.get_nowait())
+            assert ''.join(line[3:] for line in trace if line.startswith('-> ')) == '5a01', trace
+            assert ''.join(line[3:] for line in trace if line.startswith('<- ')) == 'ff', trace
             guest.sendall(bytes([0x57,0,0,0,0])+b'A'*256+bytes([0x41,0]));assert guest.recv(1)==b'\0'
             state=command('status');assert state['disks'][0]['dirty']
             command('eject',drive=0,ok=False)

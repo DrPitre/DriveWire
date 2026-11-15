@@ -18,7 +18,7 @@ repo = pathlib.Path(__file__).resolve().parents[1]
 build = args.build.resolve()
 out = args.output.resolve()
 out.mkdir(parents=True, exist_ok=True)
-name = 'DriveWire-Desktop-' + platform.system() + '-' + platform.machine()
+name = 'DriveWire-Swift-Server-' + platform.system() + '-' + platform.machine()
 stage = out / name
 if stage.exists(): shutil.rmtree(stage)
 stage.mkdir()
@@ -41,8 +41,8 @@ def test_desktop(app, server):
     subprocess.run(command+['--serial'], check=True)
 
 if platform.system() == 'Darwin':
-    app=stage/'DriveWire Desktop.app'
-    shutil.copytree(build/'DriveWire Desktop.app',app)
+    app=stage/'DriveWire Swift Server.app'
+    shutil.copytree(build/'DriveWire Swift Server.app',app)
     frameworks=app/'Contents/Frameworks'
     frameworks.mkdir(exist_ok=True)
     info=json.loads(subprocess.check_output(['swift','-print-target-info']))
@@ -81,27 +81,27 @@ if platform.system() == 'Darwin':
         if '@executable_path/../Frameworks' not in rpaths(binary):
             subprocess.run(['install_name_tool','-add_rpath','@executable_path/../Frameworks',str(binary)],check=True)
     subprocess.run(['codesign','--force','--deep','--sign','-',str(app)],check=True)
-    test_desktop(app/'Contents/MacOS/DriveWire Desktop', app/'Contents/MacOS/drivewire-server')
+    test_desktop(app/'Contents/MacOS/DriveWire Swift Server', app/'Contents/MacOS/drivewire-server')
     archive=shutil.make_archive(str(out/name),'zip',stage)
     print(archive)
 elif platform.system() == 'Windows':
     source=build/'Release'
     for file in source.iterdir():
         if file.suffix.lower() in ['.exe','.dll']: shutil.copy2(file,stage/file.name)
-    test_desktop(stage/'DriveWire Desktop.exe', stage/'drivewire-server.exe')
+    test_desktop(stage/'DriveWire Swift Server.exe', stage/'drivewire-server.exe')
     archive=shutil.make_archive(str(out/name),'zip',stage)
     print(archive)
 else:
-    for filename in ['DriveWire Desktop','drivewire-server']: shutil.copy2(build/filename,stage/filename)
+    for filename in ['DriveWire Swift Server','drivewire-server']: shutil.copy2(build/filename,stage/filename)
     info=json.loads(subprocess.check_output(['swift','-print-target-info']))
     lib=stage/'lib';lib.mkdir()
     for directory in info['paths']['runtimeLibraryPaths']:
         for file in pathlib.Path(directory).glob('*.so*'):
             if file.is_file(): shutil.copy2(file,lib/file.name)
     subprocess.run(['patchelf','--set-rpath','$ORIGIN/lib',str(stage/'drivewire-server')],check=True)
-    test_desktop(stage/'DriveWire Desktop', stage/'drivewire-server')
+    test_desktop(stage/'DriveWire Swift Server', stage/'drivewire-server')
     launcher=stage/'drivewire'
-    launcher.write_text('#!/bin/sh\ncd -- "$(dirname -- "$0")"\nexec "./DriveWire Desktop" "$@"\n')
+    launcher.write_text('#!/bin/sh\ncd -- "$(dirname -- "$0")"\nexec "./DriveWire Swift Server" "$@"\n')
     launcher.chmod(0o755)
     archive=shutil.make_archive(str(out/name),'gztar',stage)
     print(archive)
