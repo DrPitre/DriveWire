@@ -117,6 +117,7 @@ class Desktop final : public wxFrame {
     ServiceBook* services_;
     wxString terminalOutput_;
     bool terminalCursor_ = false;
+    int pendingWindowFocus_ = -1;
     wxListCtrl* channels_;
     struct DriveRow { wxTextCtrl* path; wxStaticText* state; wxButton *mount, *eject, *save, *saveAs; };
     std::array<DriveRow, 4> drives_;
@@ -452,16 +453,28 @@ class Desktop final : public wxFrame {
         windowChoice_->Enable(windowChoice_->GetCount()>0);
         if(newWindow>=0) {
             services_->SetSelection(0);
+            pendingWindowFocus_=newWindow;
             Raise();
             // Native notebook activation can restore its own focus after
             // SetSelection; focus the terminal once that event completes.
-            CallAfter([this,newWindow]{if(!closing_ && windowChannel()==newWindow) windowText_->SetFocus();});
+            CallAfter([this]{focusNewWindow();});
         }
         showWindow();
     }
     int windowChannel() const {
         auto selection = windowChoice_->GetSelection();
         return selection == wxNOT_FOUND ? -1 : static_cast<int>(reinterpret_cast<intptr_t>(windowChoice_->GetClientData(selection)));
+    }
+    void focusNewWindow() {
+        if(closing_ || pendingWindowFocus_<0) return;
+        if(windowChannel()!=pendingWindowFocus_ || services_->GetSelection()!=0) {
+            pendingWindowFocus_=-1;return;
+        }
+        // Some window managers reject foreground activation. Keep the request
+        // until the user activates the app instead of losing terminal focus.
+        if(!IsActive()) return;
+        windowText_->SetFocus();
+        if(wxWindow::FindFocus()==windowText_) pendingWindowFocus_=-1;
     }
     void showWindow() {
         int selected = windowChannel(); std::string value;
@@ -543,6 +556,7 @@ class Desktop final : public wxFrame {
         for (const auto& item : pending_) if (now - item.second.sent > std::chrono::seconds(15)) expired.push_back(item.first);
         for (auto id : expired) { auto quiet=pending_[id].quiet; pending_.erase(id); statusPending_=false; if (!quiet) error("The server did not respond to a command."); }
         showWindow();
+        focusNewWindow();
         if (smoke_) smokeTick();
     }
     void onExit(wxProcessEvent& event) {
@@ -806,11 +820,11 @@ void Desktop::smokeTick() {
         send({{"command","status"}});
     } else if(step==4) {
         if(!dirty(0)){failSmoke("Guest write did not mark disk modified");return;}
-        if(transport_->GetSelection()==0 && (windowChannel()!=129 || wxWindow::FindFocus()!=windowText_)){--smokeStep_;return;}
+        if(transport_->GetSelection()==0 && (windowChannel()!=129 || (IsActive() && wxWindow::FindFocus()!=windowText_))){--smokeStep_;return;}
         if(transport_->GetSelection()==0){
-            if(windowChannel()!=129 || services_->GetSelection()!=0 || wxWindow::FindFocus()!=windowText_){failSmoke("New virtual window did not receive focus");return;}
+            if(windowChannel()!=129 || services_->GetSelection()!=0 || (IsActive()?wxWindow::FindFocus()!=windowText_:pendingWindowFocus_!=129)){failSmoke("New virtual window did not receive focus");return;}
             stop_->SetFocus();auto unchanged=state_;update(unchanged);
-            if(wxWindow::FindFocus()!=stop_){failSmoke("Routine status update stole focus");return;}
+            if(IsActive() && wxWindow::FindFocus()!=stop_){failSmoke("Routine status update stole focus");return;}
             windowText_->SetFocus();
             wxKeyEvent character(wxEVT_CHAR);character.m_uniChar='x';character.m_keyCode='X';windowText_->GetEventHandler()->ProcessEvent(character);
             for(int key:std::array<int,5>{WXK_RETURN,WXK_BACK,'C',WXK_TAB,WXK_ESCAPE}){
@@ -838,8 +852,8 @@ void Desktop::smokeTick() {
         }
     } else if(step==6) {
         if(transport_->GetSelection()==0){
-            if(windowChannel()!=130 || wxWindow::FindFocus()!=windowText_){--smokeStep_;return;}
-            if(services_->GetSelection()!=0 || windowChoice_->GetCount()!=2){failSmoke("Z2 did not become selected with Z1 open");return;}
+            if(windowChannel()!=130 || (IsActive() && wxWindow::FindFocus()!=windowText_)){--smokeStep_;return;}
+            if(services_->GetSelection()!=0 || windowChoice_->GetCount()!=2 || (!IsActive() && pendingWindowFocus_!=130)){failSmoke("Z2 did not become selected with Z1 open");return;}
             smokeSocket_->Close();
         }
         wxCommandEvent event(wxEVT_BUTTON,stop_->GetId());stop_->GetEventHandler()->ProcessEvent(event);
