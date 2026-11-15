@@ -1130,7 +1130,7 @@ extension DriveWireHost {
                         MoveFileExW(sourcePath.baseAddress, destinationPath.baseAddress, 0)
                     }
                 }
-                if renamed == 0 {
+                if !renamed {
                     let code = GetLastError()
                     return code == DWORD(ERROR_ALREADY_EXISTS) || code == DWORD(ERROR_FILE_EXISTS) ? 218 : 214
                 }
