@@ -30,6 +30,8 @@ static std::string stringValue(const json& j, const char* key, const std::string
 class Desktop final : public wxFrame {
     wxTextCtrl *address_, *log_, *printer_, *windowText_, *windowInput_;
     wxStaticText* stats_;
+    wxBoxSizer *tcpRow_, *serialRow_;
+    wxPanel* mainPanel_;
     wxSpinCtrl* port_;
     wxChoice* transport_;
     wxComboBox *serialPath_, *baud_;
@@ -167,6 +169,11 @@ class Desktop final : public wxFrame {
     }
     void connectionControls() {
         bool active = running(), serial = transport_->GetSelection() == 1;
+        if (tcpRow_->AreAnyItemsShown() == serial || serialRow_->AreAnyItemsShown() != serial) {
+            tcpRow_->ShowItems(!serial);
+            serialRow_->ShowItems(serial);
+            mainPanel_->Layout();
+        }
         transport_->Enable(!active);
         address_->Enable(!active && !serial); port_->Enable(!active && !serial);
         serialPath_->Enable(!active && serial); baud_->Enable(!active && serial);
@@ -312,11 +319,12 @@ class Desktop final : public wxFrame {
             bool mounted = false;
             for (const auto& d : state_["disks"]) if (d.value("drive",-1)==i) {
                 drives_[i].path->ChangeValue(text(stringValue(d,"path")));
+                drives_[i].path->SetToolTip(text(stringValue(d,"path")));
                 drives_[i].state->SetLabel(d.value("dirty",false) ? "Modified" : "Ready");
                 mounted = true;
                 break;
             }
-            if (!mounted) { drives_[i].state->SetLabel("Empty"); if (ready_ && ticks_ > 3) drives_[i].path->Clear(); }
+            if (!mounted) { drives_[i].state->SetLabel("Empty"); drives_[i].path->UnsetToolTip(); if (ready_ && ticks_ > 3) drives_[i].path->Clear(); }
             drives_[i].mount->Enable(ready_ && !closing_); drives_[i].save->Enable(mounted && !closing_); drives_[i].saveAs->Enable(mounted && !closing_); drives_[i].eject->Enable(mounted && !closing_);
         }
         auto printer = state_.value("printer",json::object());
@@ -414,28 +422,41 @@ class Desktop final : public wxFrame {
 public:
     Desktop(wxString server, wxString smokeRoot) : wxFrame(nullptr,wxID_ANY,"DriveWire Desktop",wxDefaultPosition,wxSize(1040,820)),
         timer_(this), executable_(server), smokeRoot_(smokeRoot), smoke_(!smokeRoot.empty()) {
-        SetMinSize(wxSize(820,680));
+        SetMinSize(FromDIP(wxSize(820,680)));
         auto* menu = new wxMenuBar; auto* file = new wxMenu;
         file->Append(wxID_OPEN,wxS("&Open configuration…\tCtrl+O")); file->Append(wxID_SAVEAS,wxS("&Save configuration…\tCtrl+Shift+S"));
         file->AppendSeparator(); file->Append(wxID_EXIT,"&Quit\tCtrl+Q"); menu->Append(file,"&File");
         auto* serverMenu = new wxMenu; serverMenu->Append(1001,"Restart &backend"); serverMenu->Append(1002,"Save all disk changes\tCtrl+S"); menu->Append(serverMenu,"&Server");
         auto* help = new wxMenu; help->Append(wxID_ABOUT,"&About DriveWire Desktop"); menu->Append(help,"&Help"); SetMenuBar(menu);
         CreateStatusBar(2); int widths[]={-1,230}; SetStatusWidths(2,widths);
-        auto* panel = new wxPanel(this); auto* layout = new wxBoxSizer(wxVERTICAL);
-        auto* title = new wxStaticText(panel,wxID_ANY,"DriveWire"); title->SetFont(wxFontInfo(23).Bold()); layout->Add(title,0,wxLEFT|wxTOP,18);
-        layout->Add(new wxStaticText(panel,wxID_ANY,wxS("TCP / serial server • RFM • virtual disks")),0,wxLEFT|wxBOTTOM,18);
+        auto* panel = new wxPanel(this); mainPanel_ = panel; auto* layout = new wxBoxSizer(wxVERTICAL);
+        auto* header = new wxBoxSizer(wxHORIZONTAL);
+        auto* branding = new wxBoxSizer(wxVERTICAL);
+        auto* title = new wxStaticText(panel,wxID_ANY,"DriveWire");
+        title->SetFont(title->GetFont().Larger().Larger().Bold());
+        branding->Add(title);
+        branding->Add(new wxStaticText(panel,wxID_ANY,"Disk storage and connections for your CoCo"),0,wxTOP,4);
+        header->Add(branding,1,wxALIGN_CENTER_VERTICAL|wxRIGHT,16);
+        start_=new wxButton(panel,wxID_ANY,"Start server");
+        stop_=new wxButton(panel,wxID_ANY,"Stop server");
+        disconnect_=new wxButton(panel,wxID_ANY,"Disconnect guest");
+        header->Add(start_,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+        header->Add(stop_,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+        header->Add(disconnect_,0,wxALIGN_CENTER_VERTICAL);
+        start_->Disable();stop_->Disable();disconnect_->Disable();
+        layout->Add(header,0,wxEXPAND|wxALL,18);
         auto* connection = new wxStaticBoxSizer(wxVERTICAL,panel,"Connection");
         auto* transportRow = new wxBoxSizer(wxHORIZONTAL);
         transportRow->Add(new wxStaticText(panel,wxID_ANY,"Transport"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         transport_=new wxChoice(panel,wxID_ANY);transport_->Append("TCP / Becker");transport_->Append("Serial port");transport_->SetSelection(0);transportRow->Add(transport_,0);
         connection->Add(transportRow,0,wxEXPAND|wxLEFT|wxRIGHT|wxTOP,10);
-        auto* row = new wxBoxSizer(wxHORIZONTAL); row->Add(new wxStaticText(panel,wxID_ANY,"Listen address"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+        auto* row = new wxBoxSizer(wxHORIZONTAL); tcpRow_ = row; row->Add(new wxStaticText(panel,wxID_ANY,"Listen address"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         address_ = new wxTextCtrl(panel,wxID_ANY,"127.0.0.1"); row->Add(address_,1,wxRIGHT,14);
         row->Add(new wxStaticText(panel,wxID_ANY,"Port"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         port_ = new wxSpinCtrl(panel,wxID_ANY,"65504",wxDefaultPosition,wxSize(140,-1),wxSP_ARROW_KEYS,0,65535,65504); row->Add(port_,0,wxRIGHT,14);
-        verbose_ = new wxCheckBox(panel,wxID_ANY,"Trace wire bytes"); row->Add(verbose_,0,wxALIGN_CENTER_VERTICAL);
+        verbose_ = new wxCheckBox(panel,wxID_ANY,"Trace wire bytes"); transportRow->AddStretchSpacer(); transportRow->Add(verbose_,0,wxALIGN_CENTER_VERTICAL);
         connection->Add(row,0,wxEXPAND|wxALL,10);
-        auto* serialRow = new wxBoxSizer(wxHORIZONTAL);
+        auto* serialRow = new wxBoxSizer(wxHORIZONTAL); serialRow_ = serialRow;
         serialRow->Add(new wxStaticText(panel,wxID_ANY,"Serial port"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         serialPath_=new wxComboBox(panel,wxID_ANY);serialPath_->SetHint("COM3 or /dev/cu.usbserial...");serialRow->Add(serialPath_,1,wxRIGHT,8);
         refreshPorts_=new wxButton(panel,wxID_ANY,"Refresh");serialRow->Add(refreshPorts_,0,wxRIGHT,12);
@@ -443,26 +464,26 @@ public:
         baud_=new wxComboBox(panel,wxID_ANY,"57600",wxDefaultPosition,wxSize(125,-1));for(auto value:{"9600","19200","38400","57600","115200","230400"})baud_->Append(value);serialRow->Add(baud_,0,wxRIGHT,10);
         dtr_=new wxCheckBox(panel,wxID_ANY,"DTR");dtr_->SetValue(true);serialRow->Add(dtr_,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         rts_=new wxCheckBox(panel,wxID_ANY,"RTS");rts_->SetValue(true);serialRow->Add(rts_,0,wxALIGN_CENTER_VERTICAL);
-        connection->Add(serialRow,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,10);
+        connection->Add(serialRow,0,wxEXPAND|wxALL,10);
         auto* rootRow = new wxBoxSizer(wxHORIZONTAL); rootRow->Add(new wxStaticText(panel,wxID_ANY,"RFM root"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         root_ = new wxDirPickerCtrl(panel,wxID_ANY,wxGetHomeDir(),"Choose RFM host root",wxDefaultPosition,wxDefaultSize,wxDIRP_DEFAULT_STYLE|wxDIRP_DIR_MUST_EXIST);
         rootRow->Add(root_,1); connection->Add(rootRow,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,10);
-        connection->Add(new wxStaticText(panel,wxID_ANY,"RFM root contains OS9Boot and device folders such as DD. Stop to change connection settings."),0,wxLEFT|wxRIGHT|wxBOTTOM,10);
-        auto* actions = new wxBoxSizer(wxHORIZONTAL);
-        start_=new wxButton(panel,wxID_ANY,"Start server"); stop_=new wxButton(panel,wxID_ANY,"Stop server"); disconnect_=new wxButton(panel,wxID_ANY,"Disconnect guest");
-        actions->Add(start_,0,wxRIGHT,8); actions->Add(stop_,0,wxRIGHT,8); actions->Add(disconnect_,0);
-        start_->Disable();stop_->Disable();disconnect_->Disable(); connection->Add(actions,0,wxLEFT|wxRIGHT|wxBOTTOM,10);
-        stats_=new wxStaticText(panel,wxID_ANY,"No traffic"); connection->Add(stats_,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,10);
+        connection->Add(new wxStaticText(panel,wxID_ANY,"Choose the folder containing OS9Boot and device folders (such as DD)."),0,wxLEFT|wxRIGHT|wxBOTTOM,10);
         layout->Add(connection,0,wxEXPAND|wxLEFT|wxRIGHT,18);
+        stats_=new wxStaticText(panel,wxID_ANY,"No traffic");
+        layout->Add(stats_,0,wxEXPAND|wxLEFT|wxRIGHT|wxTOP,18);
         auto* notebook = new wxNotebook(panel,wxID_ANY); notebook->SetMinSize(wxSize(-1,160)); layout->Add(notebook,1,wxEXPAND|wxALL,18);
         auto* disks = new wxScrolledWindow(notebook); disks->SetScrollRate(0,20); auto* diskLayout = new wxBoxSizer(wxVERTICAL);
-        diskLayout->Add(new wxStaticText(disks,wxID_ANY,"Guest writes stay in memory until saved. Save changed disks before ejecting or quitting."),0,wxALL,12);
+        diskLayout->Add(new wxStaticText(disks,wxID_ANY,"Disk changes stay in memory until you save them."),0,wxALL,12);
         for (int i=0;i<4;++i) {
-            auto* box = new wxStaticBoxSizer(wxHORIZONTAL,disks,wxString::Format("Drive %d",i));
-            auto& drive=drives_[i]; drive.path=new wxTextCtrl(disks,wxID_ANY,"",wxDefaultPosition,wxDefaultSize,wxTE_READONLY); box->Add(drive.path,1,wxALIGN_CENTER_VERTICAL|wxALL,6);
-            drive.state=new wxStaticText(disks,wxID_ANY,"Empty",wxDefaultPosition,wxSize(66,-1)); box->Add(drive.state,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,6);
+            auto* box = new wxStaticBoxSizer(wxVERTICAL,disks,wxString::Format("Drive %d",i));
+            auto& drive=drives_[i]; drive.path=new wxTextCtrl(disks,wxID_ANY,"",wxDefaultPosition,wxDefaultSize,wxTE_READONLY); drive.path->SetHint("No disk image mounted"); box->Add(drive.path,0,wxEXPAND|wxALL,8);
+            auto* diskActions = new wxBoxSizer(wxHORIZONTAL);
+            drive.state=new wxStaticText(disks,wxID_ANY,"Empty",wxDefaultPosition,FromDIP(wxSize(90,-1))); diskActions->Add(drive.state,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+            diskActions->AddStretchSpacer();
             drive.mount=new wxButton(disks,wxID_ANY,wxS("Mount…")); drive.save=new wxButton(disks,wxID_ANY,"Save"); drive.saveAs=new wxButton(disks,wxID_ANY,wxS("Save As…")); drive.eject=new wxButton(disks,wxID_ANY,"Eject");
-            box->Add(drive.mount,0,wxALL,4);box->Add(drive.save,0,wxALL,4);box->Add(drive.saveAs,0,wxALL,4);box->Add(drive.eject,0,wxALL,4);
+            diskActions->Add(drive.mount,0,wxRIGHT,8);diskActions->Add(drive.save,0,wxRIGHT,8);diskActions->Add(drive.saveAs,0,wxRIGHT,8);diskActions->Add(drive.eject);
+            box->Add(diskActions,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,8);
             drive.mount->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){mount(i);});
             drive.save->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){saveDisk(i);});
             drive.saveAs->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){saveDisk(i,true);});
