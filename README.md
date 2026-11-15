@@ -1,8 +1,13 @@
-#  DriveWire 
+# DriveWire
 
 This is the official repository for DriveWire.
 
-DriveWire defines a standard for guest computers to access input/output resources on a host computer. This model gives the guest computer the appearance that it is directly connected to a large storage device, when in fact, connectivity is achieved using a serial cable connected to the host.
+**The future of DriveWire is the cross-platform Swift server**, with one shared
+engine for Windows, Linux, and macOS. New users should start with
+[DriveWire Swift Server](desktop/README.md) or its
+[command-line interface](swift/PORTABLE.md).
+
+DriveWire defines a standard for guest computers to access input/output resources on a host computer. This model gives the guest computer the appearance that it is directly connected to a large storage device, when in fact, connectivity is provided by a serial connection or TCP transport.
 
 There are distinct advantages in utilizing DriveWire as a storage medium:
 
@@ -10,17 +15,38 @@ There are distinct advantages in utilizing DriveWire as a storage medium:
 - **Remote operation:** The serial cable that tethers the guest to the host can extend for some length, allowing the guest to be positioned a considerable distance.
 - **Easy data management:** Virtual disks that reside on the host can be easily copied, emailed or archived for backup purposes.
 
-The essence of communication between the guest and host is a documented set of uni- and bi-directional messages called *transactions*. Each transaction is composed of one or more packets, which are passed between the guest and host through a serial line connection.
+The essence of communication between the guest and host is a documented set of uni- and bi-directional messages called *transactions*. Each transaction is composed of one or more packets, which are passed between the guest and host over the selected transport.
 
 [The DriveWire Specification](https://github.com/boisy/DriveWire/wiki/DriveWire-Specification) provides the information needed to implement both a host and a guest.
 
+## The future: cross-platform Swift
+
+**DriveWire Swift Server is the focus of future development across Windows,
+Linux, and macOS.** The shared Swift protocol engine is available both as a command-line server and through
+a wxWidgets desktop application. It supports physical serial connections and
+TCP/Becker connections for compatible guest systems and emulators.
+
+The desktop provides disk-image management, RFM host-file access, interactive
+virtual terminals, printer-text preview, live traffic counters, and protocol
+logging. It shares the Swift engine with the separate native macOS SwiftUI app.
+
+- **[Desktop build and usage guide](desktop/README.md):** build and run the
+  wxWidgets application, configure connections, and manage guest resources.
+- **[Command-line server guide](swift/PORTABLE.md):** build and run
+  `drivewire-server` on Windows, Linux, or macOS without the desktop UI.
+- **[Native macOS app](swift/README.md):** the SwiftUI application remains
+  available in `swift/DriveWire.xcodeproj`, including native MIDI output and
+  system-printer integration.
+
 ## Host platforms
 
-This repository has DriveWire host implementations for supported platforms:
+The cross-platform Swift server is the recommended starting point. The native
+Mac apps and earlier host implementations remain available in this repository:
 
+- Windows, Linux, and macOS: [Swift server](swift/PORTABLE.md) and
+  [wxWidgets desktop](desktop/README.md)
+- Native macOS: [SwiftUI](swift) and [Objective-C](objc)
 - UNIX: [C](c)
-- Mac: [Swift](swift) and [Objective-C](objc)
-- Windows and Linux: [portable Swift command-line server](swift/PORTABLE.md)
 - Legacy Windows implementation: [Delphi](delphi)
 
 There are other repositories that host DriveWire implementations:
@@ -35,9 +61,3 @@ DriveWire began life in 2003 as a solution for the Tandy Color Computer. Floppy 
 In January 2010, Aaron Wolfe, Boisy Pitre, and Jim Hathaway expanded the protocol to include networking services. [This work](https://web.archive.org/web/20100121100655/http://home.spogbiper.com/) became the 1st place winner in the [2010 RetroChallenge Winter Warmup](https://web.archive.org/web/20100110223653/http://www.retrochallenge.net/updates.html). Aaron went on to create DriveWire 4, a Java-based host.
 
 DriveWire is still in use today, and there are a number of [YouTube videos](https://www.youtube.com/results?search_query=drivewire+coco) showing it in action.
-
-## Cross-platform desktop
-
-[DriveWire Desktop](desktop/README.md) uses wxWidgets on Windows, Linux and
-macOS with the shared Swift server. The original native Swift Mac application
-remains in `swift/DriveWire.xcodeproj`.
