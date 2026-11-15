@@ -66,3 +66,9 @@ Open/Create, ChgDir, MakDir, and Delete. This permits CoWin's early
 `../CMDS/grfdrv` load when `/DD` is an RFM system device. The companion
 NitrOS-9 `rfm_boot_test` recipe verifies a remote OS9Boot and RFM-backed `/DD`
 with no RBF modules or server-mounted virtual disks.
+
+## Portable command-line server
+
+See [PORTABLE.md](PORTABLE.md) for the shared Swift package and TCP server for
+Windows, macOS and Linux. The existing Xcode application continues to use its
+native Mac backends while sharing the protocol implementation.

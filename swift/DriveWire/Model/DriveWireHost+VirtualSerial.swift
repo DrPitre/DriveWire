@@ -4,7 +4,15 @@
 //
 
 import Foundation
+#if SWIFT_PACKAGE
+import DriveWireNetworking
+typealias DriveWireNetworkConnection = TCPConnection
+typealias DriveWireNetworkListener = TCPListener
+#else
 import Network
+typealias DriveWireNetworkConnection = NWConnection
+typealias DriveWireNetworkListener = NWListener
+#endif
 
 extension DriveWireHost {
     struct VirtualSerialTCPServiceOptions {
@@ -17,7 +25,7 @@ extension DriveWireHost {
     }
 
     struct PendingVirtualSerialTCPConnection {
-        let connection: NWConnection
+        let connection: DriveWireNetworkConnection
         let localPort: UInt16
         let remoteAddress: String
         let serviceOptions: VirtualSerialTCPServiceOptions
@@ -157,8 +165,9 @@ extension DriveWireHost {
         }
     }
 
+    #if !SWIFT_PACKAGE
     final class VirtualSerialTCPConnection {
-        private let connection: NWConnection
+        private let connection: DriveWireNetworkConnection
         private let queue: DispatchQueue
         private let onReceive: (Data) -> Void
         private let onClose: () -> Void
@@ -179,7 +188,7 @@ extension DriveWireHost {
             self.connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
         }
 
-        init(connection: NWConnection, host: String, port: UInt16, telnetMode: Bool, onReceive: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
+        init(connection: DriveWireNetworkConnection, host: String, port: UInt16, telnetMode: Bool, onReceive: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
             self.host = host
             self.port = port
             self.onReceive = onReceive
@@ -243,6 +252,61 @@ extension DriveWireHost {
         }
 
     }
+
+    #else
+    final class VirtualSerialTCPConnection {
+        private let connection: TCPConnection
+        private let onReceive: (Data) -> Void
+        private let onClose: () -> Void
+        private let telnetMode: Bool
+        private var codec = TelnetCodec()
+        let host: String
+        let port: UInt16
+
+        init(host: String, port: UInt16, onReceive: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
+            self.host = host
+            self.port = port
+            self.connection = TCPConnection(host: host, port: port)
+            self.telnetMode = false
+            self.onReceive = onReceive
+            self.onClose = onClose
+        }
+
+        init(connection: TCPConnection, host: String, port: UInt16, telnetMode: Bool,
+             onReceive: @escaping (Data) -> Void, onClose: @escaping () -> Void) {
+            self.connection = connection
+            self.host = host
+            self.port = port
+            self.telnetMode = telnetMode
+            self.onReceive = onReceive
+            self.onClose = onClose
+        }
+
+        func start() {
+            connection.onReady = { [weak self] in
+                guard let self, self.telnetMode else { return }
+                self.connection.send(TelnetCodec.initialNegotiation)
+            }
+            connection.onReceive = { [weak self] data in
+                guard let self else { return }
+                if self.telnetMode {
+                    let decoded = self.codec.decode(data)
+                    self.connection.send(decoded.replies)
+                    self.onReceive(decoded.payload)
+                } else { self.onReceive(data) }
+            }
+            connection.onClose = { [weak self] _ in self?.onClose() }
+            connection.start()
+        }
+
+        func send(_ data: Data) {
+            connection.send(telnetMode ? codec.encode(data) : data)
+        }
+
+        func close() { connection.cancel() }
+    }
+
+    #endif
 
     func OP_SERINIT(data : Data) -> Int {
         currentTransaction = OPSERINIT
@@ -708,6 +772,7 @@ extension DriveWireHost {
 
         do {
             virtualSerialTCPListeners[tcpPort]?.cancel()
+            #if !SWIFT_PACKAGE
             let listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: tcpPort)!)
             listener.newConnectionHandler = { [weak self] connection in
                 DispatchQueue.main.async {
@@ -725,6 +790,13 @@ extension DriveWireHost {
                 }
             }
             listener.start(queue: .main)
+            #else
+            let listener = TCPListener(host: "0.0.0.0", port: tcpPort)
+            try listener.start { [weak self] connection in
+                self?.acceptVirtualSerialTCPConnection(connection, localPort: tcpPort,
+                    serviceOptions: serviceOptions, announceOn: channel)
+            }
+            #endif
             virtualSerialTCPListeners[tcpPort] = listener
             openVirtualSerialChannels.insert(channel)
             refreshVirtualSerialChannelStatuses()
@@ -765,10 +837,14 @@ extension DriveWireHost {
         return virtualSerialTCPSuccess()
     }
 
-    func acceptVirtualSerialTCPConnection(_ connection: NWConnection, localPort: UInt16, serviceOptions: VirtualSerialTCPServiceOptions, announceOn channel: UInt8) {
+    func acceptVirtualSerialTCPConnection(_ connection: DriveWireNetworkConnection, localPort: UInt16, serviceOptions: VirtualSerialTCPServiceOptions, announceOn channel: UInt8) {
         let connectionID = nextVirtualSerialTCPConnectionID
         nextVirtualSerialTCPConnectionID += 1
+        #if !SWIFT_PACKAGE
         let remoteAddress = remoteAddressDescription(for: connection.endpoint)
+        #else
+        let remoteAddress = connection.remoteAddress
+        #endif
         pendingVirtualSerialTCPConnections[connectionID] = PendingVirtualSerialTCPConnection(
             connection: connection,
             localPort: localPort,
@@ -778,6 +854,7 @@ extension DriveWireHost {
         enqueueVirtualSerialResponse("\(connectionID) \(localPort) \(remoteAddress)\n\r", channel: channel)
     }
 
+    #if !SWIFT_PACKAGE
     func remoteAddressDescription(for endpoint: NWEndpoint) -> String {
         switch endpoint {
         case .hostPort(let host, _):
@@ -787,34 +864,46 @@ extension DriveWireHost {
         }
     }
 
+    #endif
+
     func makeVirtualSerialTCPConnection(channel: UInt8, host: String, port: UInt16) -> VirtualSerialTCPConnection {
-        VirtualSerialTCPConnection(host: host, port: port, onReceive: { [weak self] data in
+        weak var reference: VirtualSerialTCPConnection?
+        let connection = VirtualSerialTCPConnection(host: host, port: port, onReceive: { [weak self] data in
             DispatchQueue.main.async {
-                self?.virtualSerialInput[channel, default: Data()].append(data)
-                self?.refreshVirtualSerialChannelStatuses()
+                guard let self, let reference, self.virtualSerialTCPConnections[channel] === reference else { return }
+                self.virtualSerialInput[channel, default: Data()].append(data)
+                self.refreshVirtualSerialChannelStatuses()
             }
         }, onClose: { [weak self] in
             DispatchQueue.main.async {
-                self?.virtualSerialTCPConnections[channel] = nil
-                self?.openVirtualSerialChannels.remove(channel)
-                self?.refreshVirtualSerialChannelStatuses()
+                guard let self, let reference, self.virtualSerialTCPConnections[channel] === reference else { return }
+                self.virtualSerialTCPConnections[channel] = nil
+                self.openVirtualSerialChannels.remove(channel)
+                self.refreshVirtualSerialChannelStatuses()
             }
         })
+        reference = connection
+        return connection
     }
 
-    func makeVirtualSerialTCPConnection(channel: UInt8, connection: NWConnection, host: String, port: UInt16, serviceOptions: VirtualSerialTCPServiceOptions) -> VirtualSerialTCPConnection {
-        VirtualSerialTCPConnection(connection: connection, host: host, port: port, telnetMode: serviceOptions.telnet, onReceive: { [weak self] data in
+    func makeVirtualSerialTCPConnection(channel: UInt8, connection: DriveWireNetworkConnection, host: String, port: UInt16, serviceOptions: VirtualSerialTCPServiceOptions) -> VirtualSerialTCPConnection {
+        weak var reference: VirtualSerialTCPConnection?
+        let connection = VirtualSerialTCPConnection(connection: connection, host: host, port: port, telnetMode: serviceOptions.telnet, onReceive: { [weak self] data in
             DispatchQueue.main.async {
-                self?.virtualSerialInput[channel, default: Data()].append(data)
-                self?.refreshVirtualSerialChannelStatuses()
+                guard let self, let reference, self.virtualSerialTCPConnections[channel] === reference else { return }
+                self.virtualSerialInput[channel, default: Data()].append(data)
+                self.refreshVirtualSerialChannelStatuses()
             }
         }, onClose: { [weak self] in
             DispatchQueue.main.async {
-                self?.virtualSerialTCPConnections[channel] = nil
-                self?.openVirtualSerialChannels.remove(channel)
-                self?.refreshVirtualSerialChannelStatuses()
+                guard let self, let reference, self.virtualSerialTCPConnections[channel] === reference else { return }
+                self.virtualSerialTCPConnections[channel] = nil
+                self.openVirtualSerialChannels.remove(channel)
+                self.refreshVirtualSerialChannelStatuses()
             }
         })
+        reference = connection
+        return connection
     }
 
     func isVirtualWindowChannel(_ channel: UInt8) -> Bool {
