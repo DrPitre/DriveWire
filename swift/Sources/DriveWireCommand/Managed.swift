@@ -8,6 +8,10 @@ func runManaged() -> Never {
     func output(_ object: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return }
+        // Swift print uses buffered stdio when stdout is a pipe. Deliver
+        // diagnostics before the unbuffered control reply so the desktop's
+        // regular status polling also keeps small wire traces up to date.
+        fflush(nil)
         // A leading newline keeps legacy protocol diagnostic prints separate.
         FileHandle.standardOutput.write(Data(("\n@drivewire " + json + "\n").utf8))
     }

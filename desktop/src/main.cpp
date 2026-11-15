@@ -1,5 +1,5 @@
 #include <wx/wx.h>
-#include <wx/notebook.h>
+#include <wx/simplebook.h>
 #include <wx/filepicker.h>
 #include <wx/spinctrl.h>
 #include <wx/listctrl.h>
@@ -13,7 +13,11 @@
 #include <wx/cmdline.h>
 #include <wx/combobox.h>
 #include <wx/scrolwin.h>
+#include <wx/dcbuffer.h>
+#include <wx/clipbrd.h>
+#include <wx/dataobj.h>
 #include <functional>
+#include <algorithm>
 #include <map>
 #include <array>
 #include <chrono>
@@ -27,9 +31,77 @@ static std::string stringValue(const json& j, const char* key, const std::string
     return j.contains(key) && j[key].is_string() ? j[key].get<std::string>() : fallback;
 }
 
+namespace Palette {
+const wxColour canvas(20,28,30), panel(38,46,46), raised(49,59,59);
+const wxColour text(239,245,243), muted(166,184,178), accent(71,196,156);
+}
+
+class DashboardCard : public wxPanel {
+public:
+    DashboardCard(wxWindow* parent) : wxPanel(parent) {
+        SetBackgroundStyle(wxBG_STYLE_PAINT);
+        SetBackgroundColour(Palette::panel);
+        Bind(wxEVT_PAINT,[this](wxPaintEvent&) {
+            wxAutoBufferedPaintDC dc(this);
+            dc.SetBackground(wxBrush(GetParent()->GetBackgroundColour())); dc.Clear();
+            dc.SetPen(wxPen(wxColour(57,70,66))); dc.SetBrush(wxBrush(Palette::panel));
+            dc.DrawRoundedRectangle(GetClientRect().Deflate(1),FromDIP(12));
+        });
+    }
+};
+
+static wxStaticText* heading(wxWindow* parent, const wxString& title, int size=16) {
+    auto* label=new wxStaticText(parent,wxID_ANY,title);
+    label->SetFont(wxFontInfo(size).Bold()); label->SetForegroundColour(Palette::text);
+    return label;
+}
+static void dashboardTheme(wxWindow* parent) {
+    for(auto* child:parent->GetChildren()) {
+        child->SetForegroundColour(Palette::text);
+        if(dynamic_cast<wxTextCtrl*>(child)||dynamic_cast<wxListCtrl*>(child)) child->SetBackgroundColour(Palette::canvas);
+        else if(dynamic_cast<wxButton*>(child)) child->SetBackgroundColour(Palette::raised);
+        else child->SetBackgroundColour(parent->GetBackgroundColour());
+        dashboardTheme(child);
+    }
+}
+
+// Separate native buttons avoid the compact, embossed labels in the macOS
+// notebook tab strip, while retaining keyboard and accessibility support.
+class ServiceBook final : public wxSimplebook {
+    wxWindow* tabParent_;
+    wxBoxSizer* tabRow_;
+    std::vector<wxButton*> tabs_;
+public:
+    ServiceBook(wxWindow* parent,wxWindow* tabParent,wxBoxSizer* row)
+        : wxSimplebook(parent,wxID_ANY),tabParent_(tabParent),tabRow_(row) {}
+    bool AddPage(wxWindow* page,const wxString& label,bool select=false,int imageId=-1) override {
+        auto* button=new wxButton(tabParent_,wxID_ANY,label,wxDefaultPosition,wxDefaultSize,wxBORDER_NONE);
+        button->SetFont(wxFontInfo(13));
+        button->SetMinSize(button->FromDIP(wxSize(-1,36)));
+        size_t index=tabs_.size();tabs_.push_back(button);
+        tabRow_->Add(button,1,wxEXPAND|wxRIGHT,4);
+        button->Bind(wxEVT_BUTTON,[this,index](wxCommandEvent&){SetSelection(index);});
+        bool added=wxSimplebook::AddPage(page,label,select,imageId);
+        RefreshTabs();return added;
+    }
+    int SetSelection(size_t page) override {
+        int previous=wxSimplebook::SetSelection(page);RefreshTabs();return previous;
+    }
+    void RefreshTabs() {
+        for(size_t i=0;i<tabs_.size();++i){
+            bool selected=static_cast<int>(i)==GetSelection();
+            tabs_[i]->SetBackgroundColour(selected?wxColour(38,89,74):Palette::panel);
+            tabs_[i]->SetForegroundColour(selected?wxColour(220,255,241):Palette::text);
+            tabs_[i]->SetName(tabs_[i]->GetLabel()+(selected?" (selected)":""));
+            tabs_[i]->Refresh();
+        }
+    }
+};
+
 class Desktop final : public wxFrame {
-    wxTextCtrl *address_, *log_, *printer_, *windowText_, *windowInput_;
-    wxStaticText* stats_;
+    wxTextCtrl *address_, *log_, *printer_, *windowText_;
+    wxStaticText *stats_, *receivedMetric_, *sentMetric_, *transactionMetric_, *connectionBadge_;
+    std::array<wxStaticText*,8> channelBadges_;
     wxBoxSizer *tcpRow_, *serialRow_;
     wxPanel* mainPanel_;
     wxSpinCtrl* port_;
@@ -42,6 +114,9 @@ class Desktop final : public wxFrame {
     wxCheckBox* verbose_;
     wxButton *start_, *stop_, *disconnect_;
     wxChoice* windowChoice_;
+    ServiceBook* services_;
+    wxString terminalOutput_;
+    bool terminalCursor_ = false;
     wxListCtrl* channels_;
     struct DriveRow { wxTextCtrl* path; wxStaticText* state; wxButton *mount, *eject, *save, *saveAs; };
     std::array<DriveRow, 4> drives_;
@@ -52,6 +127,7 @@ class Desktop final : public wxFrame {
     std::string stdoutBuffer_, stderrBuffer_;
     json state_ = json::object();
     long nextID_ = 1;
+    std::chrono::steady_clock::time_point lastStatusPoll_{};
     struct Pending { std::function<void(const json&)> callback; std::chrono::steady_clock::time_point sent; bool quiet; };
     std::map<long, Pending> pending_;
     int ticks_ = 0;
@@ -173,6 +249,7 @@ class Desktop final : public wxFrame {
             tcpRow_->ShowItems(!serial);
             serialRow_->ShowItems(serial);
             mainPanel_->Layout();
+            if(auto* scroll=dynamic_cast<wxScrolledWindow*>(mainPanel_)) scroll->FitInside();
         }
         transport_->Enable(!active);
         address_->Enable(!active && !serial); port_->Enable(!active && !serial);
@@ -301,6 +378,16 @@ class Desktop final : public wxFrame {
     }
     void update(const json& state) {
         bool wasConnected = state_.value("connected", false);
+        bool channelsChanged = state_.value("channels",json::array()) != state.value("channels",json::array());
+        bool windowsChanged = state_.value("windows",json::array()) != state.value("windows",json::array());
+        int newWindow=-1;
+        const auto previousWindows=state_.value("windows",json::array());
+        for(const auto& window:state.value("windows",json::array())) {
+            int channel=window.value("channel",-1);
+            if(channel<0 || !window.value("open",true)) continue;
+            auto previous=std::find_if(previousWindows.begin(),previousWindows.end(),[channel](const json& item){return item.value("channel",-1)==channel && item.value("open",true);});
+            if(previous==previousWindows.end()) newWindow=channel;
+        }
         state_ = state;
         bool active = running(), connected = state_.value("connected", false);
         bool serial = stringValue(state_,"transport") == "serial";
@@ -311,34 +398,49 @@ class Desktop final : public wxFrame {
         SetStatusText(active ? (serial ? text(stringValue(state_,"serialPath")) : text(stringValue(state_,"bind")) + wxString::Format(":%d",state_.value("port",0))) : "", 1);
         auto serialError = stringValue(state_,"serialError");
         if (serialError != lastSerialError_) { if (!serialError.empty()) appendLog("Serial: " + text(serialError) + " (retrying)"); lastSerialError_ = serialError; }
-        stats_->SetLabel(wxString::Format("Received: %llu bytes     Sent: %llu bytes     Transactions: %llu",
-            static_cast<unsigned long long>(state_.value("received", 0ULL)),
-            static_cast<unsigned long long>(state_.value("sent", 0ULL)),
-            static_cast<unsigned long long>(state_.value("transactions", 0ULL))));
+        auto metricValue=[](unsigned long long value) { return wxString::Format("%llu",value); };
+        receivedMetric_->SetLabel(metricValue(state_.value("received",0ULL)));
+        sentMetric_->SetLabel(metricValue(state_.value("sent",0ULL)));
+        transactionMetric_->SetLabel(metricValue(state_.value("transactions",0ULL)));
+        connectionBadge_->SetLabel(!active ? "SERVER STOPPED" : connected ? "CONNECTED" : "LISTENING");
+        connectionBadge_->SetForegroundColour(active ? Palette::accent : Palette::muted);
+        stats_->SetLabel(!active ? "Start the server to accept a connection." : serial ? "Serial transport  /  " + text(stringValue(state_,"serialPath")) : "TCP transport  /  " + text(stringValue(state_,"bind")) + wxString::Format(":%d",state_.value("port",0)));
         for (int i=0; i<4; ++i) {
             bool mounted = false;
             for (const auto& d : state_["disks"]) if (d.value("drive",-1)==i) {
                 drives_[i].path->ChangeValue(text(stringValue(d,"path")));
                 drives_[i].path->SetToolTip(text(stringValue(d,"path")));
                 drives_[i].state->SetLabel(d.value("dirty",false) ? "Modified" : "Ready");
+                drives_[i].state->SetForegroundColour(d.value("dirty",false) ? wxColour(245,185,94) : Palette::accent);
                 mounted = true;
                 break;
             }
-            if (!mounted) { drives_[i].state->SetLabel("Empty"); drives_[i].path->UnsetToolTip(); if (ready_ && ticks_ > 3) drives_[i].path->Clear(); }
+            if (!mounted) { drives_[i].state->SetLabel("Empty"); drives_[i].state->SetForegroundColour(Palette::muted); drives_[i].path->UnsetToolTip(); if (ready_ && ticks_ > 3) drives_[i].path->Clear(); }
             drives_[i].mount->Enable(ready_ && !closing_); drives_[i].save->Enable(mounted && !closing_); drives_[i].saveAs->Enable(mounted && !closing_); drives_[i].eject->Enable(mounted && !closing_);
         }
         auto printer = state_.value("printer",json::object());
         auto preview = text(stringValue(printer,"text"));
         if (printer_->GetValue() != preview) printer_->ChangeValue(preview);
+        if(channelsChanged) {
+        for(int i=0;i<8;++i){channelBadges_[i]->SetLabel(wxString::Format("Channel %d  /  Idle",i+1));channelBadges_[i]->SetForegroundColour(Palette::muted);}
         channels_->DeleteAllItems();
         for (const auto& channel : state_.value("channels",json::array())) {
+            int number=channel.value("channel",0);
+            if(number>=1 && number<=8){
+                bool open=channel.value("open",false);int pending=channel.value("pending",0);
+                channelBadges_[number-1]->SetLabel(wxString::Format("Channel %d  /  ",number)+(channel.value("tcp",false)?wxString("TCP"):open?wxString("Open"):wxString("Idle"))+(pending?wxString::Format("  /  %d B",pending):wxString()));
+                channelBadges_[number-1]->SetForegroundColour(open?Palette::accent:Palette::muted);
+            }
             long row = channels_->InsertItem(channels_->GetItemCount(),wxString::Format("%d",channel.value("channel",0)));
             channels_->SetItem(row,1,channel.value("open",false) ? "Open" : "Closed");
             channels_->SetItem(row,2,channel.value("tcp",false) ? "TCP" : "Local");
             channels_->SetItem(row,3,wxString::Format("%d",channel.value("pending",0)));
         }
+        }
+        if(windowsChanged) {
         int selected = windowChoice_->GetSelection();
         int selectedChannel = selected == wxNOT_FOUND ? -1 : static_cast<int>(reinterpret_cast<intptr_t>(windowChoice_->GetClientData(selected)));
+        if(newWindow>=0) selectedChannel=newWindow;
         windowChoice_->Clear();
         for (const auto& window : state_.value("windows",json::array())) {
             int channel = window.value("channel",128);
@@ -346,6 +448,15 @@ class Desktop final : public wxFrame {
             if (channel == selectedChannel) windowChoice_->SetSelection(static_cast<int>(index));
         }
         if (windowChoice_->GetSelection() == wxNOT_FOUND && windowChoice_->GetCount()) windowChoice_->SetSelection(0);
+        }
+        windowChoice_->Enable(windowChoice_->GetCount()>0);
+        if(newWindow>=0) {
+            services_->SetSelection(0);
+            Raise();
+            // Native notebook activation can restore its own focus after
+            // SetSelection; focus the terminal once that event completes.
+            CallAfter([this,newWindow]{if(!closing_ && windowChannel()==newWindow) windowText_->SetFocus();});
+        }
         showWindow();
     }
     int windowChannel() const {
@@ -355,8 +466,39 @@ class Desktop final : public wxFrame {
     void showWindow() {
         int selected = windowChannel(); std::string value;
         for (const auto& w : state_.value("windows",json::array())) if (w.value("channel",-1)==selected) value = stringValue(w,"text");
-        auto display = text(value); if (windowText_->GetValue() != display) { windowText_->ChangeValue(display); windowText_->ShowPosition(windowText_->GetLastPosition()); }
-        windowInput_->Enable(selected >= 0 && running());
+        auto output=text(value);
+        long selectionStart=0,selectionEnd=0;windowText_->GetSelection(&selectionStart,&selectionEnd);
+        bool outputChanged=terminalOutput_!=output;
+        bool cursor=selected>=0 && running() && wxWindow::FindFocus()==windowText_ && selectionStart==selectionEnd &&
+            (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()/500)%2==0;
+        if(outputChanged || cursor!=terminalCursor_){
+            int scroll=windowText_->GetScrollPos(wxVERTICAL);
+            terminalOutput_=output;terminalCursor_=cursor;
+            windowText_->ChangeValue(output+(cursor?wxString(wxUniChar(0x2588)):wxString()));
+            if(outputChanged){windowText_->SetInsertionPointEnd();windowText_->ShowPosition(windowText_->GetLastPosition());}
+            else {windowText_->SetSelection(selectionStart,selectionEnd);windowText_->SetScrollPos(wxVERTICAL,scroll);}
+        }
+        windowText_->SetToolTip(selected >= 0 && running() ? "Type directly here. Ctrl keys go to the guest; use the platform copy/paste shortcuts." : "Open a /Z device on the guest to begin an interactive session.");
+    }
+    void sendWindowInput(const wxString& input) {
+        int channel=windowChannel();
+        if(channel<0 || !running() || input.empty()) return;
+        send({{"command","windowInput"},{"channel",channel},{"text",utf8(input)}});
+    }
+    void copyWindow() {
+        long start=0,end=0;windowText_->GetSelection(&start,&end);
+        // The block cursor is presentation only and must never enter copied text.
+        end=std::min(end,static_cast<long>(terminalOutput_.length()));
+        if(end<=start || !wxTheClipboard->Open()) return;
+        wxTheClipboard->SetData(new wxTextDataObject(terminalOutput_.Mid(start,end-start)));
+        wxTheClipboard->Close();
+    }
+    void pasteWindow() {
+        if(!wxTheClipboard->Open()) return;
+        wxTextDataObject data;
+        bool available=wxTheClipboard->GetData(data);
+        wxTheClipboard->Close();
+        if(available){auto input=data.GetText();input.Replace("\r\n","\r");input.Replace("\n","\r");sendWindowInput(input);}
     }
     void close() {
         if (closing_) return;
@@ -389,13 +531,18 @@ class Desktop final : public wxFrame {
         if (process_ && !ready_ && now - launched_ > std::chrono::seconds(20)) {
             ready_ = true; error("The backend did not complete startup. Check its log and runtime libraries.");
         }
-        if (ready_ && process_ && !closing_ && ticks_ % 20 == 0 && !statusPending_) {
+        // Use elapsed time rather than timer counts; retain backpressure when
+        // the backend is busy so refresh requests cannot accumulate.
+        auto refreshInterval = std::chrono::milliseconds(running() ? 100 : 500);
+        if (ready_ && process_ && !closing_ && now-lastStatusPoll_ >= refreshInterval && !statusPending_) {
+            lastStatusPoll_ = now;
             statusPending_ = true;
             send({{"command","status"}},[this](const json&) { statusPending_ = false; },true);
         }
         std::vector<long> expired;
         for (const auto& item : pending_) if (now - item.second.sent > std::chrono::seconds(15)) expired.push_back(item.first);
         for (auto id : expired) { auto quiet=pending_[id].quiet; pending_.erase(id); statusPending_=false; if (!quiet) error("The server did not respond to a command."); }
+        showWindow();
         if (smoke_) smokeTick();
     }
     void onExit(wxProcessEvent& event) {
@@ -420,23 +567,24 @@ class Desktop final : public wxFrame {
     }
     void smokeTick();
 public:
-    Desktop(wxString server, wxString smokeRoot) : wxFrame(nullptr,wxID_ANY,"DriveWire Desktop",wxDefaultPosition,wxSize(1040,820)),
+    Desktop(wxString server, wxString smokeRoot) : wxFrame(nullptr,wxID_ANY,"DriveWire Swift Server",wxDefaultPosition,wxSize(1280,900)),
         timer_(this), executable_(server), smokeRoot_(smokeRoot), smoke_(!smokeRoot.empty()) {
-        SetMinSize(FromDIP(wxSize(820,680)));
+        SetMinSize(FromDIP(wxSize(1100,720)));
         auto* menu = new wxMenuBar; auto* file = new wxMenu;
         file->Append(wxID_OPEN,wxS("&Open configuration…\tCtrl+O")); file->Append(wxID_SAVEAS,wxS("&Save configuration…\tCtrl+Shift+S"));
         file->AppendSeparator(); file->Append(wxID_EXIT,"&Quit\tCtrl+Q"); menu->Append(file,"&File");
         auto* serverMenu = new wxMenu; serverMenu->Append(1001,"Restart &backend"); serverMenu->Append(1002,"Save all disk changes\tCtrl+S"); menu->Append(serverMenu,"&Server");
-        auto* help = new wxMenu; help->Append(wxID_ABOUT,"&About DriveWire Desktop"); menu->Append(help,"&Help"); SetMenuBar(menu);
+        auto* help = new wxMenu; help->Append(wxID_ABOUT,"&About DriveWire Swift Server"); menu->Append(help,"&Help"); SetMenuBar(menu);
         CreateStatusBar(2); int widths[]={-1,230}; SetStatusWidths(2,widths);
-        auto* panel = new wxPanel(this); mainPanel_ = panel; auto* layout = new wxBoxSizer(wxVERTICAL);
+        auto* panel = new wxPanel(this); auto* rootPanel=panel; mainPanel_ = panel; panel->SetBackgroundColour(Palette::canvas); auto* layout = new wxBoxSizer(wxVERTICAL);
         auto* header = new wxBoxSizer(wxHORIZONTAL);
         auto* branding = new wxBoxSizer(wxVERTICAL);
-        auto* title = new wxStaticText(panel,wxID_ANY,"DriveWire");
-        title->SetFont(title->GetFont().Larger().Larger().Bold());
+        auto* title = new wxStaticText(panel,wxID_ANY,"DriveWire Swift Server");
+        title->SetFont(wxFontInfo(28).Bold());
         branding->Add(title);
-        branding->Add(new wxStaticText(panel,wxID_ANY,"Disk storage and connections for your CoCo"),0,wxTOP,4);
         header->Add(branding,1,wxALIGN_CENTER_VERTICAL|wxRIGHT,16);
+        connectionBadge_=heading(panel,"SERVER STOPPED",11);
+        header->Add(connectionBadge_,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,18);
         start_=new wxButton(panel,wxID_ANY,"Start server");
         stop_=new wxButton(panel,wxID_ANY,"Stop server");
         disconnect_=new wxButton(panel,wxID_ANY,"Disconnect guest");
@@ -445,7 +593,13 @@ public:
         header->Add(disconnect_,0,wxALIGN_CENTER_VERTICAL);
         start_->Disable();stop_->Disable();disconnect_->Disable();
         layout->Add(header,0,wxEXPAND|wxALL,18);
-        auto* connection = new wxStaticBoxSizer(wxVERTICAL,panel,"Connection");
+        auto* columns=new wxBoxSizer(wxHORIZONTAL);
+        auto* left=new wxScrolledWindow(rootPanel); left->SetScrollRate(0,16); left->SetBackgroundColour(Palette::canvas);
+        auto* leftLayout=new wxBoxSizer(wxVERTICAL);
+        auto* connectionCard=new DashboardCard(left);
+        panel=connectionCard; mainPanel_=left;
+        auto* connection = new wxBoxSizer(wxVERTICAL);
+        connection->Add(heading(panel,"Connection"),0,wxALL,14);
         auto* transportRow = new wxBoxSizer(wxHORIZONTAL);
         transportRow->Add(new wxStaticText(panel,wxID_ANY,"Transport"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         transport_=new wxChoice(panel,wxID_ANY);transport_->Append("TCP / Becker");transport_->Append("Serial port");transport_->SetSelection(0);transportRow->Add(transport_,0);
@@ -453,35 +607,62 @@ public:
         auto* row = new wxBoxSizer(wxHORIZONTAL); tcpRow_ = row; row->Add(new wxStaticText(panel,wxID_ANY,"Listen address"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         address_ = new wxTextCtrl(panel,wxID_ANY,"127.0.0.1"); row->Add(address_,1,wxRIGHT,14);
         row->Add(new wxStaticText(panel,wxID_ANY,"Port"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
-        port_ = new wxSpinCtrl(panel,wxID_ANY,"65504",wxDefaultPosition,wxSize(140,-1),wxSP_ARROW_KEYS,0,65535,65504); row->Add(port_,0,wxRIGHT,14);
+        port_ = new wxSpinCtrl(panel,wxID_ANY,"65504",wxDefaultPosition,wxSize(95,-1),wxSP_ARROW_KEYS,0,65535,65504); row->Add(port_,0,wxRIGHT,14);
         verbose_ = new wxCheckBox(panel,wxID_ANY,"Trace wire bytes"); transportRow->AddStretchSpacer(); transportRow->Add(verbose_,0,wxALIGN_CENTER_VERTICAL);
         connection->Add(row,0,wxEXPAND|wxALL,10);
         auto* serialRow = new wxBoxSizer(wxHORIZONTAL); serialRow_ = serialRow;
         serialRow->Add(new wxStaticText(panel,wxID_ANY,"Serial port"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         serialPath_=new wxComboBox(panel,wxID_ANY);serialPath_->SetHint("COM3 or /dev/cu.usbserial...");serialRow->Add(serialPath_,1,wxRIGHT,8);
         refreshPorts_=new wxButton(panel,wxID_ANY,"Refresh");serialRow->Add(refreshPorts_,0,wxRIGHT,12);
-        serialRow->Add(new wxStaticText(panel,wxID_ANY,"Baud"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
-        baud_=new wxComboBox(panel,wxID_ANY,"57600",wxDefaultPosition,wxSize(125,-1));for(auto value:{"9600","19200","38400","57600","115200","230400"})baud_->Append(value);serialRow->Add(baud_,0,wxRIGHT,10);
-        dtr_=new wxCheckBox(panel,wxID_ANY,"DTR");dtr_->SetValue(true);serialRow->Add(dtr_,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
-        rts_=new wxCheckBox(panel,wxID_ANY,"RTS");rts_->SetValue(true);serialRow->Add(rts_,0,wxALIGN_CENTER_VERTICAL);
-        connection->Add(serialRow,0,wxEXPAND|wxALL,10);
+        auto* serialSettings=new wxBoxSizer(wxHORIZONTAL);
+        serialSettings->Add(new wxStaticText(panel,wxID_ANY,"Baud"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+        baud_=new wxComboBox(panel,wxID_ANY,"57600",wxDefaultPosition,wxSize(100,-1));for(auto value:{"9600","19200","38400","57600","115200","230400"})baud_->Append(value);serialSettings->Add(baud_,0,wxRIGHT,10);
+        dtr_=new wxCheckBox(panel,wxID_ANY,"DTR");dtr_->SetValue(true);serialSettings->Add(dtr_,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+        rts_=new wxCheckBox(panel,wxID_ANY,"RTS");rts_->SetValue(true);serialSettings->Add(rts_,0,wxALIGN_CENTER_VERTICAL);
+        auto* serialGroup=new wxBoxSizer(wxVERTICAL); serialGroup->Add(serialRow,0,wxEXPAND|wxBOTTOM,8);serialGroup->Add(serialSettings,0,wxEXPAND);
+        serialRow_=serialGroup;
+        connection->Add(serialGroup,0,wxEXPAND|wxALL,10);
         auto* rootRow = new wxBoxSizer(wxHORIZONTAL); rootRow->Add(new wxStaticText(panel,wxID_ANY,"RFM root"),0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
         root_ = new wxDirPickerCtrl(panel,wxID_ANY,wxGetHomeDir(),"Choose RFM host root",wxDefaultPosition,wxDefaultSize,wxDIRP_DEFAULT_STYLE|wxDIRP_DIR_MUST_EXIST);
         rootRow->Add(root_,1); connection->Add(rootRow,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,10);
         connection->Add(new wxStaticText(panel,wxID_ANY,"Choose the folder containing OS9Boot and device folders (such as DD)."),0,wxLEFT|wxRIGHT|wxBOTTOM,10);
-        layout->Add(connection,0,wxEXPAND|wxLEFT|wxRIGHT,18);
-        stats_=new wxStaticText(panel,wxID_ANY,"No traffic");
-        layout->Add(stats_,0,wxEXPAND|wxLEFT|wxRIGHT|wxTOP,18);
-        auto* notebook = new wxNotebook(panel,wxID_ANY); notebook->SetMinSize(wxSize(-1,160)); layout->Add(notebook,1,wxEXPAND|wxALL,18);
-        auto* disks = new wxScrolledWindow(notebook); disks->SetScrollRate(0,20); auto* diskLayout = new wxBoxSizer(wxVERTICAL);
+        connectionCard->SetSizer(connection); leftLayout->Add(connectionCard,0,wxEXPAND|wxBOTTOM,14);
+        auto* right=new wxPanel(rootPanel); right->SetBackgroundColour(Palette::canvas); auto* rightLayout=new wxBoxSizer(wxVERTICAL);
+        auto* activity=new DashboardCard(right); auto* activityLayout=new wxBoxSizer(wxVERTICAL);
+        activityLayout->Add(heading(activity,"Activity"),0,wxALL,14);
+        auto* metrics=new wxBoxSizer(wxHORIZONTAL);
+        auto metric=[&](const wxString& label) {
+            auto* tile=new wxPanel(activity);tile->SetBackgroundColour(Palette::raised);auto* tileLayout=new wxBoxSizer(wxVERTICAL);
+            auto* value=heading(tile,"0",22);tileLayout->Add(value,0,wxALL,10);
+            tileLayout->Add(new wxStaticText(tile,wxID_ANY,label),0,wxLEFT|wxRIGHT|wxBOTTOM,10);
+            tile->SetSizer(tileLayout);metrics->Add(tile,1,wxEXPAND|wxRIGHT,8);return value;
+        };
+        receivedMetric_=metric("Received bytes");sentMetric_=metric("Sent bytes");transactionMetric_=metric("Transactions");
+        activityLayout->Add(metrics,0,wxEXPAND|wxLEFT|wxRIGHT,14);
+        stats_=new wxStaticText(activity,wxID_ANY,"Waiting for activity");activityLayout->Add(stats_,0,wxALL,14);
+        activity->SetSizer(activityLayout);rightLayout->Add(activity,0,wxEXPAND|wxBOTTOM,14);
+        auto* channelCard=new DashboardCard(right);auto* channelLayout=new wxBoxSizer(wxVERTICAL);
+        channelLayout->Add(heading(channelCard,"Virtual channels"),0,wxALL,14);
+        auto* channelGrid=new wxFlexGridSizer(4,2,8,16);channelGrid->AddGrowableCol(0);channelGrid->AddGrowableCol(1);
+        for(int i=0;i<8;++i){channelBadges_[i]=new wxStaticText(channelCard,wxID_ANY,wxString::Format("Channel %d  /  Idle",i+1));channelGrid->Add(channelBadges_[i],1,wxEXPAND);}
+        channelLayout->Add(channelGrid,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,14);channelCard->SetSizer(channelLayout);rightLayout->Add(channelCard,0,wxEXPAND|wxBOTTOM,14);
+        rightLayout->Add(heading(right,"Guest services"),0,wxBOTTOM,10);
+        auto* tabPanel=new wxPanel(right);auto* tabRow=new wxBoxSizer(wxHORIZONTAL);tabPanel->SetSizer(tabRow);
+        rightLayout->Add(tabPanel,0,wxEXPAND|wxBOTTOM,10);
+        auto* notebook = new ServiceBook(right,tabPanel,tabRow); services_=notebook; notebook->SetMinSize(wxSize(-1,250)); rightLayout->Add(notebook,1,wxEXPAND);
+        auto* disks = new wxPanel(left); disks->SetBackgroundColour(Palette::canvas); auto* diskLayout = new wxBoxSizer(wxVERTICAL);
+        diskLayout->Add(heading(disks,"Virtual disks"),0,wxLEFT|wxTOP,12);
         diskLayout->Add(new wxStaticText(disks,wxID_ANY,"Disk changes stay in memory until you save them."),0,wxALL,12);
         for (int i=0;i<4;++i) {
-            auto* box = new wxStaticBoxSizer(wxVERTICAL,disks,wxString::Format("Drive %d",i));
-            auto& drive=drives_[i]; drive.path=new wxTextCtrl(disks,wxID_ANY,"",wxDefaultPosition,wxDefaultSize,wxTE_READONLY); drive.path->SetHint("No disk image mounted"); box->Add(drive.path,0,wxEXPAND|wxALL,8);
+            auto* driveCard=new DashboardCard(disks);
+            auto* box = new wxBoxSizer(wxVERTICAL);
+            box->Add(heading(driveCard,wxString::Format("Drive %d",i),13),0,wxLEFT|wxRIGHT|wxTOP,12);
+            auto& drive=drives_[i]; drive.path=new wxTextCtrl(driveCard,wxID_ANY,"",wxDefaultPosition,wxDefaultSize,wxTE_READONLY); drive.path->SetHint("No disk image mounted"); box->Add(drive.path,0,wxEXPAND|wxALL,8);
             auto* diskActions = new wxBoxSizer(wxHORIZONTAL);
-            drive.state=new wxStaticText(disks,wxID_ANY,"Empty",wxDefaultPosition,FromDIP(wxSize(90,-1))); diskActions->Add(drive.state,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
+            drive.state=new wxStaticText(driveCard,wxID_ANY,"Empty",wxDefaultPosition,FromDIP(wxSize(90,-1))); diskActions->Add(drive.state,0,wxALIGN_CENTER_VERTICAL|wxRIGHT,8);
             diskActions->AddStretchSpacer();
-            drive.mount=new wxButton(disks,wxID_ANY,wxS("Mount…")); drive.save=new wxButton(disks,wxID_ANY,"Save"); drive.saveAs=new wxButton(disks,wxID_ANY,wxS("Save As…")); drive.eject=new wxButton(disks,wxID_ANY,"Eject");
+            drive.mount=new wxButton(driveCard,wxID_ANY,wxS("Mount…")); drive.save=new wxButton(driveCard,wxID_ANY,"Save"); drive.saveAs=new wxButton(driveCard,wxID_ANY,wxS("Save As…")); drive.eject=new wxButton(driveCard,wxID_ANY,"Eject");
+            drive.save->Disable();drive.saveAs->Disable();drive.eject->Disable();
             diskActions->Add(drive.mount,0,wxRIGHT,8);diskActions->Add(drive.save,0,wxRIGHT,8);diskActions->Add(drive.saveAs,0,wxRIGHT,8);diskActions->Add(drive.eject);
             box->Add(diskActions,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,8);
             drive.mount->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){mount(i);});
@@ -490,13 +671,55 @@ public:
             drive.save->Bind(wxEVT_CONTEXT_MENU,[this,i](wxContextMenuEvent&){saveDisk(i,true);});
             drive.save->SetToolTip("Save guest changes. Right-click to Save As.");
             drive.eject->Bind(wxEVT_BUTTON,[this,i](wxCommandEvent&){preserve(i,[this,i](bool save,bool discard){send({{"command","eject"},{"drive",i},{"saveBefore",save},{"discard",discard}},[this](const json& r){if(r.value("ok",false))remember();});});});
-            diskLayout->Add(box,0,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,12);
+            driveCard->SetSizer(box);diskLayout->Add(driveCard,0,wxEXPAND|wxBOTTOM,10);
         }
-        disks->SetSizer(diskLayout);disks->FitInside();notebook->AddPage(disks,"Disks");
+        disks->SetSizer(diskLayout);leftLayout->Add(disks,0,wxEXPAND);
+        left->SetSizer(leftLayout);left->FitInside();right->SetSizer(rightLayout);
+        columns->Add(left,1,wxEXPAND|wxRIGHT,16);columns->Add(right,1,wxEXPAND);
+        layout->Add(columns,1,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,18);
         auto* windows=new wxPanel(notebook);auto* windowsLayout=new wxBoxSizer(wxVERTICAL);
         windowChoice_=new wxChoice(windows,wxID_ANY); windowsLayout->Add(windowChoice_,0,wxEXPAND|wxALL,8);
-        windowText_=multiline(windows);windowsLayout->Add(windowText_,1,wxEXPAND|wxLEFT|wxRIGHT,8);
-        windowInput_=new wxTextCtrl(windows,wxID_ANY,"",wxDefaultPosition,wxDefaultSize,wxTE_PROCESS_ENTER);windowInput_->SetHint("Enter a line to send to the selected virtual window");windowsLayout->Add(windowInput_,0,wxEXPAND|wxALL,8);
+        windowText_=new wxTextCtrl(windows,wxID_ANY,"",wxDefaultPosition,wxDefaultSize,
+            wxTE_MULTILINE|wxTE_READONLY|wxTE_DONTWRAP|wxHSCROLL|wxTE_PROCESS_ENTER|wxTE_PROCESS_TAB|wxWANTS_CHARS);
+        windowText_->SetFont(wxFontInfo(13).Family(wxFONTFAMILY_TELETYPE));
+        windowText_->SetHint("No active virtual windows. Open /Z1 on the guest, then click here to type.");
+        windowsLayout->Add(windowText_,1,wxEXPAND|wxLEFT|wxRIGHT|wxBOTTOM,8);
+        windowText_->Bind(wxEVT_KEY_DOWN,[this](wxKeyEvent& event){
+            int key=event.GetKeyCode();
+#ifdef __WXOSX__
+            bool shortcut=event.CmdDown();
+#else
+            bool shortcut=event.ControlDown() && event.ShiftDown();
+#endif
+            if(shortcut){
+                if(key=='V'){pasteWindow();return;}
+                if(key=='C'){copyWindow();return;}
+                if(key=='A'){windowText_->SelectAll();return;}
+                event.Skip();return;
+            }
+            if(event.RawControlDown() && !event.AltDown()) {
+                if(key>='A' && key<='_'){sendWindowInput(wxString(wxUniChar(key & 31)));return;}
+                if(key==WXK_SPACE){sendWindowInput(wxString(wxUniChar(0)));return;}
+            }
+            switch(key){
+                case WXK_RETURN: case WXK_NUMPAD_ENTER: sendWindowInput("\r");return;
+                case WXK_BACK: sendWindowInput("\b");return;
+                case WXK_TAB: if(event.ShiftDown()){windowText_->Navigate(wxNavigationKeyEvent::IsBackward);return;} sendWindowInput("\t");return;
+                case WXK_ESCAPE: sendWindowInput(wxString(wxUniChar(27)));return;
+                case WXK_DELETE: sendWindowInput(wxString(wxUniChar(127)));return;
+                case WXK_LEFT: sendWindowInput("\b");return;
+                case WXK_RIGHT: sendWindowInput("\t");return;
+                case WXK_DOWN: sendWindowInput("\n");return;
+                case WXK_UP: sendWindowInput(wxString(wxUniChar(12)));return;
+                default: event.Skip();
+            }
+        });
+        windowText_->Bind(wxEVT_CHAR,[this](wxKeyEvent& event){
+            int key=event.GetUnicodeKey();
+            if(key>=32 && key<=126) sendWindowInput(wxString(wxUniChar(key)));
+        });
+        windowText_->Bind(wxEVT_TEXT_COPY,[this](wxClipboardTextEvent&){copyWindow();});
+        windowText_->Bind(wxEVT_TEXT_PASTE,[this](wxClipboardTextEvent&){pasteWindow();});
         windows->SetSizer(windowsLayout);notebook->AddPage(windows,"Virtual windows");
         auto* ports=new wxPanel(notebook);auto* portsLayout=new wxBoxSizer(wxVERTICAL);channels_=new wxListCtrl(ports,wxID_ANY,wxDefaultPosition,wxDefaultSize,wxLC_REPORT);
         channels_->InsertColumn(0,"Channel",wxLIST_FORMAT_LEFT,110);channels_->InsertColumn(1,"State",wxLIST_FORMAT_LEFT,120);channels_->InsertColumn(2,"Transport",wxLIST_FORMAT_LEFT,130);channels_->InsertColumn(3,"Pending bytes",wxLIST_FORMAT_LEFT,140);
@@ -509,16 +732,16 @@ public:
         auto* logging=new wxPanel(notebook);auto* logLayout=new wxBoxSizer(wxVERTICAL);log_=multiline(logging);logLayout->Add(log_,1,wxEXPAND|wxALL,8);
         auto* logActions=new wxBoxSizer(wxHORIZONTAL);auto* clearLog=new wxButton(logging,wxID_ANY,"Clear");auto* saveLog=new wxButton(logging,wxID_ANY,wxS("Save log…"));logActions->Add(clearLog,0,wxRIGHT,8);logActions->Add(saveLog);logLayout->Add(logActions,0,wxLEFT|wxRIGHT|wxBOTTOM,8);
         clearLog->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){log_->Clear();});saveLog->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){exportLog();});logging->SetSizer(logLayout);notebook->AddPage(logging,"Log");
-        panel->SetSizer(layout);
+        rootPanel->SetSizer(layout); dashboardTheme(rootPanel); notebook->RefreshTabs(); connectionBadge_->SetForegroundColour(Palette::accent);
         transport_->Bind(wxEVT_CHOICE,[this](wxCommandEvent&){connectionControls();if(ready_&&transport_->GetSelection()==1)refreshPorts();});
         refreshPorts_->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){refreshPorts();});
         start_->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){start();});stop_->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){send({{"command","stop"}});});
         disconnect_->Bind(wxEVT_BUTTON,[this](wxCommandEvent&){send({{"command","disconnect"}});});
-        windowChoice_->Bind(wxEVT_CHOICE,[this](wxCommandEvent&){showWindow();});windowInput_->Bind(wxEVT_TEXT_ENTER,[this](wxCommandEvent&){int channel=windowChannel();if(channel>=0){send({{"command","windowInput"},{"channel",channel},{"text",utf8(windowInput_->GetValue())+"\r"}});windowInput_->Clear();}});
+        windowChoice_->Bind(wxEVT_CHOICE,[this](wxCommandEvent&){showWindow();windowText_->SetFocus();});
         Bind(wxEVT_MENU,[this](wxCommandEvent&){configuration(false);},wxID_OPEN);Bind(wxEVT_MENU,[this](wxCommandEvent&){configuration(true);},wxID_SAVEAS);
         Bind(wxEVT_MENU,[this](wxCommandEvent&){Close();},wxID_EXIT);Bind(wxEVT_MENU,[this](wxCommandEvent&){send({{"command","saveAll"}});},1002);
         Bind(wxEVT_MENU,[this](wxCommandEvent&){if(process_){error("Stop and quit normally before restarting a running backend.");return;}launch();},1001);
-        Bind(wxEVT_MENU,[this](wxCommandEvent&){wxAboutDialogInfo info;info.SetName("DriveWire Desktop");info.SetVersion("0.2.0");info.SetDescription("A wxWidgets desktop for the shared Swift DriveWire server.\nThe native Swift Mac application remains a separate application.");info.SetWebSite("https://github.com/DrPitre/DriveWire");wxAboutBox(info,this);},wxID_ABOUT);
+        Bind(wxEVT_MENU,[this](wxCommandEvent&){wxAboutDialogInfo info;info.SetName("DriveWire Swift Server");info.SetVersion("0.2.0");info.SetDescription("A wxWidgets desktop for the shared Swift DriveWire server.\nThe native Swift Mac application remains a separate application.");info.SetWebSite("https://github.com/DrPitre/DriveWire");wxAboutBox(info,this);},wxID_ABOUT);
         Bind(wxEVT_CLOSE_WINDOW,[this](wxCloseEvent& e){if(!e.CanVeto()){if(process_)process_->CloseOutput();Destroy();return;}e.Veto();close();});
         Bind(wxEVT_END_PROCESS,&Desktop::onExit,this);Bind(wxEVT_TIMER,&Desktop::onTimer,this);
         if (!smoke_) {
@@ -578,25 +801,56 @@ void Desktop::smokeTick() {
         std::vector<unsigned char> packet={0x57,0,0,0,0};packet.insert(packet.end(),256,0x41);packet.push_back(0x41);packet.push_back(0x00);
         smokeSocket_->Write(packet.data(),static_cast<wxUint32>(packet.size()));smokeSocket_->Read(&reply,1);
         if(smokeSocket_->LastCount()!=1||reply!=0){failSmoke("GUI mounted disk failed guest write");return;}
+        services_->SetSelection(3);
+        unsigned char window[]={0x45,129,0xC3,129,'>'};smokeSocket_->Write(window,sizeof(window));
         send({{"command","status"}});
     } else if(step==4) {
         if(!dirty(0)){failSmoke("Guest write did not mark disk modified");return;}
+        if(transport_->GetSelection()==0 && (windowChannel()!=129 || wxWindow::FindFocus()!=windowText_)){--smokeStep_;return;}
+        if(transport_->GetSelection()==0){
+            if(windowChannel()!=129 || services_->GetSelection()!=0 || wxWindow::FindFocus()!=windowText_){failSmoke("New virtual window did not receive focus");return;}
+            stop_->SetFocus();auto unchanged=state_;update(unchanged);
+            if(wxWindow::FindFocus()!=stop_){failSmoke("Routine status update stole focus");return;}
+            windowText_->SetFocus();
+            wxKeyEvent character(wxEVT_CHAR);character.m_uniChar='x';character.m_keyCode='X';windowText_->GetEventHandler()->ProcessEvent(character);
+            for(int key:std::array<int,5>{WXK_RETURN,WXK_BACK,'C',WXK_TAB,WXK_ESCAPE}){
+                wxKeyEvent event(wxEVT_KEY_DOWN);event.m_keyCode=key;event.SetRawControlDown(key=='C');windowText_->GetEventHandler()->ProcessEvent(event);
+            }
+            if(terminalOutput_!=">"){failSmoke("Terminal input must wait for guest echo");return;}
+        }
         wxCommandEvent event(wxEVT_BUTTON,drives_[0].save->GetId());drives_[0].save->GetEventHandler()->ProcessEvent(event);
     } else if(step==5) {
         if(dirty(0)){failSmoke("GUI save left disk dirty");return;}
+        if(transport_->GetSelection()==0){
+            unsigned char request[]={0x63,129,6},actual[6]={};const unsigned char expected[]={'x',13,8,3,9,27};
+            smokeSocket_->Write(request,sizeof(request));smokeSocket_->Read(actual,sizeof(actual));
+            if(smokeSocket_->LastCount()!=sizeof(actual)||!std::equal(std::begin(actual),std::end(actual),std::begin(expected))){failSmoke("Direct terminal keystrokes did not reach guest intact");return;}
+        }
         bool missing=wxFileExists(smokeRoot_+"/serial-missing.txt");
         wxFileInputStream image(smokeRoot_+wxS("/disk ü.dsk"));unsigned char b=0;image.Read(&b,1);
         if(!image.IsOk()||b!=(missing?0:0x41)){failSmoke("GUI Save did not persist guest bytes");return;}
-        if(smokeSocket_)smokeSocket_->Close();
-        wxCommandEvent event(wxEVT_BUTTON,stop_->GetId());stop_->GetEventHandler()->ProcessEvent(event);
+        if(smokeSocket_){
+            services_->SetSelection(2);
+            unsigned char window[]={0xC4,18,0x29,0xC3,130,'2'};
+            smokeSocket_->Write(window,sizeof(window));
+            send({{"command","status"}});
+            return;
+        }
     } else if(step==6) {
+        if(transport_->GetSelection()==0){
+            if(windowChannel()!=130 || wxWindow::FindFocus()!=windowText_){--smokeStep_;return;}
+            if(services_->GetSelection()!=0 || windowChoice_->GetCount()!=2){failSmoke("Z2 did not become selected with Z1 open");return;}
+            smokeSocket_->Close();
+        }
+        wxCommandEvent event(wxEVT_BUTTON,stop_->GetId());stop_->GetEventHandler()->ProcessEvent(event);
+    } else if(step==7) {
         if(running()){failSmoke("GUI Stop did not stop listener");return;}
         send({{"command","eject"},{"drive",0}});
-    } else if(step==7) {
+    } else if(step==8) {
         if(!state_["disks"].empty()){failSmoke("Eject did not clear mounted disk");return;}
         json checks;
         if (wxFileExists(smokeRoot_+"/serial-missing.txt")) checks={"serial selection", "manual COM port", "port refresh", "start button", "missing-port waiting state", "stop cancels retries", "eject", "graceful shutdown"};
-        else checks={"backend launch", "configuration", "Unicode disk path", "start button", transport_->GetSelection()==1?"serial DWINIT":"TCP DWINIT", "guest sector write", "dirty tracking", "save button", "persisted bytes", "stop button", "eject", "graceful shutdown"};
+        else checks={"backend launch", "configuration", "Unicode disk path", "start button", transport_->GetSelection()==1?"serial DWINIT":"TCP DWINIT", "direct terminal input and control keys", "new Z2 selection and focus with Z1 open", "guest sector write", "dirty tracking", "save button", "persisted bytes", "stop button", "eject", "graceful shutdown"};
         wxFileOutputStream file(smokeRoot_+"/ui-result.json");auto result=json({{"ok",true},{"checks",checks}}).dump(2);file.Write(result.data(),result.size());
         shutdown();
     }
@@ -606,7 +860,7 @@ class Application final : public wxApp {
     int result_=0;
 public:
     bool OnInit() override {
-        SetAppName("DriveWire Desktop");SetVendorName("DriveWire");
+        SetAppName("DriveWire Swift Server");SetVendorName("DriveWire");
         wxCmdLineParser parser(argc,argv);parser.AddOption("","server","Path to the Swift drivewire-server executable");parser.AddOption("","smoke-test","Run the desktop integration test using this prepared directory");parser.AddSwitch("h","help","Show help",wxCMD_LINE_OPTION_HELP);
         if(parser.Parse()!=0)return false;
         wxString server,smoke;parser.Found("server",&server);parser.Found("smoke-test",&smoke);
